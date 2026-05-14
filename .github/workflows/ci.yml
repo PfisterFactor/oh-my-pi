@@ -567,7 +567,7 @@ jobs:
          with:
            bun-version: "1.3"
        - run: bun install --frozen-lockfile
-       - run: bun x npm audit
+       - run: bun pm scan
 
    release_binary:
       name: "Release binary: ${{ matrix.target_id }}"
