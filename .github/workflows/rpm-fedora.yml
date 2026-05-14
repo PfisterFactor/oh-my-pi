@@ -39,27 +39,27 @@ jobs:
             native_variant: ""
 
     steps:
-      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
         with:
           submodules: true
 
       # --- Toolchain ---
-      - uses: oven-sh/setup-bun@4bc047ad259df6fc24a6c9b0f9a0cb08cf17fbe5
+      - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6
         with:
           bun-version: "1.3"
 
-      - uses: dtolnay/rust-toolchain@a54c7afa132b696c4a043ca06ffd95973072f65a
+      - uses: dtolnay/rust-toolchain@5b842231ba77f5c045dba54ac5560fed2db780e2
         with:
           toolchain: nightly-2026-04-29
 
-      - uses: Swatinem/rust-cache@9d47c6ad4b02e050fd7c43cd79f01a3e426dc430
+      - uses: Swatinem/rust-cache@42dc69e1aa15d09112580998cf2ef0119e2e91ae
         with:
           shared-key: native-linux-${{ matrix.native_arch }}${{ matrix.native_variant && format('-{0}', matrix.native_variant) || '' }}
           save-if: ${{ github.ref == 'refs/heads/main' }}
           cache-workspace-crates: true
 
       - name: Cache bun dependencies
-        uses: actions/cache@5a3ec84eff668545956fd18022155c47e93e2684
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830
         with:
           path: ~/.bun/install/cache
           key: bun-${{ runner.os }}-${{ hashFiles('**/bun.lock') }}
@@ -131,10 +131,10 @@ jobs:
       group: rpm-release
       cancel-in-progress: false
     steps:
-      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
 
       - name: Download RPM artifacts
-        uses: actions/download-artifact@95815c38cf2ff2164869cbab79da8d1f422bc89e
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
         with:
           path: rpms
           pattern: rpm-*
@@ -192,12 +192,12 @@ jobs:
           }
 
       - name: Checkout source (for templates)
-        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
         with:
           path: src
 
       - name: Download RPM artifacts
-        uses: actions/download-artifact@95815c38cf2ff2164869cbab79da8d1f422bc89e
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
         with:
           path: new-rpms
           pattern: rpm-*
