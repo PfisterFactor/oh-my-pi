@@ -1,0 +1,6 @@
+[omp]
+name=omp (fork: PfisterFactor)
+baseurl=https://pfisterfactor.github.io/oh-my-pi/fedora/$basearch
+enabled=1
+gpgcheck=0
+metadata_expire=1h
