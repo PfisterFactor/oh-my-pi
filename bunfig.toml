@@ -6,6 +6,8 @@ minimumReleaseAgeExcludes = ["@types/bun", "bun-types"]
 linker = "hoisted"
 exact = true
 saveTextLockfile = true
+[install.security]
+scanner = "@bun-security-scanner/npm"
 
 [loader]
 ".md" = "text"

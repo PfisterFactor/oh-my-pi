@@ -11,6 +11,7 @@
       },
       "devDependencies": {
         "@biomejs/biome": "catalog:",
+        "@bun-security-scanner/npm": "^1.0.0",
         "@types/bun": "catalog:",
         "@typescript/native-preview": "catalog:",
         "lint-staged": "catalog:",
@@ -518,6 +519,8 @@
     "@bufbuild/protoc-gen-es": ["@bufbuild/protoc-gen-es@2.13.0", "", { "dependencies": { "@bufbuild/protobuf": "2.13.0", "@bufbuild/protoplugin": "2.13.0" }, "bin": { "protoc-gen-es": "bin/protoc-gen-es" } }, "sha512-ylI1vrLksdnXrVZRs9xGxmrQxKGhUm6pPszv26kqBvNiO3qPTktk+hgfwbLISBY4M/reShkT2dFLGT9fbydBXg=="],
 
     "@bufbuild/protoplugin": ["@bufbuild/protoplugin@2.13.0", "", { "dependencies": { "@bufbuild/protobuf": "2.13.0", "@typescript/vfs": "^1.6.2", "typescript": "5.4.5" } }, "sha512-32eMChKaL/A8Hh5AfMmXSdnuyznN85uoEjoyWiWeRrvtQOtpqX/v1R9PDe0g9vMIgzznK9inMT3CUaal0kjLUQ=="],
+
+    "@bun-security-scanner/npm": ["@bun-security-scanner/npm@1.0.0", "", { "dependencies": { "zod": "^4.1.12" } }, "sha512-Gf62/BbD1X1wjSQjDehliLUx6ckTT5LaNfAyFrVi3V39yztrgjizWinha+TdP+fhIHxmRE0dUaBoKmRM7SpoUw=="],
 
     "@colors/colors": ["@colors/colors@1.6.0", "", {}, "sha512-Ir+AOibqzrIsL6ajt3Rz3LskB7OiMVHqltZmspbW/TJuTVuyOMirVqAkjfY6JISiLHgyNqicAC8AyHHGzNd/dA=="],
 
