@@ -153,7 +153,7 @@ jobs:
                - { variant: baseline, rust_checks: true }
                - { variant: modern }
       steps:
-         - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
+         - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
          - uses: ./.github/actions/build-native
            with:
               hash: ${{ needs.rust-hash.outputs.hash }}
@@ -179,7 +179,7 @@ jobs:
                - { os: ubuntu-22.04, platform: win32, arch: x64, target: x86_64-pc-windows-msvc, variant: baseline }
       runs-on: ${{ matrix.os }}
       steps:
-         - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
+         - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
          - uses: ./.github/actions/build-native
            with:
               hash: ${{ needs.rust-hash.outputs.hash }}
