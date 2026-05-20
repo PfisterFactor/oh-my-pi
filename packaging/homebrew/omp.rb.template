@@ -1,0 +1,38 @@
+class Omp < Formula
+  desc "AI coding agent for the terminal (read, bash, edit, write tools)"
+  homepage "https://github.com/PfisterFactor/oh-my-pi"
+  version "{{VERSION}}"
+  license "MIT"
+
+  on_macos do
+    on_arm do
+      url "{{URL_DARWIN_ARM64}}"
+      sha256 "{{SHA_DARWIN_ARM64}}"
+    end
+    on_intel do
+      url "{{URL_DARWIN_X64}}"
+      sha256 "{{SHA_DARWIN_X64}}"
+    end
+  end
+
+  on_linux do
+    on_arm do
+      url "{{URL_LINUX_ARM64}}"
+      sha256 "{{SHA_LINUX_ARM64}}"
+    end
+    on_intel do
+      url "{{URL_LINUX_X64}}"
+      sha256 "{{SHA_LINUX_X64}}"
+    end
+  end
+
+  def install
+    # Release assets are bare executables, not archives.
+    binary = Dir["omp-*"].first
+    bin.install binary => "omp"
+  end
+
+  test do
+    assert_match version.to_s, shell_output("#{bin}/omp --version")
+  end
+end
