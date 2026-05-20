@@ -1,0 +1,214 @@
+# Rolling Homebrew formula update on every push to main.
+#
+# Builds the omp binary for the four supported platforms (darwin/linux × x64/arm64),
+# upserts a rolling `main-latest` GitHub Release with the new binaries, and pushes
+# an updated Formula/omp.rb to PfisterFactor/homebrew-tap.
+#
+# Coexists with `rpm-fedora.yml`: both target the same `main-latest` release but
+# scrub only their own assets (`omp-*` here, `*.rpm` there) before re-uploading.
+
+name: Homebrew
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+
+permissions:
+  contents: write
+
+concurrency:
+  group: homebrew-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  # ---------------------------------------------------------------------------
+  # Build omp binary per target, mirroring ci.yml's release_binary matrix
+  # minus Windows.
+  # ---------------------------------------------------------------------------
+  build:
+    name: Build (${{ matrix.target_id }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-22.04
+            platform: linux
+            arch: x64
+            variants: modern
+            target_id: linux-x64
+            binary_path: packages/coding-agent/binaries/omp-linux-x64
+          - os: ubuntu-24.04-arm
+            platform: linux
+            arch: arm64
+            variants: ""
+            target_id: linux-arm64
+            binary_path: packages/coding-agent/binaries/omp-linux-arm64
+          - os: macos-15-intel
+            platform: darwin
+            arch: x64
+            variants: baseline
+            target_id: darwin-x64
+            binary_path: packages/coding-agent/binaries/omp-darwin-x64
+          - os: macos-14
+            platform: darwin
+            arch: arm64
+            variants: ""
+            target_id: darwin-arm64
+            binary_path: packages/coding-agent/binaries/omp-darwin-arm64
+
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
+        with:
+          submodules: true
+
+      - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6
+        with:
+          bun-version: "1.3"
+
+      - uses: dtolnay/rust-toolchain@5b842231ba77f5c045dba54ac5560fed2db780e2
+        with:
+          toolchain: nightly-2026-04-29
+
+      - name: Prepend rustup toolchain bin to PATH
+        shell: bash
+        run: |
+          # macOS runners ship rustup-init shims that error out as `cargo`/`rustc`;
+          # force the real toolchain binaries onto PATH first.
+          toolchain_bin="$(dirname "$(rustup which cargo)")"
+          echo "$toolchain_bin" >> "$GITHUB_PATH"
+
+      - uses: Swatinem/rust-cache@42dc69e1aa15d09112580998cf2ef0119e2e91ae
+        with:
+          shared-key: homebrew-${{ matrix.platform }}-${{ matrix.arch }}${{ matrix.variants && format('-{0}', matrix.variants) || '' }}
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+          cache-workspace-crates: true
+
+      - name: Cache bun dependencies
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830
+        with:
+          path: ~/.bun/install/cache
+          key: bun-${{ runner.os }}-${{ hashFiles('**/bun.lock') }}
+
+      - run: bun install --frozen-lockfile
+
+      - name: Build native addon
+        env:
+          TARGET_PLATFORM: ${{ matrix.platform }}
+          TARGET_ARCH: ${{ matrix.arch }}
+          TARGET_VARIANTS: ${{ matrix.variants }}
+        run: bun run ci:build:native
+
+      - name: Build release binary
+        env:
+          RELEASE_TARGETS: ${{ matrix.target_id }}
+        run: bun run ci:release:build-binaries
+
+      - name: Smoke release binary
+        run: |
+          set -euo pipefail
+          runtime_dir="$(mktemp -d)"
+          HOME="$runtime_dir/home" XDG_DATA_HOME="$runtime_dir/xdg" \
+            "${{ matrix.binary_path }}" --version
+
+      - name: Upload binary artifact
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: omp-binary-${{ matrix.target_id }}
+          path: ${{ matrix.binary_path }}
+          if-no-files-found: error
+
+  # ---------------------------------------------------------------------------
+  # Upsert main-latest rolling release with the four binaries, then render and
+  # push the formula to PfisterFactor/homebrew-tap.
+  # ---------------------------------------------------------------------------
+  publish:
+    name: Publish tap & rolling release
+    needs: build
+    runs-on: ubuntu-22.04
+    concurrency:
+      group: homebrew-publish
+      cancel-in-progress: false
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
+        with:
+          path: src
+
+      - name: Checkout tap
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
+        with:
+          repository: PfisterFactor/homebrew-tap
+          ssh-key: ${{ secrets.HOMEBREW_TAP_DEPLOY_KEY }}
+          path: tap
+
+      - name: Download binary artifacts
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
+        with:
+          pattern: omp-binary-*
+          path: bin
+          merge-multiple: true
+
+      - name: List downloaded binaries
+        run: ls -la bin/
+
+      - name: Upsert main-latest release with omp binaries
+        working-directory: src
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          NOTES="Rolling main build @ ${GITHUB_SHA::7} ($(date -u '+%Y-%m-%d %H:%M:%SZ'))"
+          if gh release view main-latest >/dev/null 2>&1; then
+            # Scrub only omp-* assets so we coexist with rpm-fedora.yml (which scrubs *.rpm).
+            gh release view main-latest --json assets --jq '.assets[].name' \
+              | while read -r n; do
+                  case "$n" in omp-*) gh release delete-asset main-latest "$n" --yes ;; esac
+                done
+            gh release edit main-latest --prerelease --title "Rolling main build" --notes "${NOTES}"
+          else
+            gh release create main-latest --prerelease \
+              --title "Rolling main build" --notes "${NOTES}" --target "${GITHUB_SHA}"
+          fi
+          gh release upload main-latest ../bin/omp-*
+
+      - name: Render formula
+        run: |
+          set -euo pipefail
+          VERSION="$(jq -r .version src/packages/coding-agent/package.json)"
+          BASE="https://github.com/${GITHUB_REPOSITORY}/releases/download/main-latest"
+          declare -A ASSETS=(
+            [DARWIN_ARM64]=omp-darwin-arm64
+            [DARWIN_X64]=omp-darwin-x64
+            [LINUX_ARM64]=omp-linux-arm64
+            [LINUX_X64]=omp-linux-x64
+          )
+          ARGS=( -e "s|{{VERSION}}|${VERSION}|g" )
+          for key in "${!ASSETS[@]}"; do
+            name="${ASSETS[$key]}"
+            sha=$(sha256sum "bin/${name}" | awk '{print $1}')
+            ARGS+=( -e "s|{{URL_${key}}}|${BASE}/${name}|g" )
+            ARGS+=( -e "s|{{SHA_${key}}}|${sha}|g" )
+          done
+          mkdir -p tap/Formula
+          sed "${ARGS[@]}" src/packaging/homebrew/omp.rb.template > tap/Formula/omp.rb
+          cat tap/Formula/omp.rb
+
+      - name: Commit & push tap
+        working-directory: tap
+        run: |
+          set -euo pipefail
+          git config user.name  "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add Formula/omp.rb
+          if git diff --cached --quiet; then
+            echo "Formula unchanged."
+          else
+            git commit -m "omp ${GITHUB_SHA::7}"
+            git push origin HEAD
+          fi

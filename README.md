@@ -46,6 +46,14 @@ brew install can1357/tap/omp
 bun install -g @oh-my-pi/pi-coding-agent
 ```
 
+**Homebrew (macOS · Linux)**
+
+```sh
+brew install PfisterFactor/tap/omp
+```
+
+Prebuilt binaries for Apple Silicon, Intel Mac, Linux x64, and Linux arm64. The tap is auto-updated on every push to `main`.
+
 **Windows (PowerShell)**
 
 ```powershell
