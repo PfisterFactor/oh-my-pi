@@ -39,13 +39,20 @@ function resolveEffectiveVariant(): X64Variant | null {
 const effectiveVariant = resolveEffectiveVariant();
 const variantSuffix = effectiveVariant ? `-${effectiveVariant}` : "";
 
-// Pin Rust target-cpu so x64 baseline/modern variants get a reproducible ISA floor
+// Pin Rust target-cpu so release artifacts get a reproducible ISA floor
 // instead of inheriting the host CPU when RUSTFLAGS is unset.
 if (!isCrossCompile && !Bun.env.RUSTFLAGS) {
 	if (effectiveVariant === "modern") {
 		Bun.env.RUSTFLAGS = "-C target-cpu=x86-64-v3";
 	} else if (effectiveVariant === "baseline") {
 		Bun.env.RUSTFLAGS = "-C target-cpu=x86-64-v2";
+	} else if (Bun.env.CI && targetArch === "arm64" && targetPlatform === "linux") {
+		// Linux aarch64 CI runners (Ampere/Graviton, Neoverse-N1) advertise
+		// FEAT_LSE + FEAT_DotProd, so `target-cpu=native` emits `cas`/`ldadd`/
+		// `sdot`/`udot`. Those illegal-instruction inside virtualized Linux
+		// guests on Apple Silicon hosts where the hypervisor doesn't pass LSE
+		// through (e.g. OrbStack 2.x). Pin to ARMv8.0-A baseline for releases.
+		Bun.env.RUSTFLAGS = "-C target-cpu=generic";
 	} else {
 		Bun.env.RUSTFLAGS = "-C target-cpu=native";
 	}
