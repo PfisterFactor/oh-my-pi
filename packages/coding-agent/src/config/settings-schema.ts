@@ -1784,7 +1784,7 @@ export const SETTINGS_SCHEMA = {
 
 	"startup.checkUpdate": {
 		type: "boolean",
-		default: true,
+		default: false,
 		ui: {
 			tab: "interaction",
 			group: "Startup & Updates",
