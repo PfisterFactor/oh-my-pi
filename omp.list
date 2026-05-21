@@ -1,0 +1,1 @@
+deb [trusted=yes arch=amd64,arm64] https://pfisterfactor.github.io/oh-my-pi/debian stable main

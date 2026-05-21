@@ -1,0 +1,17 @@
+Package: omp
+Architecture: amd64
+Version: 15.1.8-0.1779322642.gitcbfbf71
+Priority: optional
+Section: utils
+Maintainer: PfisterFactor <noreply@github.com>
+Filename: pool/main/o/omp/omp_15.1.8-0.1779322642.gitcbfbf71_amd64.deb
+Size: 58493154
+MD5sum: 2e1f38b871953515572a3fc7b0dfa330
+SHA1: 81081fa529dade4e1e22d83d617391c4cef419e9
+SHA256: acb47592d9a93f2493cd4d11e446991f36a296da1800e4c131abd63ce91b6155
+SHA512: 166d6082d456324c904ed8504659a84ba28c0417ff8442c35dae46fb5685e603221c16b134a1cb61b0f41e343b449d1ee9a2d338b1b88b0c142542a139bbc6fd
+Homepage: https://github.com/PfisterFactor/oh-my-pi
+Description: AI coding agent for the terminal
+ Coding agent CLI with read, bash, edit, write tools and session
+ management. Fork of badlogic/pi-mono.
+

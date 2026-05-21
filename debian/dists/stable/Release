@@ -1,0 +1,32 @@
+Architectures: amd64 arm64
+Codename: stable
+Components: main
+Date: Thu, 21 May 2026 00:20:17 +0000
+Description: omp apt repo (unsigned, trusted=yes)
+Label: omp
+Origin: omp
+Suite: stable
+MD5Sum:
+ ef143a6cfe204cc53bd2ebb5359da3d4              186 Release
+ 0e5a10e44997dfa0bc4dac82a8eba232              741 main/binary-amd64/Packages
+ 17446817178761466baae977cb1cc1d7              524 main/binary-amd64/Packages.gz
+ 85d53125e96b8759a8f778dcec0afd59              741 main/binary-arm64/Packages
+ 456a6a9350633c8f24a64aa1a49fdbfb              521 main/binary-arm64/Packages.gz
+SHA1:
+ e3021a3e5adeaf7d34f33dc3e407f617b922c1da              186 Release
+ c6e7ff4e77ba59fd5b9b89d0fae001691d8fe706              741 main/binary-amd64/Packages
+ b52e416870bd7eb91fcb0bb6aaa12d7d68fbc189              524 main/binary-amd64/Packages.gz
+ 6160d715229a804307a53d6e44d2d68555f924dd              741 main/binary-arm64/Packages
+ 1441415c2999ef209f18ade939252c5249e37502              521 main/binary-arm64/Packages.gz
+SHA256:
+ fdd3e3b749bdfb6c20c2c22214d734837ba3c2e1228d8f7f2d4f947caf152d61              186 Release
+ c1f37e03e340123ec6f586c762eba16cbd77f656ab0c5c2b3ec672f6e7f2a848              741 main/binary-amd64/Packages
+ 4214362733144990d2db303da58623a24b025bfb26bd38093d8310d0c8ca6c4b              524 main/binary-amd64/Packages.gz
+ 845b5c29c167d3c17de0f13004b28e32c157f0c79f72ef22f1780e8d3a0f3af4              741 main/binary-arm64/Packages
+ 8e49795ec074cb1584ee5acbf6a2bd86eb2011faa570d5b8dc43079b9d5814a9              521 main/binary-arm64/Packages.gz
+SHA512:
+ f8dae1c5449eac393de60811134d3644f0ece83a477a7244200c775935f436f13b8709379243ad44200f7279f031ea6c851eab525cdb95cc1cd47df2a5b9ded5              186 Release
+ 1f02bdf2d7e28c3451dd92e1b9af124938eb3d1e9f45fb174f350bb1004966960effcb4b1cdfcfd306974443b6f926334359d3004bf3d44f14d2783bb6167ab2              741 main/binary-amd64/Packages
+ f50eb464a27d02bd81e19b02eccdf0bb34d8a31ea9bc5be95afb06d769c6333b318081f76bd54ec94279d5471c43e73537b571372f4a81890072a9ad976dfc31              524 main/binary-amd64/Packages.gz
+ dbdfae3a2e5b9e92f04884c7e1583eeb72b999437a7397ec14500cd2afd0e20a2464ba42a8e54e2c115011293d95a13110f43070f39c560c2b2c2c68ba44273f              741 main/binary-arm64/Packages
+ 31a0a4d41ec2e42d01740f0e08df35dea4b36d497cdb398f5059f194f8199d3d68bcbd7190a2721667ef0c40bf0bd7c8b0744bdae2b534b2b8db71f4d394da4b              521 main/binary-arm64/Packages.gz
