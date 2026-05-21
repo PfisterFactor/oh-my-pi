@@ -1,0 +1,1 @@
+deb [trusted=yes arch=amd64,arm64] {{BASE_URL}}/debian stable main

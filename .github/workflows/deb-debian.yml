@@ -1,9 +1,11 @@
-# Fedora RPM build + dnf repo on GitHub Pages.
+# Debian/Ubuntu .deb build + apt repo on GitHub Pages.
 #
-# Builds the omp CLI binary, packages it as an RPM for x86_64 and aarch64,
-# publishes a rolling main-latest release, and updates the dnf repo on gh-pages.
+# Builds the omp CLI binary, packages it as a .deb for amd64 and arm64,
+# attaches both to the rolling main-latest release (coexisting with
+# rpm-fedora.yml and homebrew.yml — each scrubs only its own asset types),
+# and updates the apt repo on gh-pages.
 
-name: Fedora RPM
+name: Debian apt repo
 
 on:
   push:
@@ -12,7 +14,6 @@ on:
 
 env:
   CARGO_TERM_COLOR: always
-  FEDORA_IMAGE: "fedora:41@sha256:f1a3fab47bcb3c3ddf3135d5ee7ba8b7b25f2e809a47440936212a3a50957f3d"
 
 permissions:
   contents: write
@@ -20,20 +21,20 @@ permissions:
 
 jobs:
   # ---------------------------------------------------------------------------
-  # Build binary + package RPM, per arch.
+  # Build binary + package .deb, per arch.
   # ---------------------------------------------------------------------------
-  build-rpm:
-    name: Build RPM (${{ matrix.arch }})
+  build-deb:
+    name: Build .deb (${{ matrix.arch }})
     runs-on: ${{ matrix.runner }}
     strategy:
       fail-fast: false
       matrix:
         include:
-          - arch: x86_64
+          - arch: amd64
             runner: ubuntu-22.04
             native_arch: x64
             native_variant: modern
-          - arch: aarch64
+          - arch: arm64
             runner: ubuntu-24.04-arm
             native_arch: arm64
             native_variant: ""
@@ -81,13 +82,13 @@ jobs:
       - name: Build omp binary
         run: bun --cwd=packages/coding-agent scripts/build-binary.ts
 
-      # --- Stage RPM sources ---
-      - name: Stage RPM sources
+      # --- Stage deb sources ---
+      - name: Stage deb sources
         run: |
-          mkdir -p packaging/rpm/sources
-          cp packages/coding-agent/dist/omp  packaging/rpm/sources/omp
-          cp LICENSE                         packaging/rpm/sources/LICENSE
-          ls -lh packaging/rpm/sources/
+          mkdir -p packaging/deb/sources
+          cp packages/coding-agent/dist/omp packaging/deb/sources/omp
+          cp LICENSE                        packaging/deb/sources/LICENSE
+          ls -lh packaging/deb/sources/
 
       - name: Compute build metadata
         id: meta
@@ -98,46 +99,48 @@ jobs:
           echo "version=${VERSION}"   >> "$GITHUB_OUTPUT"
           echo "buildnum=${BUILDNUM}" >> "$GITHUB_OUTPUT"
           echo "shortsha=${SHORTSHA}" >> "$GITHUB_OUTPUT"
-          echo "Building ${VERSION}-0.${BUILDNUM}.git${SHORTSHA}"
+          echo "Building ${VERSION}-0.${BUILDNUM}.git${SHORTSHA} for ${{ matrix.arch }}"
 
-      - name: Build RPM in Fedora container
+      - name: Install dpkg tooling
         run: |
-          docker run --rm \
-            -v "$PWD:/work" -w /work \
-            -e RPM_VERSION="${{ steps.meta.outputs.version }}" \
-            -e RPM_BUILDNUM="${{ steps.meta.outputs.buildnum }}" \
-            -e RPM_SHORTSHA="${{ steps.meta.outputs.shortsha }}" \
-            -e GH_OWNER="${{ github.repository_owner }}" \
-            -e HOST_UID="$(id -u)" \
-            -e HOST_GID="$(id -g)" \
-            "${FEDORA_IMAGE}" \
-            bash packaging/rpm/build-rpm.sh
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends dpkg-dev
 
-      - name: Upload RPM artifact
+      - name: Build .deb
+        env:
+          DEB_VERSION: ${{ steps.meta.outputs.version }}
+          DEB_BUILDNUM: ${{ steps.meta.outputs.buildnum }}
+          DEB_SHORTSHA: ${{ steps.meta.outputs.shortsha }}
+          DEB_ARCH: ${{ matrix.arch }}
+          GH_OWNER: ${{ github.repository_owner }}
+        run: bash packaging/deb/build-deb.sh
+
+      - name: Upload .deb artifact
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
         with:
-          name: rpm-${{ matrix.arch }}
-          path: packaging/rpm/out/*.rpm
+          name: deb-${{ matrix.arch }}
+          path: packaging/deb/out/*.deb
           if-no-files-found: error
 
   # ---------------------------------------------------------------------------
-  # Upsert a rolling "main-latest" GitHub Release with both RPMs attached.
+  # Attach .debs to the rolling "main-latest" GitHub Release.
+  # Coexists with rpm-fedora.yml (scrubs *.rpm) and homebrew.yml (scrubs omp-*).
   # ---------------------------------------------------------------------------
   publish-release:
-    name: Publish rolling Release
-    needs: build-rpm
+    name: Attach .debs to rolling Release
+    needs: build-deb
     runs-on: ubuntu-latest
     concurrency:
-      group: rpm-release
+      group: deb-release
       cancel-in-progress: false
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
 
-      - name: Download RPM artifacts
+      - name: Download .deb artifacts
         uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
         with:
-          path: rpms
-          pattern: rpm-*
+          path: debs
+          pattern: deb-*
           merge-multiple: true
 
       - name: Upsert main-latest release
@@ -147,25 +150,28 @@ jobs:
           set -euo pipefail
           NOTES="Rolling build from \`main\` @ \`${GITHUB_SHA::7}\` — $(date -u '+%Y-%m-%d %H:%M:%SZ')"
           if gh release view main-latest >/dev/null 2>&1; then
-            # Changing _buildnum in the filename defeats --clobber; delete first.
+            # Scrub only *.deb so we coexist with rpm-fedora.yml (*.rpm) and
+            # homebrew.yml (omp-*). Changing _buildnum in the filename defeats
+            # --clobber, so delete first.
             gh release view main-latest --json assets --jq '.assets[].name' \
               | while read -r n; do
-                  case "$n" in *.rpm) gh release delete-asset main-latest "$n" --yes ;; esac
+                  case "$n" in *.deb) gh release delete-asset main-latest "$n" --yes ;; esac
                 done
             gh release edit main-latest --prerelease --title "Rolling main build" --notes "${NOTES}"
           else
             gh release create main-latest --prerelease \
               --title "Rolling main build" --notes "${NOTES}" --target "${GITHUB_SHA}"
           fi
-          gh release upload main-latest rpms/*.rpm
+          gh release upload main-latest debs/*.deb
 
   # ---------------------------------------------------------------------------
-  # Push dnf repository tree (createrepo_c --update) to gh-pages.
-  # GitHub Pages must be configured to serve from gh-pages / root.
+  # Push apt repository tree (apt-ftparchive) to gh-pages.
+  # Shares the gh-pages concurrency group with rpm-fedora.yml so the two
+  # workflows serialize cleanly against the same branch.
   # ---------------------------------------------------------------------------
   publish-pages:
-    name: Publish dnf repo to gh-pages
-    needs: build-rpm
+    name: Publish apt repo to gh-pages
+    needs: build-deb
     runs-on: ubuntu-latest
     concurrency:
       group: gh-pages
@@ -196,40 +202,54 @@ jobs:
         with:
           path: src
 
-      - name: Download RPM artifacts
+      - name: Download .deb artifacts
         uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
         with:
-          path: new-rpms
-          pattern: rpm-*
+          path: new-debs
+          pattern: deb-*
+          merge-multiple: true
 
-      - name: Stage RPMs into site
+      - name: Install apt-ftparchive
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends apt-utils
+
+      - name: Stage .debs and regenerate apt metadata
         run: |
           set -euo pipefail
-          for arch in x86_64 aarch64; do
-            mkdir -p "site/fedora/$arch"
-            if ls "new-rpms/rpm-$arch"/*.rpm >/dev/null 2>&1; then
-              cp -v "new-rpms/rpm-$arch"/*.rpm "site/fedora/$arch/"
-            fi
+          DEBIAN=site/debian
+          POOL="$DEBIAN/pool/main/o/omp"
+          mkdir -p "$POOL"
+
+          # Accumulate rolling builds (matches rpm-fedora.yml behaviour) so
+          # older revisions remain installable via `apt install omp=<ver>`.
+          # `-n` is a safety net for re-runs; new buildnums never collide.
+          cp -vn new-debs/*.deb "$POOL/" || true
+
+          for arch in amd64 arm64; do
+            BIN="$DEBIAN/dists/stable/main/binary-$arch"
+            mkdir -p "$BIN"
+            # apt-ftparchive emits Filename: paths relative to its cwd, so
+            # invoke it from $DEBIAN to keep them rooted at `pool/...`.
+            ( cd "$DEBIAN" && \
+              apt-ftparchive --arch "$arch" packages pool > "dists/stable/main/binary-$arch/Packages" )
+            gzip -9c "$BIN/Packages" > "$BIN/Packages.gz"
           done
+
+          ( cd "$DEBIAN/dists/stable" && \
+            apt-ftparchive release \
+              -o APT::FTPArchive::Release::Origin="omp" \
+              -o APT::FTPArchive::Release::Label="omp" \
+              -o APT::FTPArchive::Release::Suite="stable" \
+              -o APT::FTPArchive::Release::Codename="stable" \
+              -o APT::FTPArchive::Release::Architectures="amd64 arm64" \
+              -o APT::FTPArchive::Release::Components="main" \
+              -o APT::FTPArchive::Release::Description="omp apt repo (unsigned, trusted=yes)" \
+              . > Release )
+
           touch site/.nojekyll
 
-      - name: Generate dnf metadata (createrepo_c)
-        run: |
-          docker run --rm -v "$PWD/site:/s" -w /s "${FEDORA_IMAGE}" bash -c '
-            set -euo pipefail
-            dnf install -y --setopt=install_weak_deps=False createrepo_c >/dev/null
-            for arch in x86_64 aarch64; do
-              [ -d "/s/fedora/$arch" ] || continue
-              if [ -d "/s/fedora/$arch/repodata" ]; then
-                createrepo_c --update "/s/fedora/$arch"
-              else
-                createrepo_c "/s/fedora/$arch"
-              fi
-            done
-          '
-          sudo chown -R "$(id -u):$(id -g)" site
-
-      - name: Render .repo and index.html from templates
+      - name: Render apt sources files and shared index from templates
         run: |
           set -euo pipefail
           OWNER_L="${GITHUB_REPOSITORY_OWNER,,}"
@@ -237,13 +257,15 @@ jobs:
           BASE_URL="https://${OWNER_L}.github.io/${REPO_N}"
           BUILD_TS="$(date -u '+%Y-%m-%d %H:%M:%SZ')"
           sed -e "s|{{BASE_URL}}|${BASE_URL}|g" \
-              -e "s|{{OWNER}}|${GITHUB_REPOSITORY_OWNER}|g" \
-              src/packaging/rpm/omp.repo.template > site/omp.repo
+              src/packaging/deb/omp.list.template > site/omp.list
+          sed -e "s|{{BASE_URL}}|${BASE_URL}|g" \
+              src/packaging/deb/omp.sources.template > site/omp.sources
           sed -e "s|{{BASE_URL}}|${BASE_URL}|g" \
               -e "s|{{OWNER}}|${GITHUB_REPOSITORY_OWNER}|g" \
               -e "s|{{BUILD_TIMESTAMP}}|${BUILD_TS}|g" \
               src/packaging/index.html.template > site/index.html
-          cat site/omp.repo
+          cat site/omp.list
+          cat site/omp.sources
 
       - name: Commit and push gh-pages
         run: |
@@ -253,6 +275,6 @@ jobs:
           if git diff --cached --quiet; then
             echo "No changes."
           else
-            git commit -m "publish rpm repo @ ${GITHUB_SHA::7}"
+            git commit -m "publish apt repo @ ${GITHUB_SHA::7}"
             git push origin gh-pages
           fi
