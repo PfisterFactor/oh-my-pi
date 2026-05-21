@@ -1,0 +1,10 @@
+Package: omp
+Version: @VERSION@
+Section: utils
+Priority: optional
+Architecture: @ARCH@
+Maintainer: @OWNER@ <noreply@github.com>
+Homepage: https://github.com/@OWNER@/oh-my-pi
+Description: AI coding agent for the terminal
+ Coding agent CLI with read, bash, edit, write tools and session
+ management. Fork of badlogic/pi-mono.
