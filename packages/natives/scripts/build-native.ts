@@ -52,12 +52,20 @@ const variantSuffix = effectiveVariant ? `-${effectiveVariant}` : "";
 // instead of inheriting the host CPU when RUSTFLAGS is unset. Non-x64 builds keep
 // the target's default CPU features: `-C target-cpu=native` would bake the build
 // host's CPU features into shipped artifacts and trips ring 0.17's aarch64-apple
-// const assertion (CAPS_STATIC == MIN_STATIC_FEATURES).
+// const assertion (CAPS_STATIC == MIN_STATIC_FEATURES). Linux aarch64 CI is pinned
+// explicitly to ARMv8.0-A generic so Ampere/Graviton-built artifacts don't
+// illegal-instruction inside virtualized Apple Silicon guests (no LSE passthrough).
 if (!isCrossCompile && !Bun.env.RUSTFLAGS) {
 	if (effectiveVariant === "modern") {
 		Bun.env.RUSTFLAGS = "-C target-cpu=x86-64-v3";
 	} else if (effectiveVariant === "baseline") {
 		Bun.env.RUSTFLAGS = "-C target-cpu=x86-64-v2";
+	} else if (Bun.env.CI && targetArch === "arm64" && targetPlatform === "linux") {
+		// Linux aarch64 CI runners (Ampere/Graviton, Neoverse-N1) advertise
+		// FEAT_LSE + FEAT_DotProd. Pin to ARMv8.0-A baseline for releases so
+		// artifacts stay legal inside virtualized Linux guests on Apple Silicon
+		// hosts where the hypervisor doesn't pass LSE through (e.g. OrbStack 2.x).
+		Bun.env.RUSTFLAGS = "-C target-cpu=generic";
 	}
 }
 
