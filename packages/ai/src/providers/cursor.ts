@@ -3,34 +3,7 @@ import * as fs from "node:fs/promises";
 import http2 from "node:http2";
 import { create, fromBinary, fromJson, type JsonValue, toBinary, toJson } from "@bufbuild/protobuf";
 import { ValueSchema } from "@bufbuild/protobuf/wkt";
-import { $env, extractHttpStatusFromError, sanitizeText } from "@oh-my-pi/pi-utils";
-import { calculateCost } from "../models";
-import type {
-	Api,
-	AssistantMessage,
-	Context,
-	CursorExecHandlerResult,
-	CursorExecHandlers,
-	CursorMcpCall,
-	CursorShellStreamCallbacks,
-	CursorToolResultHandler,
-	ImageContent,
-	Message,
-	Model,
-	StreamFunction,
-	StreamOptions,
-	TextContent,
-	ThinkingContent,
-	Tool,
-	ToolCall,
-	ToolResultMessage,
-} from "../types";
-import { normalizeSystemPrompts } from "../utils";
-import { AssistantMessageEventStream } from "../utils/event-stream";
-import { parseStreamingJson } from "../utils/json-parse";
-import { formatErrorMessageWithRetryAfter } from "../utils/retry-after";
-import { toolWireSchema } from "../utils/schema/wire";
-import type { McpToolDefinition } from "./cursor/gen/agent_pb";
+import type { McpToolDefinition } from "@oh-my-pi/pi-catalog/discovery/cursor-gen/agent_pb";
 import {
 	AgentClientMessageSchema,
 	AgentConversationTurnStructureSchema,
@@ -127,7 +100,35 @@ import {
 	WriteShellStdinErrorSchema,
 	WriteShellStdinResultSchema,
 	WriteSuccessSchema,
-} from "./cursor/gen/agent_pb";
+} from "@oh-my-pi/pi-catalog/discovery/cursor-gen/agent_pb";
+import { calculateCost } from "@oh-my-pi/pi-catalog/models";
+import { $env, extractHttpStatusFromError, sanitizeText } from "@oh-my-pi/pi-utils";
+import type {
+	Api,
+	AssistantMessage,
+	Context,
+	CursorExecHandlerResult,
+	CursorExecHandlers,
+	CursorMcpCall,
+	CursorShellStreamCallbacks,
+	CursorToolResultHandler,
+	ImageContent,
+	Message,
+	Model,
+	StreamFunction,
+	StreamOptions,
+	TextContent,
+	ThinkingContent,
+	Tool,
+	ToolCall,
+	ToolResultMessage,
+} from "../types";
+import { normalizeSystemPrompts } from "../utils";
+import { AssistantMessageEventStream } from "../utils/event-stream";
+import { parseStreamingJson } from "../utils/json-parse";
+import { createRequestDebugSession, isRequestDebugEnabled, type RequestDebugResponseLog } from "../utils/request-debug";
+import { formatErrorMessageWithRetryAfter } from "../utils/retry-after";
+import { toolWireSchema } from "../utils/schema/wire";
 
 export const CURSOR_API_URL = "https://api2.cursor.sh";
 export const CURSOR_CLIENT_VERSION = "cli-2026.01.09-231024f";
@@ -331,6 +332,7 @@ export const streamCursor: StreamFunction<"cursor-agent"> = (
 		let h2Client: http2.ClientHttp2Session | null = null;
 		let h2Request: http2.ClientHttp2Stream | null = null;
 		let heartbeatTimer: NodeJS.Timeout | null = null;
+		let debugResponseLogPromise: Promise<RequestDebugResponseLog | undefined> | undefined;
 
 		try {
 			const apiKey = options?.apiKey;
@@ -351,11 +353,10 @@ export const streamCursor: StreamFunction<"cursor-agent"> = (
 			const requestContextTools = buildMcpToolDefinitions(context.tools);
 
 			const baseUrl = model.baseUrl || CURSOR_API_URL;
-			h2Client = http2.connect(baseUrl);
-
-			h2Request = h2Client.request({
+			const requestPath = "/agent.v1.AgentService/Run";
+			const requestHeaders = {
 				":method": "POST",
-				":path": "/agent.v1.AgentService/Run",
+				":path": requestPath,
 				"content-type": "application/connect+proto",
 				"connect-protocol-version": "1",
 				te: "trailers",
@@ -364,7 +365,20 @@ export const streamCursor: StreamFunction<"cursor-agent"> = (
 				"x-cursor-client-version": CURSOR_CLIENT_VERSION,
 				"x-cursor-client-type": "cli",
 				"x-request-id": crypto.randomUUID(),
-			});
+			};
+			const debugSession = isRequestDebugEnabled()
+				? await createRequestDebugSession({
+						protocol: "http2",
+						method: "POST",
+						url: new URL(requestPath, baseUrl).toString(),
+						headers: requestHeaders,
+						bodyBase64: Buffer.from(requestBytes).toString("base64"),
+					})
+				: undefined;
+
+			h2Client = http2.connect(baseUrl);
+
+			h2Request = h2Client.request(requestHeaders);
 
 			stream.push({ type: "start", partial: output });
 
@@ -408,7 +422,19 @@ export const streamCursor: StreamFunction<"cursor-agent"> = (
 
 			let resolveH2: (() => void) | undefined;
 
+			h2Request.on("response", headers => {
+				debugResponseLogPromise = debugSession?.openResponseLog(
+					`HTTP/2 ${headers[":status"] ?? ""}`.trim(),
+					headers,
+				);
+			});
+
 			h2Request.on("data", (chunk: Buffer) => {
+				if (debugResponseLogPromise) {
+					void debugResponseLogPromise.then(log => {
+						log?.write(chunk);
+					});
+				}
 				pendingBuffer = Buffer.concat([pendingBuffer, chunk]);
 
 				while (pendingBuffer.length >= 5) {
@@ -480,51 +506,50 @@ export const streamCursor: StreamFunction<"cursor-agent"> = (
 			await new Promise<void>((resolve, reject) => {
 				resolveH2 = resolve;
 
+				const closeDebugLog = async (): Promise<void> => {
+					const log = await debugResponseLogPromise;
+					await log?.close();
+				};
+
 				h2Request!.on("trailers", trailers => {
 					const status = trailers["grpc-status"];
 					const msg = trailers["grpc-message"];
 					if (status && status !== "0") {
-						reject(new Error(`gRPC error ${status}: ${decodeURIComponent(String(msg || ""))}`));
+						void closeDebugLog().finally(() => {
+							reject(new Error(`gRPC error ${status}: ${decodeURIComponent(String(msg || ""))}`));
+						});
 					}
 				});
 
 				h2Request!.on("end", () => {
 					resolveH2 = undefined;
-					if (endStreamError) {
-						reject(endStreamError);
-						return;
-					}
-					resolve();
+					void closeDebugLog()
+						.then(() => {
+							if (endStreamError) {
+								reject(endStreamError);
+								return;
+							}
+							resolve();
+						})
+						.catch(reject);
 				});
 
-				h2Request!.on("error", reject);
+				h2Request!.on("error", error => {
+					void closeDebugLog().finally(() => reject(error));
+				});
 
 				if (options?.signal) {
 					options.signal.addEventListener("abort", () => {
 						h2Request?.close();
-						reject(new Error("Request was aborted"));
+						void closeDebugLog().finally(() => {
+							reject(new Error("Request was aborted"));
+						});
 					});
 				}
 			});
 
-			if (state.currentTextBlock) {
-				const idx = output.content.indexOf(state.currentTextBlock);
-				stream.push({
-					type: "text_end",
-					contentIndex: idx,
-					content: state.currentTextBlock.text,
-					partial: output,
-				});
-			}
-			if (state.currentThinkingBlock) {
-				const idx = output.content.indexOf(state.currentThinkingBlock);
-				stream.push({
-					type: "thinking_end",
-					contentIndex: idx,
-					content: state.currentThinkingBlock.thinking,
-					partial: output,
-				});
-			}
+			endCurrentTextBlock(output, stream, state);
+			endCurrentThinkingBlock(output, stream, state);
 			if (state.currentToolCall) {
 				const idx = output.content.indexOf(state.currentToolCall);
 				state.currentToolCall.arguments = parseStreamingJson(state.currentToolCall.partialJson);
@@ -557,6 +582,8 @@ export const streamCursor: StreamFunction<"cursor-agent"> = (
 			stream.push({ type: "error", reason: output.stopReason, error: output });
 			stream.end();
 		} finally {
+			const log = await debugResponseLogPromise;
+			await log?.close();
 			if (heartbeatTimer) {
 				clearInterval(heartbeatTimer);
 				heartbeatTimer = null;
@@ -569,9 +596,9 @@ export const streamCursor: StreamFunction<"cursor-agent"> = (
 	return stream;
 };
 
-type ToolCallState = ToolCall & { index: number; partialJson?: string; kind: "mcp" | "todo_write" };
+export type ToolCallState = ToolCall & { index: number; partialJson?: string; kind: "mcp" | "todo" };
 
-interface BlockState {
+export interface BlockState {
 	currentTextBlock: (TextContent & { index: number }) | null;
 	currentThinkingBlock: (ThinkingContent & { index: number }) | null;
 	currentToolCall: ToolCallState | null;
@@ -582,7 +609,7 @@ interface BlockState {
 	setFirstTokenTime: () => void;
 }
 
-interface UsageState {
+export interface UsageState {
 	sawTokenDelta: boolean;
 }
 
@@ -1829,7 +1856,7 @@ interface CursorUpdateTodosToolCall {
 	updateTodosToolCall?: { args?: { todos?: CursorTodoItem[] } };
 }
 
-function buildTodoWriteArgs(toolCall: CursorUpdateTodosToolCall): {
+function buildTodoArgs(toolCall: CursorUpdateTodosToolCall): {
 	todos: Array<{ id?: string; content: string; activeForm: string; status: "pending" | "in_progress" | "completed" }>;
 } | null {
 	const todos = toolCall.updateTodosToolCall?.args?.todos;
@@ -1897,7 +1924,72 @@ function buildMcpErrorResult(error: string) {
 	});
 }
 
-function processInteractionUpdate(
+/**
+ * Merge the decoded completion-frame `McpArgs` map into the args assembled
+ * from streamed `args_text_delta` snapshots.
+ *
+ * The completion frame is authoritative for the scalars it carries — but it
+ * can omit oversized parameters entirely and can downgrade a structured value
+ * to its raw string fallback when `decodeMcpArgValue` cannot parse it as
+ * JSON. Overwriting the streamed args wholesale therefore loses data (e.g.
+ * the task tool's `tasks` array on multi-subagent dispatches, issue #2615).
+ *
+ * Rules per key:
+ * - completion key absent  → keep the streamed value.
+ * - completion is a string while the streamed value is structured (object or
+ *   array) → keep the streamed value (the completion frame downgraded it).
+ * - otherwise               → completion wins.
+ */
+export function mergeCursorMcpToolCallArgs(
+	streamed: Record<string, unknown> | undefined,
+	completion: Record<string, unknown> | undefined,
+): Record<string, unknown> {
+	const merged: Record<string, unknown> = { ...(streamed ?? {}) };
+	if (!completion) return merged;
+	for (const [key, completionValue] of Object.entries(completion)) {
+		const streamedValue = merged[key];
+		if (typeof completionValue === "string" && streamedValue !== null && typeof streamedValue === "object") {
+			continue;
+		}
+		merged[key] = completionValue;
+	}
+	return merged;
+}
+
+function endCurrentTextBlock(output: AssistantMessage, stream: AssistantMessageEventStream, state: BlockState): void {
+	const block = state.currentTextBlock;
+	if (!block) return;
+	const idx = output.content.indexOf(block);
+	delete (block as { index?: number }).index;
+	stream.push({
+		type: "text_end",
+		contentIndex: idx,
+		content: block.text,
+		partial: output,
+	});
+	state.setTextBlock(null);
+}
+
+function endCurrentThinkingBlock(
+	output: AssistantMessage,
+	stream: AssistantMessageEventStream,
+	state: BlockState,
+): void {
+	const block = state.currentThinkingBlock;
+	if (!block) return;
+	const idx = output.content.indexOf(block);
+	delete (block as { index?: number }).index;
+	stream.push({
+		type: "thinking_end",
+		contentIndex: idx,
+		content: block.thinking,
+		partial: output,
+	});
+	state.setThinkingBlock(null);
+}
+
+/** Exported for tests: drives one Cursor interaction update through the streaming state machine. */
+export function processInteractionUpdate(
 	update: any,
 	output: AssistantMessage,
 	stream: AssistantMessageEventStream,
@@ -1941,18 +2033,10 @@ function processInteractionUpdate(
 		const idx = output.content.indexOf(state.currentThinkingBlock!);
 		stream.push({ type: "thinking_delta", contentIndex: idx, delta, partial: output });
 	} else if (updateCase === "thinkingCompleted") {
-		if (state.currentThinkingBlock) {
-			const idx = output.content.indexOf(state.currentThinkingBlock);
-			delete (state.currentThinkingBlock as any).index;
-			stream.push({
-				type: "thinking_end",
-				contentIndex: idx,
-				content: state.currentThinkingBlock.thinking,
-				partial: output,
-			});
-			state.setThinkingBlock(null);
-		}
+		endCurrentThinkingBlock(output, stream, state);
 	} else if (updateCase === "toolCallStarted") {
+		endCurrentTextBlock(output, stream, state);
+		endCurrentThinkingBlock(output, stream, state);
 		const toolCall = update.message.value.toolCall;
 		if (toolCall) {
 			const mcpCall = toolCall.mcpToolCall;
@@ -1973,16 +2057,16 @@ function processInteractionUpdate(
 				return;
 			}
 
-			const todoArgs = buildTodoWriteArgs(toolCall);
+			const todoArgs = buildTodoArgs(toolCall);
 			if (todoArgs) {
 				const callId = update.message.value.callId || crypto.randomUUID();
 				const block: ToolCallState = {
 					type: "toolCall",
 					id: callId,
-					name: "todo_write",
+					name: "todo",
 					arguments: todoArgs,
 					index: output.content.length,
-					kind: "todo_write",
+					kind: "todo",
 				};
 				output.content.push(block);
 				state.setToolCall(block);
@@ -1991,22 +2075,32 @@ function processInteractionUpdate(
 		}
 	} else if (updateCase === "toolCallDelta" || updateCase === "partialToolCall") {
 		if (state.currentToolCall?.kind === "mcp") {
-			const delta = update.message.value.argsTextDelta || "";
-			state.currentToolCall.partialJson = `${state.currentToolCall.partialJson ?? ""}${delta}`;
-			state.currentToolCall.arguments = parseStreamingJson(state.currentToolCall.partialJson ?? "");
+			// Cursor's `args_text_delta` is "aggregated args text so far" per agent.proto: each
+			// delta is a cumulative snapshot of the JSON-text args. Strip the prefix we already
+			// have to recover the new suffix; fall back to treating the value as an incremental
+			// fragment when it doesn't extend the buffer.
+			const snapshot: string = update.message.value.argsTextDelta || "";
+			const current = state.currentToolCall.partialJson ?? "";
+			const chunk = snapshot.startsWith(current) ? snapshot.slice(current.length) : snapshot;
+			if (chunk.length === 0) {
+				return;
+			}
+			state.currentToolCall.partialJson = current + chunk;
+			state.currentToolCall.arguments = parseStreamingJson(state.currentToolCall.partialJson);
 			const idx = output.content.indexOf(state.currentToolCall);
-			stream.push({ type: "toolcall_delta", contentIndex: idx, delta, partial: output });
+			stream.push({ type: "toolcall_delta", contentIndex: idx, delta: chunk, partial: output });
 		}
 	} else if (updateCase === "toolCallCompleted") {
 		if (state.currentToolCall) {
 			const toolCall = update.message.value.toolCall;
 			if (state.currentToolCall.kind === "mcp") {
 				const decodedArgs = decodeMcpArgsMap(toolCall?.mcpToolCall?.args?.args);
-				if (decodedArgs) {
-					state.currentToolCall.arguments = decodedArgs;
-				}
-			} else if (state.currentToolCall.kind === "todo_write" && toolCall) {
-				const todoArgs = buildTodoWriteArgs(toolCall);
+				state.currentToolCall.arguments = mergeCursorMcpToolCallArgs(
+					state.currentToolCall.arguments as Record<string, unknown> | undefined,
+					decodedArgs,
+				);
+			} else if (state.currentToolCall.kind === "todo" && toolCall) {
+				const todoArgs = buildTodoArgs(toolCall);
 				if (todoArgs) {
 					state.currentToolCall.arguments = todoArgs;
 				}
@@ -2066,7 +2160,7 @@ function readCursorBlob(blobStore: Map<string, Uint8Array>, blobId: Uint8Array):
 	return data;
 }
 
-const CURSOR_NATIVE_TOOL_NAMES = new Set(["bash", "read", "write", "delete", "ls", "grep", "lsp", "todo_write"]);
+const CURSOR_NATIVE_TOOL_NAMES = new Set(["bash", "read", "write", "delete", "ls", "grep", "lsp", "todo"]);
 
 function buildMcpToolDefinitions(tools: Tool[] | undefined): McpToolDefinition[] {
 	if (!tools || tools.length === 0) {
@@ -2204,7 +2298,7 @@ function findLastUserMessageIndex(messages: Message[]): number {
  * actual model prompt. `turns[]` is UI/display metadata. Without populating
  * this field, multi-turn conversations lose prior context — the model sees
  * only an empty placeholder where historical user turns should be.
- * The last user message is excluded because it is sent in the action.
+ * The active user message is excluded because it is sent in the action.
  */
 /**
  * Build one Cursor system-message JSON blob per ordered system prompt. Emitting separate blobs
@@ -2227,17 +2321,16 @@ function buildRootPromptMessagesJson(
 	messages: Message[],
 	systemPromptIds: Uint8Array[],
 	blobStore: Map<string, Uint8Array>,
+	activeUserMessageIndex = findLastUserMessageIndex(messages),
 ): Uint8Array[] {
 	const entries: Uint8Array[] = [...systemPromptIds];
-	const lastUserIdx = findLastUserMessageIndex(messages);
-
 	const pushJson = (obj: unknown) => {
 		const bytes = new TextEncoder().encode(JSON.stringify(obj));
 		entries.push(storeCursorBlob(blobStore, bytes));
 	};
 
 	for (let i = 0; i < messages.length; i++) {
-		if (i === lastUserIdx) break;
+		if (i === activeUserMessageIndex) break;
 		const msg = messages[i];
 		if (msg.role === "user" || msg.role === "developer") {
 			const content = buildCursorRootPromptContent(msg.content);
@@ -2250,9 +2343,10 @@ function buildRootPromptMessagesJson(
 		} else if (msg.role === "toolResult") {
 			const text = toolResultToText(msg);
 			if (!text) continue;
+			const prefix = msg.isError ? "[Tool Error]" : "[Tool Result]";
 			pushJson({
 				role: "user",
-				content: [{ type: "text", text: `[Tool Result]\n${text}` }],
+				content: [{ type: "text", text: `${prefix}\n${text}` }],
 			});
 		}
 	}
@@ -2263,12 +2357,16 @@ function buildRootPromptMessagesJson(
 /**
  * Convert context.messages to Cursor's ConversationTurnStructure blob IDs.
  * Groups messages into turns: each turn is a user message followed by the assistant's response.
- * Excludes the last user message (which goes in the action).
+ * Excludes the active user message (which goes in the action).
  *
  * Each `AgentConversationTurnStructure.user_message`, `steps[]`, and the outer
  * `ConversationStateStructure.turns[]` entry is a blob ID into `blobStore`.
  */
-function buildConversationTurns(messages: Message[], blobStore: Map<string, Uint8Array>): Uint8Array[] {
+function buildConversationTurns(
+	messages: Message[],
+	blobStore: Map<string, Uint8Array>,
+	activeUserMessageIndex = findLastUserMessageIndex(messages),
+): Uint8Array[] {
 	const turns: Uint8Array[] = [];
 
 	// Find turn boundaries - each turn starts with a user message
@@ -2282,15 +2380,10 @@ function buildConversationTurns(messages: Message[], blobStore: Map<string, Uint
 			continue;
 		}
 
-		// Check if this is the last user message (which goes in the action, not turns)
-		let isLastUserMessage = true;
-		for (let j = i + 1; j < messages.length; j++) {
-			if (messages[j].role === "user" || messages[j].role === "developer") {
-				isLastUserMessage = false;
-				break;
-			}
-		}
-		if (isLastUserMessage) {
+		// The active user message goes in the action, not turns. A prior user
+		// followed by assistant/tool-result messages is complete history and
+		// must remain serialized for resume actions.
+		if (i === activeUserMessageIndex) {
 			break;
 		}
 
@@ -2331,10 +2424,11 @@ function buildConversationTurns(messages: Message[], blobStore: Map<string, Uint
 				// Include tool results as assistant text for context
 				const text = toolResultToText(stepMsg);
 				if (text) {
+					const prefix = stepMsg.isError ? "[Tool Error]" : "[Tool Result]";
 					const step = create(ConversationStepSchema, {
 						message: {
 							case: "assistantMessage",
-							value: create(AssistantMessageSchema, { text: `[Tool Result]\n${text}` }),
+							value: create(AssistantMessageSchema, { text: `${prefix}\n${text}` }),
 						},
 					});
 					stepBlobIds.push(storeCursorBlob(blobStore, toBinary(ConversationStepSchema, step)));
@@ -2363,24 +2457,35 @@ function buildConversationTurns(messages: Message[], blobStore: Map<string, Uint
 }
 
 /** Exported for tests: decodes Cursor history blobs built from conversation messages. */
-export function buildCursorHistoryForTest(messages: Message[]): {
+export function buildCursorHistoryForTest(
+	messages: Message[],
+	activeUserMessageIndex = findLastUserMessageIndex(messages),
+): {
 	rootPromptMessagesJson: unknown[];
 	turnUserMessagesJson: JsonValue[];
+	turnStepMessagesJson: JsonValue[][];
 } {
 	const blobStore = new Map<string, Uint8Array>();
-	const rootPromptMessagesJson = buildRootPromptMessagesJson(messages, [], blobStore).map(blobId =>
-		JSON.parse(new TextDecoder().decode(readCursorBlob(blobStore, blobId))),
+	const rootPromptMessagesJson = buildRootPromptMessagesJson(messages, [], blobStore, activeUserMessageIndex).map(
+		blobId => JSON.parse(new TextDecoder().decode(readCursorBlob(blobStore, blobId))),
 	);
 	const turnUserMessagesJson: JsonValue[] = [];
-	for (const turnBlobId of buildConversationTurns(messages, blobStore)) {
+	const turnStepMessagesJson: JsonValue[][] = [];
+	for (const turnBlobId of buildConversationTurns(messages, blobStore, activeUserMessageIndex)) {
 		const turn = fromBinary(ConversationTurnStructureSchema, readCursorBlob(blobStore, turnBlobId));
 		if (turn.turn.case !== "agentConversationTurn") {
 			continue;
 		}
 		const userMessage = fromBinary(UserMessageSchema, readCursorBlob(blobStore, turn.turn.value.userMessage));
 		turnUserMessagesJson.push(toJson(UserMessageSchema, userMessage));
+		turnStepMessagesJson.push(
+			turn.turn.value.steps.map(stepBlobId => {
+				const step = fromBinary(ConversationStepSchema, readCursorBlob(blobStore, stepBlobId));
+				return toJson(ConversationStepSchema, step);
+			}),
+		);
 	}
-	return { rootPromptMessagesJson, turnUserMessagesJson };
+	return { rootPromptMessagesJson, turnUserMessagesJson, turnStepMessagesJson };
 }
 function createCursorUserMessage(
 	content: string | (TextContent | ImageContent)[],
@@ -2436,12 +2541,15 @@ function buildGrpcRequest(
 		storeCursorBlob(blobStore, new TextEncoder().encode(json)),
 	);
 
-	const lastMessage = context.messages[context.messages.length - 1];
+	const activeUserMessageIndex = context.messages.length - 1;
+	const activeMessage = context.messages[activeUserMessageIndex];
+	const activeUserMessage =
+		activeMessage?.role === "user" || activeMessage?.role === "developer" ? activeMessage : undefined;
 	let userContent: string | (TextContent | ImageContent)[] | undefined;
 	let userText = "";
 	let hasUserImages = false;
-	if (lastMessage?.role === "user" || lastMessage?.role === "developer") {
-		userContent = lastMessage.content;
+	if (activeUserMessage?.role === "user" || activeUserMessage?.role === "developer") {
+		userContent = activeUserMessage.content;
 		if (typeof userContent === "string") {
 			userText = userContent.trim();
 		} else {
@@ -2465,15 +2573,20 @@ function buildGrpcRequest(
 					},
 	});
 
-	// Build conversation turns from prior messages (excluding the last user message).
-	// This populates the UI-side history view (`turns[]`).
-	const turns = buildConversationTurns(context.messages, blobStore);
+	// Build conversation turns from prior messages, excluding only the active user message
+	// when the request is sending one. Resume actions must preserve trailing tool results.
+	const turns = buildConversationTurns(context.messages, blobStore, activeUserMessage ? activeUserMessageIndex : -1);
 
 	// Build `rootPromptMessagesJson` from prior messages. Cursor's server uses this
 	// field (not `turns[]`) to construct the actual model prompt; if we only send the
 	// system prompt here, multi-turn conversations lose prior context and the model
 	// sees only the current user message.
-	const rootPromptMessagesJson = buildRootPromptMessagesJson(context.messages, systemPromptIds, blobStore);
+	const rootPromptMessagesJson = buildRootPromptMessagesJson(
+		context.messages,
+		systemPromptIds,
+		blobStore,
+		activeUserMessage ? activeUserMessageIndex : -1,
+	);
 
 	// Preserve cached non-history state fields (todos, file states, summaries, etc.)
 	// when the system prompt is unchanged; otherwise start fresh.

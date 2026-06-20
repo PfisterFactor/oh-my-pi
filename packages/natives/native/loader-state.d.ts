@@ -47,12 +47,20 @@ export interface ResolveLoaderCandidatesInput {
 	isCompiledBinary: boolean;
 	stageFromNodeModules?: boolean;
 	nativeDir: string;
+	leafPackageDir?: string | null;
 	execDir: string;
 	versionedDir: string;
 	userDataDir: string;
 }
 
 export function resolveLoaderCandidates(input: ResolveLoaderCandidatesInput): string[];
+
+export interface CleanupStaleNativeVersionsInput {
+	nativesDir: string;
+	currentVersion: string;
+}
+
+export function cleanupStaleNativeVersions(input: CleanupStaleNativeVersionsInput): string[];
 
 export interface ExtractEmbeddedAddonArchiveInput {
 	archivePath: string;

@@ -2,9 +2,10 @@ import { describe, expect, it } from "bun:test";
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
 import type { Api, Context, Model, Tool, ToolResultMessage } from "@oh-my-pi/pi-ai";
-import { complete, getBundledModel } from "@oh-my-pi/pi-ai";
+import { complete } from "@oh-my-pi/pi-ai";
 import type { OptionsForApi } from "@oh-my-pi/pi-ai/types";
-import * as z from "zod/v4";
+import { getBundledModel } from "@oh-my-pi/pi-catalog/models";
+import { z } from "zod/v4";
 import { e2eApiKey, resolveApiKey } from "./oauth";
 
 // Resolve OAuth tokens at module level (async, runs before tests)
@@ -63,7 +64,7 @@ async function handleToolWithImageResult<TApi extends Api>(model: Model<TApi>, o
 	// Find the tool call
 	const toolCall = firstResponse.content.find(b => b.type === "toolCall");
 	expect(toolCall).toBeTruthy();
-	if (!toolCall || toolCall.type !== "toolCall") {
+	if (toolCall?.type !== "toolCall") {
 		throw new Error("Expected tool call");
 	}
 	expect(toolCall.name).toBe("get_circle");
@@ -152,7 +153,7 @@ async function handleToolWithTextAndImageResult<TApi extends Api>(model: Model<T
 	// Find the tool call
 	const toolCall = firstResponse.content.find(b => b.type === "toolCall");
 	expect(toolCall).toBeTruthy();
-	if (!toolCall || toolCall.type !== "toolCall") {
+	if (toolCall?.type !== "toolCall") {
 		throw new Error("Expected tool call");
 	}
 	expect(toolCall.name).toBe("get_circle_with_description");

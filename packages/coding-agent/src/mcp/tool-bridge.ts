@@ -15,6 +15,7 @@ import type {
 	RenderResultOptions,
 } from "../extensibility/custom-tools/types";
 import type { Theme } from "../modes/theme/theme";
+import type { OutputMeta } from "../tools/output-meta";
 import { ToolAbortError, throwIfAborted } from "../tools/tool-errors";
 import { callTool } from "./client";
 import { renderMCPCall, renderMCPResult } from "./render";
@@ -71,6 +72,8 @@ export interface MCPToolDetails {
 	provider?: string;
 	/** Provider display name (e.g., "Claude Code", "MCP Config") */
 	providerName?: string;
+	/** Structured output metadata (set by the spill wrapper when output is truncated to an artifact). */
+	meta?: OutputMeta;
 }
 /**
  * Format MCP content for LLM consumption.
@@ -116,10 +119,12 @@ function buildResult(
 		provider,
 		providerName,
 	};
+	const contentText = result.isError ? `Error: ${text}` : text;
+	const toolResult: CustomToolResult<MCPToolDetails> = { content: [{ type: "text", text: contentText }], details };
 	if (result.isError) {
-		return { content: [{ type: "text", text: `Error: ${text}` }], details };
+		toolResult.isError = true;
 	}
-	return { content: [{ type: "text", text }], details };
+	return toolResult;
 }
 
 /** Build an error CustomToolResult from a caught exception. */
@@ -134,6 +139,7 @@ function buildErrorResult(
 	return {
 		content: [{ type: "text", text: `MCP error: ${message}` }],
 		details: { serverName, mcpToolName, isError: true, provider, providerName },
+		isError: true,
 	};
 }
 
@@ -217,6 +223,9 @@ export class MCPTool implements CustomTool<TSchema, MCPToolDetails> {
 	readonly mcpToolName: string;
 	/** Server name */
 	readonly mcpServerName: string;
+	readonly approval = "write" as const;
+	/** Render completed MCP calls with the result header replacing the pending call header. */
+	readonly mergeCallAndResult = true;
 
 	/** Create MCPTool instances for all tools from an MCP server connection */
 	static fromTools(connection: MCPServerConnection, tools: MCPToolDefinition[], reconnect?: MCPReconnect): MCPTool[] {
@@ -300,6 +309,10 @@ export class DeferredMCPTool implements CustomTool<TSchema, MCPToolDetails> {
 	readonly mcpToolName: string;
 	/** Server name */
 	readonly mcpServerName: string;
+	readonly approval = "write" as const;
+	/** Render completed MCP calls with the result header replacing the pending call header. */
+	readonly mergeCallAndResult = true;
+
 	readonly #fallbackProvider: string | undefined;
 	readonly #fallbackProviderName: string | undefined;
 

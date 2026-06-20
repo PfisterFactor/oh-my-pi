@@ -2,7 +2,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "bun:test";
 import * as fs from "node:fs";
 import * as path from "node:path";
 import { Agent } from "@oh-my-pi/pi-agent-core";
-import { getBundledModel } from "@oh-my-pi/pi-ai/models";
+import { getBundledModel } from "@oh-my-pi/pi-catalog/models";
 import { ModelRegistry } from "@oh-my-pi/pi-coding-agent/config/model-registry";
 import { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
 import { loadExtensions } from "@oh-my-pi/pi-coding-agent/extensibility/extensions/loader";
@@ -125,12 +125,19 @@ describe("AgentSession auto-compaction queue resume", () => {
 	});
 
 	afterEach(async () => {
-		await session.dispose();
-		authStorage.close();
-		tempDir.removeSync();
-		vi.useRealTimers();
-		getRuntimeSignals().length = 0;
-		vi.restoreAllMocks();
+		try {
+			await session?.dispose();
+		} finally {
+			try {
+				authStorage?.close();
+				vi.useRealTimers();
+				await Bun.sleep(0);
+				await tempDir?.remove();
+			} finally {
+				getRuntimeSignals().length = 0;
+				vi.restoreAllMocks();
+			}
+		}
 	});
 
 	it("resumes after threshold compaction when only agent-level queued messages exist", async () => {
@@ -144,7 +151,13 @@ describe("AgentSession auto-compaction queue resume", () => {
 
 		expect(session.agent.hasQueuedMessages()).toBe(true);
 
-		const continueSpy = vi.spyOn(session.agent, "continue").mockResolvedValue();
+		const continueSpy = vi.spyOn(session.agent, "continue").mockImplementation(async () => {
+			// Real continue() polls and consumes the queued steering/follow-up
+			// messages. Mirror that here so the stranded-queue drain settles after
+			// one resume instead of rescheduling itself forever (a no-op mock
+			// leaves the queue populated, spinning the drain into an OOM loop).
+			session.agent.clearAllQueues();
+		});
 
 		// Wait for auto_compaction_end event to know when the async handler is done
 		const { promise: compactionDone, resolve: onCompactionDone } = Promise.withResolvers<void>();
@@ -156,7 +169,10 @@ describe("AgentSession auto-compaction queue resume", () => {
 		// compaction (contextWindow=200000, threshold ~80%).
 		const assistantMsg = {
 			role: "assistant" as const,
-			content: [],
+			// Non-empty content: an empty `stop` turn would trip the empty-stop guard
+			// (#handleEmptyAssistantStop) and short-circuit the agent_end handler before
+			// compaction/todo checks run — hanging this test forever under fake timers.
+			content: [{ type: "text" as const, text: "Done." }],
 			api: "anthropic-messages" as const,
 			provider: "anthropic" as const,
 			model: "claude-sonnet-4-5",
@@ -197,6 +213,54 @@ describe("AgentSession auto-compaction queue resume", () => {
 		expect(runtimeSignals.some(signal => signal.startsWith("compaction:end:"))).toBe(true);
 	});
 
+	it("has isCompacting true when the auto_compaction_start event fires", async () => {
+		// Defect 1: the compaction AbortController (which backs isCompacting) must be
+		// installed before auto_compaction_start is emitted. If it is installed after,
+		// a message typed the instant the loader appears is read while
+		// isCompacting === false and mis-routed into the core steering queue (which a
+		// later handoff reset would wipe) instead of the safe UI compaction queue.
+		let capturedIsCompacting: boolean | undefined;
+		const { promise: compactionDone, resolve: onCompactionDone } = Promise.withResolvers<void>();
+		session.subscribe(event => {
+			if (event.type === "auto_compaction_start") {
+				capturedIsCompacting = session.isCompacting;
+			} else if (event.type === "auto_compaction_end") {
+				onCompactionDone();
+			}
+		});
+
+		// Defensive: mirror the resume-drain stub so any queued continuation settles
+		// instead of spinning the drain (see the threshold test above).
+		vi.spyOn(session.agent, "continue").mockImplementation(async () => {
+			session.agent.clearAllQueues();
+		});
+
+		const assistantMsg = {
+			role: "assistant" as const,
+			content: [{ type: "text" as const, text: "Done." }],
+			api: "anthropic-messages" as const,
+			provider: "anthropic" as const,
+			model: "claude-sonnet-4-5",
+			stopReason: "stop" as const,
+			usage: {
+				input: 190000,
+				output: 1000,
+				cacheRead: 0,
+				cacheWrite: 0,
+				totalTokens: 191000,
+				cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+			},
+			timestamp: Date.now(),
+		};
+
+		session.agent.emitExternalEvent({ type: "message_end", message: assistantMsg });
+		session.agent.emitExternalEvent({ type: "agent_end", messages: [assistantMsg] });
+
+		await compactionDone;
+
+		expect(capturedIsCompacting).toBe(true);
+	});
+
 	it("forwards todo reminder lifecycle signals to extensions", async () => {
 		const continueSpy = vi.spyOn(session.agent, "continue").mockResolvedValue();
 
@@ -214,7 +278,8 @@ describe("AgentSession auto-compaction queue resume", () => {
 
 		const assistantMsg = {
 			role: "assistant" as const,
-			content: [],
+			// Non-empty content: see comment on the first test's assistantMsg.
+			content: [{ type: "text" as const, text: "Done." }],
 			api: "anthropic-messages" as const,
 			provider: "anthropic" as const,
 			model: "claude-sonnet-4-5",

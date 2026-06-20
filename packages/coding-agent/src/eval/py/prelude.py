@@ -3,7 +3,9 @@ from __future__ import annotations
 if "__omp_prelude_loaded__" not in globals():
     __omp_prelude_loaded__ = True
     from pathlib import Path
-    import os, json
+    import os, json, math, re
+    from urllib.parse import unquote
+    INTENT_FIELD = "i"
 
     # __omp_display is injected by runner.py before the prelude executes; it
     # mirrors IPython's display() semantics with the same MIME bundle output.
@@ -53,9 +55,47 @@ if "__omp_prelude_loaded__" not in globals():
         _emit_status("env", key=key, value=val, action="get")
         return val
 
-    def read(path: str | Path, *, offset: int = 1, limit: int | None = None) -> str:
+    _OMP_INTERNAL_URL_RE = re.compile(r"^([a-z][a-z0-9+.-]*)://(.*)$", re.IGNORECASE)
+
+    def _resolve_omp_path(path: str | Path) -> Path:
+        """Map a helper path to a real filesystem Path.
+
+        A `scheme://…` whose scheme has an injected on-disk root (e.g.
+        `local://`, via PI_EVAL_LOCAL_ROOTS) is rewritten under that root so it
+        lands where `read local://…` resolves — not a literal `local:/`
+        directory under the cwd (which `Path("local://x")` collapses to). Plain
+        paths pass through unchanged; any other `scheme://` is rejected."""
+        if not isinstance(path, str):
+            return Path(path)
+        match = _OMP_INTERNAL_URL_RE.match(path)
+        if not match:
+            return Path(path)
+        scheme = match.group(1).lower()
+        try:
+            roots = json.loads(os.environ.get("PI_EVAL_LOCAL_ROOTS") or "{}")
+        except (ValueError, TypeError):
+            roots = {}
+        root = roots.get(scheme) if isinstance(roots, dict) else None
+        if not root:
+            raise ValueError(f"Protocol paths are not supported by this helper: {path}")
+        relative = unquote(match.group(2).replace("\\", "/"))
+        # Mirror the host `path.resolve`/`resolveLocalUrlToPath`: normalize and
+        # make absolute WITHOUT realpath'ing symlinks (Path.resolve would turn
+        # /tmp into /private/tmp and diverge from the read-side resolution).
+        root_path = os.path.abspath(root)
+        if relative == "":
+            return Path(root_path)
+        rel_path = Path(relative)
+        if rel_path.is_absolute() or ".." in rel_path.parts:
+            raise ValueError(f"Unsafe {scheme}:// path (absolute or traversal): {path}")
+        resolved = os.path.abspath(os.path.join(root_path, relative))
+        if resolved != root_path and not resolved.startswith(root_path + os.sep):
+            raise ValueError(f"{scheme}:// path escapes its root: {path}")
+        return Path(resolved)
+
+    def read(path: str | Path, offset: int = 1, limit: int | None = None) -> str:
         """Read file contents. offset/limit are 1-indexed line numbers."""
-        p = Path(path)
+        p = _resolve_omp_path(path)
         data = p.read_text(encoding="utf-8")
         lines = data.splitlines(keepends=True)
         if offset > 1 or limit is not None:
@@ -69,7 +109,7 @@ if "__omp_prelude_loaded__" not in globals():
 
     def write(path: str | Path, content: str) -> Path:
         """Write file contents (create parents)."""
-        p = Path(path)
+        p = _resolve_omp_path(path)
         p.parent.mkdir(parents=True, exist_ok=True)
         p.write_text(content, encoding="utf-8")
         _emit_status("write", path=str(p), chars=len(content))
@@ -77,7 +117,7 @@ if "__omp_prelude_loaded__" not in globals():
 
     def append(path: str | Path, content: str) -> Path:
         """Append to file."""
-        p = Path(path)
+        p = _resolve_omp_path(path)
         p.parent.mkdir(parents=True, exist_ok=True)
         with p.open("a", encoding="utf-8") as f:
             f.write(content)
@@ -385,6 +425,40 @@ if "__omp_prelude_loaded__" not in globals():
             raise RuntimeError("tool bridge is unavailable in this kernel")
         return (base.rstrip("/"), token, session)
 
+    def _bridge_call(name: str, args: dict):
+        """POST one request to the host tool bridge and return its `value`."""
+        import urllib.request, urllib.error
+        base, token, session = _tool_proxy_from_env()
+        _run_id_getter = globals().get("__omp_current_run_id__")
+        _run_id = _run_id_getter() if callable(_run_id_getter) else globals().get("__omp_run_id__")
+        payload = json.dumps(
+            {"session": session, "run": _run_id, "name": name, "args": args}
+        ).encode("utf-8")
+        req = urllib.request.Request(
+            f"{base}/v1/tool",
+            data=payload,
+            method="POST",
+            headers={
+                "Content-Type": "application/json",
+                "Authorization": f"Bearer {token}",
+            },
+        )
+        try:
+            with urllib.request.urlopen(req) as resp:
+                body = resp.read()
+        except urllib.error.HTTPError as exc:
+            body = exc.read()
+        try:
+            data = json.loads(body)
+        except json.JSONDecodeError:
+            raise RuntimeError(
+                f"bridge call {name!r}: non-JSON response: {body[:200]!r}"
+            ) from None
+        if not isinstance(data, dict) or not data.get("ok"):
+            msg = (data or {}).get("error") if isinstance(data, dict) else None
+            raise RuntimeError(msg or f"bridge call {name!r} failed")
+        return data.get("value")
+
     class _ToolCallable:
         """Invokes one host-side tool via the loopback HTTP bridge."""
 
@@ -397,7 +471,6 @@ if "__omp_prelude_loaded__" not in globals():
             return f"<tool.{self._name}>"
 
         def __call__(self, args=None, /, **kwargs):
-            import urllib.request, urllib.error
             if args is None:
                 merged: dict = {}
             elif isinstance(args, dict):
@@ -407,38 +480,9 @@ if "__omp_prelude_loaded__" not in globals():
                     f"tool.{self._name}(...) expects a dict of arguments (got {type(args).__name__})"
                 )
             merged.update(kwargs)
-            if "_i" not in merged:
-                merged["_i"] = "py prelude"
-            base, token, session = _tool_proxy_from_env()
-            _run_id_getter = globals().get("__omp_current_run_id__")
-            _run_id = _run_id_getter() if callable(_run_id_getter) else globals().get("__omp_run_id__")
-            payload = json.dumps(
-                {"session": session, "run": _run_id, "name": self._name, "args": merged}
-            ).encode("utf-8")
-            req = urllib.request.Request(
-                f"{base}/v1/tool",
-                data=payload,
-                method="POST",
-                headers={
-                    "Content-Type": "application/json",
-                    "Authorization": f"Bearer {token}",
-                },
-            )
-            try:
-                with urllib.request.urlopen(req) as resp:
-                    body = resp.read()
-            except urllib.error.HTTPError as exc:
-                body = exc.read()
-            try:
-                data = json.loads(body)
-            except json.JSONDecodeError:
-                raise RuntimeError(
-                    f"tool.{self._name}: bridge returned non-JSON response: {body[:200]!r}"
-                ) from None
-            if not isinstance(data, dict) or not data.get("ok"):
-                msg = (data or {}).get("error") if isinstance(data, dict) else None
-                raise RuntimeError(msg or f"tool.{self._name} failed")
-            return data.get("value")
+            if INTENT_FIELD not in merged:
+                merged[INTENT_FIELD] = "py prelude"
+            return _bridge_call(self._name, merged)
 
     class _ToolProxy:
         """`tool.<name>(args)` proxy mirroring the JS runtime bridge."""
@@ -458,3 +502,182 @@ if "__omp_prelude_loaded__" not in globals():
             return f"<tool proxy session={session}>" if session else "<tool proxy unavailable>"
 
     tool = _ToolProxy()
+
+    def completion(prompt, *, model="default", system=None, schema=None):
+        """Oneshot, stateless completion against a model tier.
+
+        `model` selects a tier: "smol", "default" (the session's active model),
+        or "slow". Pass `system` for a system prompt. Pass a JSON-Schema dict
+        as `schema` to force a structured response; the parsed object is then
+        returned instead of the completion text.
+        """
+        args = {"prompt": prompt, "model": model}
+        if system is not None:
+            args["system"] = system
+        if schema is not None:
+            args["schema"] = schema
+        res = _bridge_call("__completion__", args)
+        text = res.get("text") if isinstance(res, dict) else res
+        return json.loads(text) if schema is not None else text
+
+    def agent(prompt, *, agent_type="task", model=None, label=None, schema=None, return_handle=False):
+        """Run a subagent and return its final output.
+
+        `agent_type` selects the subagent definition (default "task"). Pass
+        `model` to override that agent's model, `label` for the output artifact
+        id, and `schema` to request structured JSON output; when `schema` is
+        supplied the parsed object is returned. Share background by writing a
+        local:// file and referencing it in the prompt.
+
+        Set `return_handle=True` to receive a DAG node dict instead of bare
+        text: ``{"text", "output", "handle", "id", "agent"}`` where ``handle``
+        is the spawned agent's recoverable ``agent://<id>`` URI. A downstream
+        ``pipeline``/``parallel`` stage embeds that ``handle`` (or ``output``)
+        in its prompt so a large transcript flows through the graph by
+        reference, never re-inlined. When ``schema`` is also set the parsed
+        object lands under ``"data"``. If the bridge returns no recoverable id
+        the node still resolves with ``handle=None`` — the helper never throws.
+        """
+        args = {"prompt": prompt}
+        if agent_type is not None:
+            args["agentType"] = agent_type
+        if model is not None:
+            args["model"] = model
+        if label is not None:
+            args["label"] = label
+        if schema is not None:
+            args["schema"] = schema
+        res = _bridge_call("__agent__", args)
+        text = res.get("text") if isinstance(res, dict) else res
+        parsed = json.loads(text) if schema is not None else text
+        if not return_handle:
+            return parsed
+        details = res.get("details") if isinstance(res, dict) else None
+        if not isinstance(details, dict) or details.get("id") is None:
+            return {"text": text, "output": text, "handle": None, "id": None, "agent": None}
+        node = {
+            "text": text,
+            "output": text,
+            "handle": f"agent://{details['id']}",
+            "id": details["id"],
+            "agent": details.get("agent"),
+        }
+        if schema is not None:
+            node["data"] = parsed
+        return node
+
+    def _concurrency_limit():
+        """Worker-pool ceiling from the host ``task.maxConcurrency`` setting.
+
+        An eval fan-out runs as wide as a ``task`` batch would. Returns ``0`` for
+        unbounded (run every item at once); falls back to ``0`` if the host
+        bridge is unreachable.
+        """
+        try:
+            snap = _bridge_call("__concurrency__", {}) or {}
+            n = int(snap.get("limit") or 0)
+        except Exception:
+            return 0
+        return n if n > 0 else 0
+
+    def _pool_map(items, fn):
+        """Run ``fn`` over ``items`` through a bounded thread pool.
+
+        Preserves input order, barriers until every task settles, and raises the
+        lowest-index exception if any task failed. Each task runs inside a copy
+        of the submitting thread's context so the ``_CURRENT_RID`` ContextVar
+        propagates and bridge calls (agent(), tool.*, etc.) keep working. The
+        pool width tracks ``task.maxConcurrency`` (0 = run every item at once).
+        """
+        import concurrent.futures, contextvars
+        items = list(items)
+        if not items:
+            return []
+        limit = _concurrency_limit()
+        workers = min(limit, len(items)) if limit > 0 else len(items)
+        results = [None] * len(items)
+        errors = {}
+        with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as pool:
+            futures = {}
+            for i, item in enumerate(items):
+                ctx = contextvars.copy_context()
+                futures[pool.submit(ctx.run, fn, item)] = i
+            for fut in concurrent.futures.as_completed(futures):
+                i = futures[fut]
+                try:
+                    results[i] = fut.result()
+                except BaseException as exc:  # noqa: BLE001 - propagate to caller
+                    errors[i] = exc
+        if errors:
+            raise errors[min(errors)]
+        return results
+
+    def parallel(thunks):
+        """Run zero-arg callables through a bounded pool, preserving input order.
+
+        Barriers until all finish; re-raises the lowest-index exception if any
+        thunk raised. Pool width tracks the task tool's ``task.maxConcurrency``.
+        """
+        thunks = list(thunks)
+        for t in thunks:
+            if not callable(t):
+                raise TypeError("parallel() expects an iterable of zero-arg callables")
+        return _pool_map(thunks, lambda t: t())
+
+    def pipeline(items, *stages):
+        """Map items left-to-right through one-arg stage callables.
+
+        Every item clears stage N before any item enters stage N+1 (barrier per
+        stage). Stage 1 receives the original item; later stages receive the
+        previous stage's result. Pool width tracks ``task.maxConcurrency``.
+        """
+        current = list(items)
+        for stage in stages:
+            if not callable(stage):
+                raise TypeError("pipeline() stages must be callables")
+            current = _pool_map(current, stage)
+        return current
+
+    def log(message):
+        """Emit a status ``log`` event for TUI rendering."""
+        _emit_status("log", message=str(message))
+        return None
+
+    def phase(title):
+        """Record the current readable phase and emit a status ``phase`` event."""
+        globals()["__omp_current_phase__"] = str(title)
+        _emit_status("phase", title=str(title))
+        return None
+
+    class _Budget:
+        """Live view of the host Goal Mode token budget via the host bridge."""
+
+        @property
+        def total(self):
+            snap = _bridge_call("__budget__", {})
+            return (snap or {}).get("total")
+
+        @property
+        def hard(self):
+            snap = _bridge_call("__budget__", {})
+            return bool((snap or {}).get("hard"))
+
+        def spent(self):
+            snap = _bridge_call("__budget__", {})
+            return int((snap or {}).get("spent") or 0)
+
+        def remaining(self):
+            snap = _bridge_call("__budget__", {}) or {}
+            total = snap.get("total")
+            if total is None:
+                return math.inf
+            return max(0, total - int(snap.get("spent") or 0))
+
+        def __repr__(self):
+            try:
+                snap = _bridge_call("__budget__", {}) or {}
+                return f"<budget total={snap.get('total')} spent={snap.get('spent')}>"
+            except Exception:
+                return "<budget unavailable>"
+
+    budget = _Budget()

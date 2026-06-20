@@ -16,23 +16,23 @@ import { astEditToolRenderer } from "./ast-edit";
 import { astGrepToolRenderer } from "./ast-grep";
 import { bashToolRenderer } from "./bash";
 import { browserToolRenderer } from "./browser/render";
-import { calculatorToolRenderer } from "./calculator";
 import { debugToolRenderer } from "./debug";
-import { evalToolRenderer } from "./eval";
+import { evalToolRenderer } from "./eval-render";
 import { findToolRenderer } from "./find";
 import { githubToolRenderer } from "./gh-renderer";
 import { inspectImageToolRenderer } from "./inspect-image-renderer";
+import { ircToolRenderer } from "./irc";
 import { jobToolRenderer } from "./job";
+import { recallToolRenderer, reflectToolRenderer, retainToolRenderer } from "./memory-render";
 import { readToolRenderer } from "./read";
-import { recipeToolRenderer } from "./recipe/render";
 import { resolveToolRenderer } from "./resolve";
 import { searchToolRenderer } from "./search";
 import { searchToolBm25Renderer } from "./search-tool-bm25";
 import { sshToolRenderer } from "./ssh";
-import { todoWriteToolRenderer } from "./todo-write";
+import { todoToolRenderer } from "./todo";
 import { writeToolRenderer } from "./write";
 
-type ToolRenderer = {
+export type ToolRenderer = {
 	renderCall: (args: unknown, options: RenderResultOptions, theme: Theme) => Component;
 	renderResult: (
 		result: { content: Array<{ type: string; text?: string }>; details?: unknown; isError?: boolean },
@@ -43,6 +43,15 @@ type ToolRenderer = {
 	mergeCallAndResult?: boolean;
 	/** Render without background box, inline in the response flow */
 	inline?: boolean;
+	/**
+	 * Whether pending-call rows are provisional: useful on screen while a tool is
+	 * streaming, but not durable transcript history. `true` means every pending
+	 * shape is provisional. `"collapsed"` means only the collapsed pending shape
+	 * is provisional; expanded rendering is top-anchored/append-shaped enough to
+	 * let the transcript commit its settled prefix. Absent = the pending preview
+	 * streams rows the result render preserves.
+	 */
+	provisionalPendingPreview?: boolean | "collapsed";
 };
 
 export const toolRenderers: Record<string, ToolRenderer> = {
@@ -51,23 +60,25 @@ export const toolRenderers: Record<string, ToolRenderer> = {
 	ast_edit: astEditToolRenderer as ToolRenderer,
 	bash: bashToolRenderer as ToolRenderer,
 	browser: browserToolRenderer as ToolRenderer,
-	recipe: recipeToolRenderer as ToolRenderer,
 	debug: debugToolRenderer as ToolRenderer,
 	eval: evalToolRenderer as ToolRenderer,
-	calc: calculatorToolRenderer as ToolRenderer,
 	edit: editToolRenderer as ToolRenderer,
 	apply_patch: editToolRenderer as ToolRenderer,
 	find: findToolRenderer as ToolRenderer,
 	search: searchToolRenderer as ToolRenderer,
 	lsp: lspToolRenderer as ToolRenderer,
 	inspect_image: inspectImageToolRenderer as ToolRenderer,
+	irc: ircToolRenderer as ToolRenderer,
 	read: readToolRenderer as ToolRenderer,
 	job: jobToolRenderer as ToolRenderer,
 	resolve: resolveToolRenderer as ToolRenderer,
+	retain: retainToolRenderer as ToolRenderer,
+	recall: recallToolRenderer as ToolRenderer,
+	reflect: reflectToolRenderer as ToolRenderer,
 	search_tool_bm25: searchToolBm25Renderer as ToolRenderer,
 	ssh: sshToolRenderer as ToolRenderer,
 	task: taskToolRenderer as ToolRenderer,
-	todo_write: todoWriteToolRenderer as ToolRenderer,
+	todo: todoToolRenderer as ToolRenderer,
 	github: githubToolRenderer as ToolRenderer,
 	goal: goalToolRenderer as ToolRenderer,
 	web_search: webSearchToolRenderer as ToolRenderer,

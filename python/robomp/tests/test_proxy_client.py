@@ -22,6 +22,7 @@ from robomp.github_client import (
     GitHubError,
     IssueInfo,
     IssueSummary,
+    PullRequestFileInfo,
     PullRequestInfo,
     PullRequestReviewInfo,
     ReactionInfo,
@@ -276,7 +277,7 @@ def round_trip_app(proxy_settings: Settings):
                     }
                 ],
             )
-        if path == "/repos/octo/widget/pulls/2/reviews":
+        if path == "/repos/octo/widget/pulls/2/reviews" and req.method == "GET":
             return httpx.Response(
                 200,
                 json=[
@@ -288,6 +289,25 @@ def round_trip_app(proxy_settings: Settings):
                         "submitted_at": "2026-01-01T00:00:00Z",
                     }
                 ],
+            )
+        if path == "/repos/octo/widget/pulls/2/files":
+            return httpx.Response(
+                200,
+                json=[{"filename": "src/app.py", "status": "modified", "additions": 2, "deletions": 1}],
+            )
+        if path == "/repos/octo/widget/pulls/2/reviews" and req.method == "POST":
+            body = json.loads(req.content)
+            assert body["event"] == "COMMENT"
+            assert body["comments"] == [{"path": "src/app.py", "line": 12, "side": "RIGHT", "body": "finding"}]
+            return httpx.Response(
+                200,
+                json={
+                    "id": 55,
+                    "user": {"login": "robomp-bot"},
+                    "body": body["body"],
+                    "state": "COMMENTED",
+                    "submitted_at": "2026-01-01T00:00:00Z",
+                },
             )
         if path == "/user":
             return httpx.Response(200, json={"login": "robomp-bot"})
@@ -318,6 +338,8 @@ def round_trip_app(proxy_settings: Settings):
             return httpx.Response(201, json={})
         if path == "/repos/octo/widget/issues/1/labels":
             return httpx.Response(200, json=[{"name": "triage"}])
+        if path == "/repos/octo/widget/issues/1/labels/needs-info" and req.method == "DELETE":
+            return httpx.Response(200, json={})
         if path == "/repos/octo/widget/issues/1/assignees":
             return httpx.Response(201, json={})
         return httpx.Response(404, json={"message": f"unrouted {req.method} {path}"})
@@ -353,6 +375,19 @@ async def test_round_trip_all_endpoints(round_trip_app) -> None:
     prs = await client.list_pr_reviews("octo/widget", 2)
     assert len(prs) == 1 and isinstance(prs[0], PullRequestReviewInfo)
 
+    files = await client.list_pr_files("octo/widget", 2)
+    assert len(files) == 1 and isinstance(files[0], PullRequestFileInfo)
+    assert files[0].path == "src/app.py"
+
+    submitted = await client.submit_pr_review(
+        repo="octo/widget",
+        pr_number=2,
+        body="summary",
+        event="COMMENT",
+        comments=[{"path": "src/app.py", "line": 12, "side": "RIGHT", "body": "finding"}],
+    )
+    assert submitted.id == 55
+
     assert await client.get_authenticated_login() == "robomp-bot"
 
     existing_pr = await client.get_pull_request("octo/widget", 4)
@@ -372,6 +407,7 @@ async def test_round_trip_all_endpoints(round_trip_app) -> None:
     assert await client.request_reviewers(repo="octo/widget", pr_number=4, reviewers=["alice"]) is None
 
     labels = await client.add_issue_labels("octo/widget", 1, ["triage"])
+    assert await client.remove_issue_label("octo/widget", 1, "needs-info") is None
     assert labels == ("triage",)
 
     assert await client.add_assignees("octo/widget", 1, ["alice"]) is None

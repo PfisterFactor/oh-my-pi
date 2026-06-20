@@ -73,24 +73,28 @@ export default function myExtension(pi: ExtensionAPI) {
 }
 ```
 
-## Discovery path
+## Discovery paths
 
-omp discovers extension modules in this order:
+omp loads extension modules from these sources:
 
-1. **Project-scoped auto-discovery** — `<cwd>/.omp/extensions/`
-2. **User-scoped auto-discovery** — `~/.omp/agent/extensions/`
-3. **Marketplace-installed plugins** — `~/.omp/plugins/node_modules/` (extensions shipped inside installed plugin packages)
-4. **CLI flag** — `omp --extension ./my-ext.ts` (also `-e`; `--hook` is treated as an alias)
-5. **Settings `extensions` array** — paths listed in `~/.omp/agent/config.yml` or `<cwd>/.omp/settings.json`
+1. Native `.omp` locations discovered through the capability system:
+   - `<cwd>/.omp/extensions/`
+   - `~/.omp/agent/extensions/`
+   - legacy extension paths listed in `.omp/settings.json#extensions` or `~/.omp/agent/settings.json#extensions`
+2. Installed plugins under `~/.omp/plugins/node_modules` (`omp plugin install` npm/git specs, or `omp plugin link`) via their `omp.extensions`/`pi.extensions` manifests. Marketplace cache installs do not feed extension modules — they surface skills/commands/hooks/tools/MCP only.
+3. Explicit configured paths passed by the CLI (`omp --extension ./my-ext.ts`, also `-e`; `--hook` is treated as an alias) and by the `extensions:` setting in config.
 
-Within each scope, de-duplication is by resolved absolute path — first seen wins.
+The runtime de-duplicates by resolved absolute path — first seen wins.
 
 When a path points to a directory, omp resolves the entry point in this order:
 
 1. `package.json` with `omp.extensions` (or legacy `pi.extensions`) field
 2. `index.ts`
 3. `index.js`
-4. One-level scan for `*.ts` / `*.js` files and subdir `index.*` / `package.json` manifests
+
+When scanning an `extensions/` directory, omp also loads direct `*.ts`/`*.js` files and one-level subdirectories that have `index.ts`, `index.js`, or a manifest.
+
+Extension packages can also bundle sibling capability directories. When a package is loaded through `extensions:` or `--extension`/`-e`, the `omp-plugins` provider discovers its `skills/`, `hooks/pre|post/`, `tools/`, `commands/`, `rules/`, `prompts/`, and `.mcp.json`.
 
 ## package.json manifest
 
@@ -197,9 +201,14 @@ pi.on("tool_call", async (event, ctx) => {
 pi.on("turn_end", async (_event, ctx) => {
   ctx.ui.setStatus("tokens", `~${ctx.getContextUsage()?.tokens ?? "?"} tokens`);
 });
+
+pi.on("session_stop", async (event) => {
+  if (event.stop_hook_active) return;
+  return { continue: true, additionalContext: `Review final status after turn ${event.turn_id}.` };
+});
 ```
 
-Full event catalog: see [hooks authoring guide](./authoring-hooks.md).
+Full event catalog: see [extension authoring guide](../extensions.md).
 
 ## Extension vs hook — when to use which
 
@@ -208,27 +217,22 @@ Full event catalog: see [hooks authoring guide](./authoring-hooks.md).
 | Tools + commands + events in one module | **Extension** (`ExtensionAPI`) |
 | Pure event interception (policy, redaction) | **Extension** or **Hook** (both work; extension is preferred) |
 | Legacy hook module already exists | **Hook** (`HookAPI` from `@oh-my-pi/pi-coding-agent/extensibility/hooks`) |
-| Registering provider / custom message renderer | **Extension only** |
+| Registering a provider, shortcut, or CLI flag | **Extension only** |
 | Shipping as a marketplace plugin | **Extension** (use `package.json` manifest) |
 
 Extensions are a strict superset of hooks. New authoring should use `ExtensionAPI`.
 
 ## Debugging
 
-Start omp with `--log-level debug` to see extension load messages:
+omp writes structured logs to a rotating file under `~/.omp/logs/` (debug level is always on; nothing is written to the console, which would corrupt the TUI). Tail today's log to see extension load diagnostics:
 
 ```
-omp --log-level debug
+tail -f ~/.omp/logs/omp.$(date +%F).log
 ```
 
-Watch for lines like:
+Failed extension loads are logged with their path and error. Loaded extensions may also emit their own debug logs via `pi.logger`.
 
-```
-[extension-loader] loading /home/you/.omp/agent/extensions/my-ext.ts
-[extension-loader] loaded: my-ext (1 tool, 1 command, 2 handlers)
-```
-
-To temporarily disable a specific extension by name without removing the file:
+To temporarily disable a specific extension module by name without removing the file:
 
 ```yaml
 # ~/.omp/agent/config.yml
@@ -243,7 +247,7 @@ The derived name is the filename stem (or directory name for `index.ts`-style en
 - **Do not call runtime actions during load.** Methods like `pi.sendMessage()` throw `ExtensionRuntimeNotInitializedError` if called synchronously during module evaluation (before a session is active). Register handlers/tools/commands during load; perform runtime actions only from event handlers, tools, or commands.
 - **`tool_call` errors are fail-closed.** If a `tool_call` handler throws, the tool is blocked.
 - **Command names must not clash with built-ins.** Conflicts are skipped with a diagnostic log.
-- **Reserved shortcuts are ignored** (`ctrl+c`, `ctrl+d`, `ctrl+z`, `ctrl+k`, `ctrl+p`, `ctrl+l`, `ctrl+o`, `ctrl+t`, `ctrl+g`, `shift+tab`, `shift+ctrl+p`, `alt+enter`, `escape`, `enter`).
+- **Reserved shortcuts are ignored** (`ctrl+c`, `ctrl+d`, `ctrl+z`, `ctrl+k`, `ctrl+p`, `ctrl+l`, `ctrl+o`, `ctrl+t`, `ctrl+g`, `ctrl+q`, `alt+m`, `shift+tab`, `shift+ctrl+p`, `alt+enter`, `escape`, `enter`).
 
 ## Further reading
 

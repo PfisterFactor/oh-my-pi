@@ -2,9 +2,8 @@ import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 import { $which, getPuppeteerDir, logger } from "@oh-my-pi/pi-utils";
-import * as browsers from "@puppeteer/browsers";
+import type * as BrowsersNs from "@puppeteer/browsers";
 import type { Browser, CDPSession, Page, default as Puppeteer, Target } from "puppeteer-core";
-import { PUPPETEER_REVISIONS } from "puppeteer-core/internal/revisions.js";
 import stealthTamperingScript from "../puppeteer/00_stealth_tampering.txt" with { type: "text" };
 import stealthActivityScript from "../puppeteer/01_stealth_activity.txt" with { type: "text" };
 import stealthHairlineScript from "../puppeteer/02_stealth_hairline.txt" with { type: "text" };
@@ -78,6 +77,14 @@ export async function loadPuppeteerInWorker(safeDir: string): Promise<typeof Pup
 	}
 }
 
+let browsersModule: typeof BrowsersNs | undefined;
+async function loadBrowsers(): Promise<typeof BrowsersNs> {
+	if (!browsersModule) {
+		browsersModule = await import("@puppeteer/browsers");
+	}
+	return browsersModule;
+}
+
 /**
  * Lazily download Chromium on first browser launch via @puppeteer/browsers.
  * Skipped when a system Chromium (NixOS) or PUPPETEER_EXECUTABLE_PATH is set.
@@ -92,12 +99,14 @@ async function ensureChromiumExecutable(): Promise<string | undefined> {
 	if (chromiumExecutablePromise) return chromiumExecutablePromise;
 
 	chromiumExecutablePromise = (async () => {
+		const browsers = await loadBrowsers();
 		const platform = browsers.detectBrowserPlatform();
 		if (!platform) {
 			logger.warn("Could not detect browser platform; relying on puppeteer default resolution");
 			return undefined;
 		}
 		const cacheDir = getPuppeteerDir();
+		const { PUPPETEER_REVISIONS } = await import("puppeteer-core/internal/revisions.js");
 		const buildId = await browsers.resolveBuildId(browsers.Browser.CHROME, platform, PUPPETEER_REVISIONS.chrome);
 		const executablePath = browsers.computeExecutablePath({
 			browser: browsers.Browser.CHROME,
@@ -601,6 +610,19 @@ function buildStealthInjectionScript(scripts: readonly string[] = STEALTH_PATCH_
 					const Promise_resolve = nativeWindow.Promise.resolve.bind(nativeWindow.Promise);
 					const Window_Blob = nativeWindow.Blob;
 					const Window_Proxy = nativeWindow.Proxy;
+					const Reflect_get = nativeWindow.Reflect.get;
+					const Reflect_set = nativeWindow.Reflect.set;
+					const Reflect_apply = nativeWindow.Reflect.apply;
+					const Reflect_construct = nativeWindow.Reflect.construct;
+					const Reflect_defineProperty = nativeWindow.Reflect.defineProperty;
+					const Reflect_deleteProperty = nativeWindow.Reflect.deleteProperty;
+					const Reflect_getOwnPropertyDescriptor = nativeWindow.Reflect.getOwnPropertyDescriptor;
+					const Reflect_getPrototypeOf = nativeWindow.Reflect.getPrototypeOf;
+					const Reflect_has = nativeWindow.Reflect.has;
+					const Reflect_isExtensible = nativeWindow.Reflect.isExtensible;
+					const Reflect_ownKeys = nativeWindow.Reflect.ownKeys;
+					const Reflect_preventExtensions = nativeWindow.Reflect.preventExtensions;
+					const Reflect_setPrototypeOf = nativeWindow.Reflect.setPrototypeOf;
 					const Intl_DateTimeFormat = nativeWindow.Intl.DateTimeFormat;
 					const Date_constructor = nativeWindow.Date;
 

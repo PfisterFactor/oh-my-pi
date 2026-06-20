@@ -1,5 +1,5 @@
 import { describe, expect, it } from "bun:test";
-import { applyEdits, parsePatch } from "@oh-my-pi/hashline";
+import { applyEdits, Patch, parsePatch } from "@oh-my-pi/hashline";
 
 function applyPatch(text: string, diff: string): string {
 	return applyEdits(text, parsePatch(diff).edits).text;
@@ -7,245 +7,197 @@ function applyPatch(text: string, diff: string): string {
 
 const FILE = "a\nb\nc\nd\ne";
 
-describe("hashline core — hunk header forms", () => {
-	it("rejects a bare single-number hunk header (single-line shorthand removed)", () => {
-		expect(() => parsePatch("2\n+B")).toThrow(/single-number hunk header/);
+describe("hashline section headers", () => {
+	it("accepts paths with spaces in anchored section headers", () => {
+		const section = Patch.parseSingle("[dir with spaces/file.ts#1a2b]\nSWAP 1.=1:\n+after");
+
+		expect(section.path).toBe("dir with spaces/file.ts");
+		expect(section.fileHash).toBe("1A2B");
+		expect(section.applyTo("before").text).toBe("after");
 	});
 
-	it("an empty `A A` deletes the line", () => {
-		expect(applyPatch(FILE, "2 2")).toBe("a\nc\nd\ne");
+	it("recovers apply_patch-contaminated headers whose paths contain spaces", () => {
+		const section = Patch.parseSingle("[*** Update File: dir with spaces/file.ts#1A2B]\nSWAP 1.=1:\n+after");
+
+		expect(section.path).toBe("dir with spaces/file.ts");
+		expect(section.fileHash).toBe("1A2B");
+		expect(section.applyTo("before").text).toBe("after");
 	});
 
-	it("accepts hyphen as a range separator (`A-B`)", () => {
-		// Models reflexively type `301-314` when copying a `read` range.
-		expect(applyPatch(FILE, "2-3\n+X")).toBe("a\nX\nd\ne");
+	it("rejects trailing junk after a snapshot tag", () => {
+		expect(() => Patch.parse("[src/a.ts#1A2B copied from read]\nSWAP 1.=1:\n+after")).toThrow(/Input header must be/);
+		expect(() => Patch.parse("[src/a.ts#1A2B:812]\nSWAP 1.=1:\n+after")).toThrow(/Input header must be/);
 	});
 
-	it("accepts `..` as a range separator (`A..B`)", () => {
-		expect(applyPatch(FILE, "2..3\n+X")).toBe("a\nX\nd\ne");
+	it("rejects trailing junk after a snapshot tag even with apply_patch noise", () => {
+		expect(() => Patch.parse("[Update File: src/a.ts#1A2B copied from read]\nSWAP 1.=1:\n+after")).toThrow(
+			/Input header must be/,
+		);
+		expect(() => Patch.parse("[Update File: src/a.ts#1A2B:812]\nSWAP 1.=1:\n+after")).toThrow(/Input header must be/);
 	});
 
-	it("accepts unicode ellipsis as a range separator (`A…B`)", () => {
-		expect(applyPatch(FILE, "2\u20263\n+X")).toBe("a\nX\nd\ne");
+	it("rejects malformed snapshot tags", () => {
+		expect(() => Patch.parse("[src/a.ts#1A2]\nSWAP 1.=1:\n+after")).toThrow(/Input header must be/);
+		expect(() => Patch.parse("[src/a.ts#1A2G]\nSWAP 1.=1:\n+after")).toThrow(/Input header must be/);
+		expect(() => Patch.parse("[src/a.ts#1A2B5]\nSWAP 1.=1:\n+after")).toThrow(/Input header must be/);
 	});
 
-	it("tolerates whitespace around the separator (`A - B`)", () => {
-		expect(applyPatch(FILE, "2 - 3\n+X")).toBe("a\nX\nd\ne");
+	it("rejects malformed snapshot tags even with apply_patch noise", () => {
+		expect(() => Patch.parse("[Update File: src/a.ts#1A2G]\nSWAP 1.=1:\n+after")).toThrow(/Input header must be/);
 	});
 
-	it("rejects `LINE=content` rows pasted from old format as orphan payload", () => {
-		expect(() => parsePatch("2=hello")).toThrow(/payload line has no preceding hunk header/);
-	});
-
-	it("auto-pipes mid-payload bare rows in a mixed block (was previously rejected)", () => {
-		const result = parsePatch("2 2\n+first\n3=    ddd");
-		expect(applyEdits(FILE, result.edits).text).toBe("a\nfirst\n3=    ddd\nc\nd\ne");
-		expect(result.warnings.some(w => /Auto-prefixed bare body row/.test(w))).toBe(true);
-	});
-});
-
-describe("hashline leniency L2 — bare `^A` repeat shorthand", () => {
-	it("treats `^A` as `^A-A`", () => {
-		// `^2-2` keeps the original line 2 between the inserted rows.
-		expect(applyPatch(FILE, "2 2\n+ABOVE\n&2\n+BELOW")).toBe("a\nABOVE\nb\nBELOW\nc\nd\ne");
-	});
-
-	it("auto-pipes `^A-` (malformed range) as literal text via L3", () => {
-		// `^2-` is not a valid repeat row (missing end number). The
-		// tokenizer classifies it as raw; L3's uniformly-bare auto-pipe
-		// then folds it back into the block as a literal. The model sees
-		// the warning and can re-issue with a well-formed repeat.
-		const result = parsePatch("2 2\n&2-");
-		expect(applyEdits(FILE, result.edits).text).toBe("a\n&2-\nc\nd\ne");
-		expect(result.warnings.some(w => /Auto-prefixed bare body row/.test(w))).toBe(true);
+	it("reports bracket syntax with a 4-hex example when the header is missing", () => {
+		try {
+			Patch.parse("DEL 38.=40");
+			throw new Error("expected missing-header error");
+		} catch (error) {
+			const message = error instanceof Error ? error.message : String(error);
+			expect(message).toContain('input must begin with "[PATH#HASH]"');
+			expect(message).toContain('Example: "[src/foo.ts#1A2B]"');
+			expect(message).not.toContain("#0A3");
+		}
 	});
 });
 
-describe("hashline leniency L3 — auto-pipe uniformly bare bodies", () => {
-	it("accepts a block whose body is uniformly unprefixed", () => {
-		const result = parsePatch("2 2\n  hello\n  world");
-		expect(applyEdits(FILE, result.edits).text).toBe("a\n  hello\n  world\nc\nd\ne");
-		expect(result.warnings.some(w => /Auto-prefixed bare body row/.test(w))).toBe(true);
+describe("hashline core — verb header forms", () => {
+	it("rejects a bare single-number hunk header with verb guidance", () => {
+		expect(() => parsePatch("2\n+B")).toThrow(/hunk headers need a verb/);
 	});
 
-	it("auto-pipes a bare row after a `+` row (was previously rejected)", () => {
-		const result = parsePatch("2 2\n+first\nsecond");
-		expect(applyEdits(FILE, result.edits).text).toBe("a\nfirst\nsecond\nc\nd\ne");
-		expect(result.warnings.some(w => /Auto-prefixed bare body row/.test(w))).toBe(true);
+	it("rejects a bare numeric range with verb guidance", () => {
+		expect(() => parsePatch("2 3\n+X")).toThrow(/Hunk headers need a verb/);
 	});
 
-	it("auto-pipes a bare row before a `+` row (was previously rejected)", () => {
-		// `first` is buffered. When `+second` arrives, we auto-pipe both rows.
-		const result = parsePatch("2 2\nfirst\n+second");
-		expect(applyEdits(FILE, result.edits).text).toBe("a\nfirst\nsecond\nc\nd\ne");
-		expect(result.warnings.some(w => /Auto-prefixed bare body row/.test(w))).toBe(true);
+	it("accepts canonical replace/delete/insert forms", () => {
+		expect(applyPatch(FILE, "SWAP 2.=3:\n+X")).toBe("a\nX\nd\ne");
+		expect(applyPatch(FILE, "DEL 2.=3")).toBe("a\nd\ne");
+		expect(applyPatch(FILE, "INS.PRE 2:\n+X")).toBe("a\nX\nb\nc\nd\ne");
+		expect(applyPatch(FILE, "INS.POST 2:\n+X")).toBe("a\nb\nX\nc\nd\ne");
+		expect(applyPatch(FILE, "INS.HEAD:\n+X")).toBe("X\na\nb\nc\nd\ne");
+		expect(applyPatch(FILE, "INS.TAIL:\n+X")).toBe("a\nb\nc\nd\ne\nX");
 	});
 
-	it("does NOT auto-pipe across block boundaries", () => {
-		// `2 2` accumulates `foo` as a bare row; `4 4` flushes the first
-		// block (auto-pipe fires) and starts a new pending. The second
-		// block's `bar` row is also bare → second auto-pipe.
-		const result = parsePatch("2 2\nfoo\n4 4\nbar");
-		expect(applyEdits(FILE, result.edits).text).toBe("a\nfoo\nc\nbar\ne");
-	});
-});
-
-describe("hashline leniency L9 — unified-diff body conversion", () => {
-	it("drops `-`-prefixed body rows (already deleted by the hunk range)", () => {
-		// Classic apply_patch / unified-diff shape: -old / +new pair.
-		// Model expects the `-` row to mark line for deletion; hashline's
-		// `A..B` already deletes the range, so we drop the `-` row
-		// and keep the `+` row.
-		const result = parsePatch("2 2\n-original line\n+replacement");
-		expect(applyEdits(FILE, result.edits).text).toBe("a\nreplacement\nc\nd\ne");
-		expect(result.warnings.some(w => /Hunk body contained unified-diff-style rows/.test(w))).toBe(true);
+	it("accepts single-number replace and delete shorthand", () => {
+		expect(applyPatch(FILE, "SWAP 2:\n+X")).toBe("a\nX\nc\nd\ne");
+		expect(applyPatch(FILE, "DEL 2")).toBe("a\nc\nd\ne");
 	});
 
-	it("strips the unified-diff metadata-space from context rows once a `-` row is seen", () => {
-		// Body has a context row ` keep this`, a `-old` row, a `+new` row.
-		// Result: lines 2..3 replaced with [keep this, new].
-		const text = "a\nb\nc\nd";
-		const result = parsePatch("2 3\n keep this\n-original\n+new");
-		expect(applyEdits(text, result.edits).text).toBe("a\nkeep this\nnew\nd");
+	it("accepts alternate replace range separators and missing colon", () => {
+		expect(applyPatch(FILE, "SWAP 2-3:\n+X")).toBe("a\nX\nd\ne");
+		expect(applyPatch(FILE, "SWAP 2\u20263:\n+X")).toBe("a\nX\nd\ne");
+		expect(applyPatch(FILE, "SWAP 2 3:\n+X")).toBe("a\nX\nd\ne");
+		expect(applyPatch(FILE, "SWAP 2..3:\n+X")).toBe("a\nX\nd\ne"); // legacy `..` still accepted
+		expect(applyPatch(FILE, "SWAP 2.=3\n+X")).toBe("a\nX\nd\ne"); // missing colon
 	});
 
-	it("retroactively strips the metadata-space from context rows that arrived BEFORE the `-` row", () => {
-		// Streaming order: context first, then `-`. The `-` is what tells us
-		// we are in unified-diff mode; we must go back and strip the space
-		// from the context row.
-		const text = "a\nb\nc\nd";
-		const result = parsePatch("2 3\n keep this\n+new\n-original");
-		expect(applyEdits(text, result.edits).text).toBe("a\nkeep this\nnew\nd");
+	it("accepts missing colon on insert headers", () => {
+		expect(applyPatch(FILE, "INS.PRE 2\n+X")).toBe("a\nX\nb\nc\nd\ne");
+		expect(applyPatch(FILE, "INS.HEAD\n+X")).toBe("X\na\nb\nc\nd\ne");
 	});
 });
 
-describe("hashline leniency L5 — overlapping bare/concrete coalesce", () => {
-	it("coalesces two identical-range hunks (last-wins)", () => {
-		// Two `2 3` hunks back-to-back. The first has no body, the
-		// second has a payload. We drop the first and emit only the second.
-		const result = parsePatch("2 3\n2 3\n+X");
-		expect(applyEdits(FILE, result.edits).text).toBe("a\nX\nd\ne");
-		expect(result.warnings.some(w => /identical-range hashline hunks/.test(w))).toBe(true);
+describe("hashline body contracts", () => {
+	it("auto-pipes a bare body row while warning", () => {
+		const result = parsePatch("SWAP 2.=2:\n  hello");
+		expect(applyEdits(FILE, result.edits).text).toBe("a\n  hello\nc\nd\ne");
+		expect(result.warnings.some(w => /Auto-prefixed bare body row/.test(w))).toBe(true);
 	});
 
-	it("coalesces an overlapping bare hunk followed by a concrete hunk", () => {
-		// Bare `2 3` overlaps with the concrete `3 4`. Drop the
-		// bare pending; keep the concrete one.
-		const result = parsePatch("2 3\n3 4\n+NEW");
-		expect(applyEdits(FILE, result.edits).text).toBe("a\nb\nNEW\ne");
-		expect(result.warnings.some(w => /overlapping bare hashline hunk/.test(w))).toBe(true);
+	it("strips read-output line number prefix from auto-piped bare body rows", () => {
+		const result = parsePatch("SWAP 2.=2:\n2:hello");
+		expect(applyEdits(FILE, result.edits).text).toBe("a\nhello\nc\nd\ne");
+		expect(result.warnings.some(w => /Auto-prefixed bare body row/.test(w))).toBe(true);
+	});
+	it("preserves `+N:` literal payloads without stripping", () => {
+		const result = parsePatch("SWAP 2.=2:\n+3:keep");
+		expect(applyEdits(FILE, result.edits).text).toBe("a\n3:keep\nc\nd\ne");
+		expect(result.warnings.some(w => /Auto-prefixed/.test(w))).toBe(false);
+	});
+	it("strips only one N: prefix from bare body rows (preserves nested digits:colon)", () => {
+		// "2:42:hello" → should yield "42:hello", NOT "hello" (recursive would over-strip)
+		const result = parsePatch("SWAP 2.=2:\n2:42:hello");
+		expect(applyEdits(FILE, result.edits).text).toBe("a\n42:hello\nc\nd\ne");
 	});
 
-	it("still rejects two concrete overlapping replaces", () => {
-		// Both pending hunks have payload → no L5 short-circuit. The
-		// post-hoc validator catches the line-3 collision.
-		expect(() => parsePatch("2 3\n+X\n+Y\n3 4\n+Z")).toThrow(/anchor line 3 is already targeted by another hunk/);
+	it("strips N: prefixes only when every bare body row carries one", () => {
+		const result = parsePatch("SWAP 2.=3:\n2:foo\n3:bar");
+		expect(applyEdits(FILE, result.edits).text).toBe("a\nfoo\nbar\nd\ne");
+	});
+
+	it("leaves bare body rows untouched when only some carry an N: prefix", () => {
+		// "3:keep" looks like a snapshot prefix but "plain" does not, so the body
+		// is genuine content (not a pasted snapshot) — strip nothing.
+		const result = parsePatch("SWAP 2.=3:\n3:keep\nplain");
+		expect(applyEdits(FILE, result.edits).text).toBe("a\n3:keep\nplain\nd\ne");
+	});
+
+	it("keeps interior blank rows in a bare replace body", () => {
+		const result = parsePatch("SWAP 2.=3:\nfoo\n\nbar");
+		expect(applyEdits(FILE, result.edits).text).toBe("a\nfoo\n\nbar\nd\ne");
+	});
+
+	it("drops trailing blank rows between a bare body and the next hunk", () => {
+		const result = parsePatch("SWAP 2.=2:\nfoo\n\nSWAP 4.=4:\nbaz");
+		expect(applyEdits(FILE, result.edits).text).toBe("a\nfoo\nc\nbaz\ne");
+	});
+
+	it("skips blank rows when checking N: prefix uniformity", () => {
+		const result = parsePatch("SWAP 2.=3:\n2:foo\n\n3:bar");
+		expect(applyEdits(FILE, result.edits).text).toBe("a\nfoo\n\nbar\nd\ne");
+	});
+
+	it("leaves numeric-keyed literal bodies untouched (dict/YAML shape)", () => {
+		const result = parsePatch('SWAP 2.=3:\n1: "one",\n2: "two",');
+		expect(applyEdits(FILE, result.edits).text).toBe('a\n1: "one",\n2: "two",\nd\ne');
+	});
+
+	it("rejects `-` body rows with a teaching error", () => {
+		expect(() => parsePatch("SWAP 2.=2:\n-old\n+new")).toThrow(/`-` rows are not valid/);
+	});
+
+	it("allows literal text that begins with `-` or `+` when prefixed with `+`", () => {
+		expect(applyPatch(FILE, "SWAP 2.=2:\n+-literal\n++plus")).toBe("a\n-literal\n+plus\nc\nd\ne");
+	});
+
+	it("treats empty replace as delete and still rejects empty insert", () => {
+		expect(applyPatch(FILE, "SWAP 2.=2:")).toBe("a\nc\nd\ne");
+		expect(() => parsePatch("INS.TAIL:")).toThrow(/`INS` needs/);
+	});
+
+	it("rejects delete with a body", () => {
+		expect(() => parsePatch("DEL 2\n+X")).toThrow(/does not take body rows/);
+	});
+
+	it("rejects delete with a colon", () => {
+		expect(() => parsePatch("DEL 2:\n+X")).toThrow(/has no colon/);
 	});
 });
 
 describe("hashline — apply_patch / unified-diff contamination", () => {
-	it("rejects `*** Update File:` sentinels as contamination", () => {
-		expect(() => parsePatch("*** Update File: a.ts\n2 2\n+X")).toThrow(/apply_patch sentinel/);
+	it("rejects apply_patch sentinels as contamination", () => {
+		expect(() => parsePatch("*** Update File: a.ts\nSWAP 2.=2:\n+X")).toThrow(/apply_patch sentinel/);
+		expect(() => parsePatch("*** Add File: a.ts\nSWAP 2.=2:\n+X")).toThrow(/apply_patch sentinel/);
 	});
 
-	it("rejects `*** Add File:` sentinels as contamination", () => {
-		expect(() => parsePatch("*** Add File: a.ts\n2 2\n+X")).toThrow(/apply_patch sentinel/);
-	});
-
-	it("rejects unified-diff hunk headers (`-N,M +N,M`) as contamination", () => {
-		expect(() => parsePatch("@@ -1,3 +1,3 @@\n2 2\n+X")).toThrow(/unified-diff hunk header/);
+	it("rejects unified-diff hunk headers as contamination", () => {
+		expect(() => parsePatch("@@ -1,3 +1,3 @@\nSWAP 2.=2:\n+X")).toThrow(/unified-diff hunk header/);
 	});
 
 	it("treats top-level `+TEXT` as an orphan literal payload", () => {
-		expect(() => parsePatch("+   const X = 1;\n2 2")).toThrow(/payload line has no preceding hunk header/);
-	});
-});
-
-describe("hashline leniency — composite scenarios from the benchmark dumps", () => {
-	it("recovers GLM's `LINE=`-shaped paste + bare body (chat-simple.ts shape)", () => {
-		const text = "aaa\nbbb\nccc\nddd";
-		// Authored: bare `2 2` anchor followed by a uniformly-bare body
-		// pasted from `read` output. L1 promotes `2 2` to `2 2`; L3
-		// auto-pipes the bare body rows.
-		const result = parsePatch("2 2\n  NEW_LINE_ONE\n  NEW_LINE_TWO");
-		expect(applyEdits(text, result.edits).text).toBe("aaa\n  NEW_LINE_ONE\n  NEW_LINE_TWO\nccc\nddd");
-		expect(result.warnings.some(w => /Auto-prefixed bare body row/.test(w))).toBe(true);
-	});
-
-	it("two back-to-back identical-range hunks coalesce last-wins", () => {
-		const text = "aaa\nbbb\nccc\nddd";
-		// Two `2 3` hunks; the first has no body, the second is the
-		// "real" deletion. The first should be dropped via the identical-
-		// range coalesce, leaving the deletion to fire.
-		const result = parsePatch("2 3\n2 3");
-		expect(applyEdits(text, result.edits).text).toBe("aaa\nddd");
-		expect(result.warnings.length).toBeGreaterThan(0);
-	});
-
-	it("recovers gpt-5-spark's `+&A..B` shape (model prefixed a repeat with +)", () => {
-		const text = "aaa\nbbb\nccc";
-		// Authored: `2-2: +NEW +&2..2`. The second body row is a repeat row
-		// the model mistakenly prefixed with `+`. It should be silently
-		// rerouted as `^2-2` so the patch effectively inserts NEW above
-		// the original line 2, with a warning.
-		const result = parsePatch("2 2\n+NEW\n+&2..2");
-		expect(applyEdits(text, result.edits).text).toBe("aaa\nNEW\nbbb\nccc");
-		expect(result.warnings.some(w => /A body row started with `\+&A\.\.B`/.test(w))).toBe(true);
-	});
-
-	it("accepts `+&A..B` with leading whitespace inside the literal text", () => {
-		// gpt-5-spark / chat-simple.ts shape: `+    ^85-85` — the model
-		// added indentation between `+` and `^A-B`. We trim before checking.
-		const text = "aaa\nbbb\nccc";
-		const result = parsePatch("2 2\n+NEW\n+    &2..2");
-		expect(applyEdits(text, result.edits).text).toBe("aaa\nNEW\nbbb\nccc");
-		expect(result.warnings.some(w => /A body row started with `\+&A\.\.B`/.test(w))).toBe(true);
-	});
-
-	it("accepts `+^A` shorthand (single line)", () => {
-		const text = "aaa\nbbb\nccc";
-		const result = parsePatch("2 2\n+NEW\n+&2");
-		expect(applyEdits(text, result.edits).text).toBe("aaa\nNEW\nbbb\nccc");
-		expect(result.warnings.some(w => /A body row started with `\+&A\.\.B`/.test(w))).toBe(true);
-	});
-
-	it("does NOT misclassify `+^literal-text` (not a valid repeat shape)", () => {
-		// `+&hello` is just a literal payload row whose text is `^hello`.
-		// No range follows the `^`, so it's not a repeat — emit the literal
-		// as-is, no warning.
-		const text = "aaa\nbbb\nccc";
-		const result = parsePatch("2 2\n+&hello");
-		expect(applyEdits(text, result.edits).text).toBe("aaa\n&hello\nccc");
-		expect(result.warnings.some(w => /A body row started with `\+&A\.\.B`/.test(w))).toBe(false);
-	});
-});
-
-describe("hashline leniency — BOF/EOF range suffix", () => {
-	it("accepts `BOF..BOF=` as `BOF`", () => {
-		expect(applyPatch(FILE, "BOF\n+HEAD")).toBe("HEAD\na\nb\nc\nd\ne");
-	});
-
-	it("accepts `EOF..EOF=` as `EOF`", () => {
-		expect(applyPatch(FILE, "EOF\n+TAIL")).toBe("a\nb\nc\nd\ne\nTAIL");
-	});
-
-	it("accepts `BOF..EOF=` (degenerate but harmless)", () => {
-		expect(applyPatch(FILE, "BOF\n+HEAD")).toBe("HEAD\na\nb\nc\nd\ne");
+		expect(() => parsePatch("+const X = 1;\nSWAP 2.=2:")).toThrow(/payload line has no preceding hunk header/);
 	});
 });
 
 describe("hashline apply — duplicate boundary payloads", () => {
-	it("keeps replacement boundary echoes literal", () => {
+	it("keeps replacement boundary echoes literal unless balance repair applies", () => {
 		const text = ["// one", "// two", "old();"].join("\n");
-		const diff = "3 3\n+// one\n+// two\n+new();";
-
+		const diff = "SWAP 3.=3:\n+// one\n+// two\n+new();";
 		expect(applyPatch(text, diff)).toBe(["// one", "// two", "// one", "// two", "new();"].join("\n"));
 	});
 
 	it("keeps pure-insert context echoes literal", () => {
 		const text = ["aaa", "bbb", "ccc"].join("\n");
-		const diff = "EOF\n+bbb\n+ccc\n+NEW";
-
+		const diff = "INS.TAIL:\n+bbb\n+ccc\n+NEW";
 		expect(applyPatch(text, diff)).toBe("aaa\nbbb\nccc\nbbb\nccc\nNEW");
 	});
 });

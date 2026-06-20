@@ -1,8 +1,8 @@
 import * as fs from "node:fs";
 import * as path from "node:path";
 import { getAgentDir, isEnoent, logger } from "@oh-my-pi/pi-utils";
+import type { Type } from "arktype";
 import { JSONC, YAML } from "bun";
-import type { ZodType } from "zod/v4";
 
 /** Minimal subset of the AJV ConfigSchemaError shape this module actually relies on. */
 interface ConfigSchemaError {
@@ -10,18 +10,44 @@ interface ConfigSchemaError {
 	message: string | undefined;
 }
 
+/**
+ * Module-private cache of (jsonPath, ymlPath) pairs we already migrated this
+ * process. Prevents `ConfigFile.relocate()` / repeated `tryLoad()` calls from
+ * re-running the migration over and over on the boot path.
+ */
+const migratedPaths = new Set<string>();
+
+function migrationKey(jsonPath: string, ymlPath: string): string {
+	return `${jsonPath}\u0000${ymlPath}`;
+}
+
+/**
+ * Synchronous JSON → YAML migration kept for callers that still want the
+ * eager path (settings init, tests that observe migration completion).
+ * Idempotent — re-running is a no-op.
+ */
 function migrateJsonToYml(jsonPath: string, ymlPath: string) {
+	const key = migrationKey(jsonPath, ymlPath);
+	if (migratedPaths.has(key)) return;
 	try {
-		if (fs.existsSync(ymlPath)) return;
-		if (!fs.existsSync(jsonPath)) return;
+		if (fs.existsSync(ymlPath)) {
+			migratedPaths.add(key);
+			return;
+		}
+		if (!fs.existsSync(jsonPath)) {
+			migratedPaths.add(key);
+			return;
+		}
 
 		const content = fs.readFileSync(jsonPath, "utf-8");
-		const parsed = JSON.parse(content);
+		const parsed = JSONC.parse(content);
 		if (!parsed) {
 			logger.warn("migrateJsonToYml: invalid json structure", { path: jsonPath });
+			migratedPaths.add(key);
 			return;
 		}
 		fs.writeFileSync(ymlPath, YAML.stringify(parsed, null, 2));
+		migratedPaths.add(key);
 	} catch (error) {
 		logger.warn("migrateJsonToYml: migration failed", { error: String(error) });
 	}
@@ -29,7 +55,7 @@ function migrateJsonToYml(jsonPath: string, ymlPath: string) {
 
 export interface IConfigFile<T> {
 	readonly id: string;
-	readonly schema: ZodType<T>;
+	readonly schema: Type;
 	path?(): string;
 	load(): T | null;
 	invalidate?(): void;
@@ -97,25 +123,35 @@ export type LoadResult<T> =
 
 export class ConfigFile<T> implements IConfigFile<T> {
 	readonly #basePath: string;
+	readonly #jsonMigrationPath: string | null;
 	#cache?: LoadResult<T>;
 	#auxValidate?: (value: T) => void;
 
 	constructor(
 		readonly id: string,
-		readonly schema: ZodType<T>,
+		readonly schema: Type,
 		configPath: string = path.join(getAgentDir(), `${id}.yml`),
 	) {
 		this.#basePath = configPath;
 		if (configPath.endsWith(".yml")) {
-			const jsonPath = `${configPath.slice(0, -4)}.json`;
-			migrateJsonToYml(jsonPath, configPath);
+			this.#jsonMigrationPath = `${configPath.slice(0, -4)}.json`;
 		} else if (configPath.endsWith(".yaml")) {
-			const jsonPath = `${configPath.slice(0, -5)}.json`;
-			migrateJsonToYml(jsonPath, configPath);
+			this.#jsonMigrationPath = `${configPath.slice(0, -5)}.json`;
 		} else if (configPath.endsWith(".json") || configPath.endsWith(".jsonc")) {
 			// JSON configs are still supported without migration.
+			this.#jsonMigrationPath = null;
 		} else {
 			throw new Error(`Invalid config file path: ${configPath}`);
+		}
+	}
+
+	/**
+	 * Run the JSON → YAML migration synchronously, if applicable. Idempotent.
+	 * Sync callers (tests, settings init) hit this implicitly via {@link tryLoad}.
+	 */
+	#ensureMigrated(): void {
+		if (this.#jsonMigrationPath) {
+			migrateJsonToYml(this.#jsonMigrationPath, this.#basePath);
 		}
 	}
 
@@ -123,6 +159,7 @@ export class ConfigFile<T> implements IConfigFile<T> {
 		if (!configPath || configPath === this.#basePath) return this;
 		const result = new ConfigFile<T>(this.id, this.schema, configPath);
 		result.#auxValidate = this.#auxValidate;
+		result.#ensureMigrated();
 		return result;
 	}
 
@@ -133,6 +170,13 @@ export class ConfigFile<T> implements IConfigFile<T> {
 			if (isEnoent(err)) return null;
 			throw err;
 		}
+	}
+
+	async getMtimeMsAsync(): Promise<number | null> {
+		const file = Bun.file(this.path());
+		if (!(await file.exists())) return null;
+		const lm = file.lastModified;
+		return typeof lm === "number" && Number.isFinite(lm) ? lm : null;
 	}
 
 	withValidation(name: string, validate: (value: T) => void): this {
@@ -149,10 +193,10 @@ export class ConfigFile<T> implements IConfigFile<T> {
 	}
 
 	createDefault(): T {
-		const parsed = this.schema.safeParse({});
-		if (parsed.success) return parsed.data;
-		const fallback = this.schema.safeParse(undefined);
-		if (fallback.success) return fallback.data;
+		const parsed = this.schema({});
+		if (!(parsed instanceof Error)) return parsed as T;
+		const fallback = this.schema(undefined);
+		if (!(fallback instanceof Error)) return fallback as T;
 		throw new ConfigError(this.id, undefined, {
 			err: new Error("Schema produced no default value"),
 			stage: "createDefault",
@@ -164,12 +208,8 @@ export class ConfigFile<T> implements IConfigFile<T> {
 		return result;
 	}
 
-	tryLoad(): LoadResult<T> {
-		if (this.#cache) return this.#cache;
-
+	#parseContent(content: string): LoadResult<T> {
 		try {
-			const content = fs.readFileSync(this.path(), "utf-8").trim();
-
 			let parsed: unknown;
 			if (this.#basePath.endsWith(".json") || this.#basePath.endsWith(".jsonc")) {
 				parsed = JSONC.parse(content);
@@ -179,19 +219,17 @@ export class ConfigFile<T> implements IConfigFile<T> {
 				throw new Error(`Invalid config file path: ${this.#basePath}`);
 			}
 
-			const checked = this.schema.safeParse(parsed);
-			if (!checked.success) {
+			const checked = this.schema(parsed);
+			if (checked instanceof Error) {
 				const schemaErrors: ConfigSchemaError[] = [];
-				for (const issue of checked.error.issues) {
-					const instancePath = issue.path.length === 0 ? "" : `/${issue.path.map(String).join("/")}`;
-					schemaErrors.push({ instancePath, message: issue.message });
-					if (schemaErrors.length >= 50) break;
-				}
+				// arktype errors are Error instances with a message property
+				// Extract the error message as a single schema error
+				schemaErrors.push({ instancePath: "root", message: checked.message });
 				const error = new ConfigError(this.id, schemaErrors);
 				logger.warn("Failed to parse config file", { path: this.path(), error });
 				return this.#storeCache({ error, status: "error" });
 			}
-			const value = checked.data;
+			const value = checked as T;
 			try {
 				this.#auxValidate?.(value);
 			} catch (error) {
@@ -203,9 +241,6 @@ export class ConfigFile<T> implements IConfigFile<T> {
 			}
 			return this.#storeCache({ value, status: "ok" });
 		} catch (error) {
-			if (isEnoent(error)) {
-				return this.#storeCache({ status: "not-found" });
-			}
 			logger.warn("Failed to parse config file", { path: this.path(), error });
 			return this.#storeCache({
 				error: new ConfigError(this.id, undefined, { err: error, stage: "Unexpected" }),
@@ -214,12 +249,60 @@ export class ConfigFile<T> implements IConfigFile<T> {
 		}
 	}
 
+	tryLoad(): LoadResult<T> {
+		if (this.#cache) return this.#cache;
+		this.#ensureMigrated();
+
+		let content: string;
+		try {
+			content = fs.readFileSync(this.path(), "utf-8").trim();
+		} catch (error) {
+			if (isEnoent(error)) {
+				return this.#storeCache({ status: "not-found" });
+			}
+			logger.warn("Failed to read config file", { path: this.path(), error });
+			return this.#storeCache({
+				error: new ConfigError(this.id, undefined, { err: error, stage: "Read" }),
+				status: "error",
+			});
+		}
+		return this.#parseContent(content);
+	}
+
+	async tryLoadAsync(): Promise<LoadResult<T>> {
+		if (this.#cache) return this.#cache;
+		this.#ensureMigrated();
+
+		let content: string;
+		try {
+			content = (await Bun.file(this.path()).text()).trim();
+		} catch (error) {
+			if (isEnoent(error)) {
+				return this.#storeCache({ status: "not-found" });
+			}
+			logger.warn("Failed to read config file", { path: this.path(), error });
+			return this.#storeCache({
+				error: new ConfigError(this.id, undefined, { err: error, stage: "Read" }),
+				status: "error",
+			});
+		}
+		return this.#parseContent(content);
+	}
+
 	load(): T | null {
 		return this.tryLoad().value ?? null;
 	}
 
+	async loadAsync(): Promise<T | null> {
+		return (await this.tryLoadAsync()).value ?? null;
+	}
+
 	loadOrDefault(): T {
 		return this.tryLoad().value ?? this.createDefault();
+	}
+
+	async loadOrDefaultAsync(): Promise<T> {
+		return (await this.tryLoadAsync()).value ?? this.createDefault();
 	}
 
 	path(): string {

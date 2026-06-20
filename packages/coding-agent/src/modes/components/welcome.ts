@@ -1,6 +1,130 @@
-import { type Component, padding, TERMINAL, truncateToWidth, visibleWidth } from "@oh-my-pi/pi-tui";
+import {
+	type Component,
+	padding,
+	replaceTabs,
+	TERMINAL,
+	truncateToWidth,
+	visibleWidth,
+	wrapTextWithAnsi,
+} from "@oh-my-pi/pi-tui";
 import { APP_NAME } from "@oh-my-pi/pi-utils";
 import { theme } from "../../modes/theme/theme";
+import tipsText from "./tips.txt" with { type: "text" };
+
+/** Tips embedded at build time, one per line; blanks dropped. */
+const TIPS: readonly string[] = tipsText
+	.split("\n")
+	.map(line => line.trim())
+	.filter(line => line.length > 0);
+
+/**
+ * Fixed number of session rows in the welcome box so its height stays stable
+ * across recent-session updates.
+ */
+export const WELCOME_SESSION_SLOTS = 4;
+
+/**
+ * Fixed number of LSP-server rows, for the same reason. Overflow is sliced so
+ * the box height is constant regardless of how many servers a project has.
+ */
+export const WELCOME_LSP_SLOTS = 4;
+
+/** Trailing marker that flags a tip as a "what's new" callout. Stripped before
+ *  wrapping (with any preceding whitespace) and replaced by {@link NEW_TAG_TEXT}
+ *  painted as a shimmering rainbow. Non-global so `.test` stays stateless. */
+const NEW_TIP_MARKER = /\s*\[NEW\]\s*$/;
+
+/** Visible text rendered in place of {@link NEW_TIP_MARKER}. */
+const NEW_TAG_TEXT = "NEW!";
+
+/** Milliseconds for one full hue rotation of the rainbow "NEW!" tag. */
+const NEW_GLOW_PERIOD_MS = 1500;
+
+/** Selection weight for "[NEW]" tips; ordinary tips weigh 1, so a freshly added
+ *  affordance surfaces this many times as often. */
+const NEW_TIP_WEIGHT = 4;
+
+/** Per-tip selection weights, parallel to {@link TIPS}. */
+const TIP_WEIGHTS: readonly number[] = TIPS.map(tip => (NEW_TIP_MARKER.test(tip) ? NEW_TIP_WEIGHT : 1));
+const TIP_WEIGHT_TOTAL = TIP_WEIGHTS.reduce((sum, weight) => sum + weight, 0);
+
+/** Pick a tip at random, biased toward "[NEW]" tips by {@link NEW_TIP_WEIGHT}.
+ *  Returns "" when no tips are embedded. */
+function pickWeightedTip(): string {
+	if (TIPS.length === 0) return "";
+	let r = Math.random() * TIP_WEIGHT_TOTAL;
+	for (let i = 0; i < TIPS.length; i++) {
+		r -= TIP_WEIGHTS[i] ?? 1;
+		if (r < 0) return TIPS[i] ?? "";
+	}
+	return TIPS[TIPS.length - 1] ?? "";
+}
+
+type ColorEncoding = "ansi-16m" | "ansi-256";
+
+/** Paint each glyph of {@link NEW_TAG_TEXT} on a moving HSL rainbow. `phase`
+ *  rotates the hue offset cyclically; successive renders with increasing phase
+ *  shimmer, while a fixed phase yields a still rainbow. */
+function renderNewTag(phase: number, encoding: ColorEncoding): string {
+	const bold = "\x1b[1m";
+	const reset = "\x1b[0m";
+	const wrapped = ((phase % 1) + 1) % 1;
+	const chars = [...NEW_TAG_TEXT];
+	let out = bold;
+	let prev = "";
+	for (let i = 0; i < chars.length; i++) {
+		const hue = Math.round(((i / chars.length + wrapped) % 1) * 360);
+		const color = Bun.color(`hsl(${hue}, 95%, 60%)`, encoding) ?? "";
+		if (color !== prev) {
+			out += color;
+			prev = color;
+		}
+		out += chars[i];
+	}
+	return out + reset;
+}
+export function renderWelcomeTip(tip: string, boxWidth: number, phase = 0): string[] {
+	const label = "Tip: ";
+	const labelWidth = visibleWidth(label);
+	const bodyBudget = boxWidth - 1 - labelWidth; // 1 = leading indent
+	if (bodyBudget < 8) return [];
+
+	const isNew = NEW_TIP_MARKER.test(tip);
+	const body = isNew ? tip.replace(NEW_TIP_MARKER, "") : tip;
+
+	const wrappedBody = wrapTextWithAnsi(replaceTabs(body), bodyBudget);
+	if (wrappedBody.length === 0) return [];
+
+	const encoding: ColorEncoding = TERMINAL.trueColor ? "ansi-16m" : "ansi-256";
+	const purple = Bun.color("#b48cff", encoding) ?? "";
+	const lightBlue = Bun.color("#9ccfff", encoding) ?? "";
+	const italic = "\x1b[3m";
+	const dim = "\x1b[2m";
+	const reset = "\x1b[0m";
+	const continuationIndent = padding(labelWidth);
+
+	const lines = wrappedBody.map((line, index) =>
+		index === 0
+			? ` ${italic}${purple}${label}${dim}${lightBlue}${line}${reset}`
+			: ` ${italic}${continuationIndent}${dim}${lightBlue}${line}${reset}`,
+	);
+
+	if (isNew) {
+		// Append the rainbow tag to the final body line when it fits within the
+		// box; otherwise drop it onto its own indented continuation line so the
+		// styled glyphs never overflow or reflow the wrapped body.
+		const tag = renderNewTag(phase, encoding);
+		const tagWidth = 1 + visibleWidth(NEW_TAG_TEXT); // 1 = space separator
+		const lastLine = lines[lines.length - 1];
+		if (lastLine !== undefined && visibleWidth(lastLine) + tagWidth <= boxWidth) {
+			lines[lines.length - 1] = `${lastLine} ${tag}`;
+		} else {
+			lines.push(` ${continuationIndent}${tag}`);
+		}
+	}
+
+	return lines;
+}
 
 export interface RecentSession {
 	name: string;
@@ -9,7 +133,7 @@ export interface RecentSession {
 
 export interface LspServerInfo {
 	name: string;
-	status: "ready" | "error" | "connecting";
+	status: "ready" | "error" | "connecting" | "available";
 	fileTypes: string[];
 }
 
@@ -18,7 +142,13 @@ export interface LspServerInfo {
  */
 export class WelcomeComponent implements Component {
 	#animStart: number | null = null;
-	#animTimer: ReturnType<typeof setInterval> | null = null;
+	#animTimer: Timer | null = null;
+	#selectedTip: string | undefined;
+	// Render cache: the welcome box is the first transcript-area component, so
+	// returning a stable array reference keeps the whole frame prefix stable.
+	// Bypassed while the intro animation runs (every frame differs).
+	#cachedWidth = -1;
+	#cachedLines: string[] | undefined;
 
 	constructor(
 		private readonly version: string,
@@ -27,8 +157,21 @@ export class WelcomeComponent implements Component {
 		private recentSessions: RecentSession[] = [],
 		private lspServers: LspServerInfo[] = [],
 	) {}
+	get tip(): string | undefined {
+		if (this.#selectedTip === undefined) {
+			if (theme.getSymbolPreset() === "unicode" && Math.random() < 0.1) {
+				this.#selectedTip = "Please use nerdfont 😭.";
+			} else {
+				this.#selectedTip = pickWeightedTip();
+			}
+		}
+		return this.#selectedTip || undefined;
+	}
 
-	invalidate(): void {}
+	invalidate(): void {
+		this.#cachedWidth = -1;
+		this.#cachedLines = undefined;
+	}
 
 	/**
 	 * Play a one-shot intro that sweeps the gradient through every phase
@@ -54,22 +197,43 @@ export class WelcomeComponent implements Component {
 			this.#animTimer = null;
 		}
 		this.#animStart = null;
+		// The settled (resting) frame differs from the last intro frame.
+		this.invalidate();
 	}
 
 	setModel(modelName: string, providerName: string): void {
 		this.modelName = modelName;
 		this.providerName = providerName;
+		this.invalidate();
 	}
 
 	setRecentSessions(sessions: RecentSession[]): void {
 		this.recentSessions = sessions;
+		this.invalidate();
 	}
 
 	setLspServers(servers: LspServerInfo[]): void {
 		this.lspServers = servers;
+		this.invalidate();
 	}
 
-	render(termWidth: number): string[] {
+	render(termWidth: number): readonly string[] {
+		const animating = this.#animStart != null;
+		if (!animating && this.#cachedLines && this.#cachedWidth === termWidth) {
+			return this.#cachedLines;
+		}
+		const lines = this.#renderLines(termWidth);
+		if (animating) {
+			this.#cachedLines = undefined;
+			this.#cachedWidth = -1;
+		} else {
+			this.#cachedLines = lines;
+			this.#cachedWidth = termWidth;
+		}
+		return lines;
+	}
+
+	#renderLines(termWidth: number): string[] {
 		// Box dimensions - responsive with max width and small-terminal support
 		const maxWidth = 100;
 		const boxWidth = Math.min(maxWidth, Math.max(0, termWidth - 2));
@@ -124,7 +288,7 @@ export class WelcomeComponent implements Component {
 			// absorbs whatever space is left.
 			const bulletPrefix = ` ${theme.md.bullet} `;
 			const prefixWidth = visibleWidth(bulletPrefix);
-			for (const session of this.recentSessions.slice(0, 3)) {
+			for (const session of this.recentSessions.slice(0, WELCOME_SESSION_SLOTS)) {
 				const timeSuffixRaw = ` (${session.timeAgo})`;
 				const timeWidth = visibleWidth(timeSuffixRaw);
 				const nameBudget = Math.max(1, rightCol - prefixWidth - timeWidth);
@@ -135,22 +299,32 @@ export class WelcomeComponent implements Component {
 				);
 			}
 		}
+		// Pad to the fixed slot count so the box height doesn't depend on session count.
+		while (sessionLines.length < WELCOME_SESSION_SLOTS) {
+			sessionLines.push("");
+		}
 
 		// LSP servers content
 		const lspLines: string[] = [];
 		if (this.lspServers.length === 0) {
 			lspLines.push(` ${theme.fg("dim", "No LSP servers")}`);
 		} else {
-			for (const server of this.lspServers) {
+			for (const server of this.lspServers.slice(0, WELCOME_LSP_SLOTS)) {
 				const icon =
 					server.status === "ready"
-						? theme.styledSymbol("status.success", "success")
-						: server.status === "connecting"
-							? theme.styledSymbol("status.pending", "muted")
-							: theme.styledSymbol("status.error", "error");
+						? theme.styledSymbol("status.enabled", "success")
+						: server.status === "available"
+							? theme.styledSymbol("status.enabled", "dim")
+							: server.status === "connecting"
+								? theme.styledSymbol("status.pending", "muted")
+								: theme.styledSymbol("status.error", "error");
 				const exts = server.fileTypes.slice(0, 3).join(" ");
 				lspLines.push(` ${icon} ${theme.fg("muted", server.name)} ${theme.fg("dim", exts)}`);
 			}
+		}
+		// Pad to the fixed slot count so the box height doesn't depend on server count.
+		while (lspLines.length < WELCOME_LSP_SLOTS) {
+			lspLines.push("");
 		}
 
 		// Right column
@@ -207,12 +381,31 @@ export class WelcomeComponent implements Component {
 		}
 		// Bottom border
 		if (showRightColumn) {
-			lines.push(bl + h.repeat(leftCol) + theme.fg("dim", theme.boxSharp.teeUp) + h.repeat(rightCol) + br);
+			lines.push(bl + h.repeat(leftCol) + theme.fg("dim", theme.boxRound.teeUp) + h.repeat(rightCol) + br);
 		} else {
 			lines.push(bl + h.repeat(leftCol) + br);
 		}
 
+		// Randomly picked tip, rendered directly beneath the box.
+		lines.push(...this.#renderTip(boxWidth));
+
 		return lines;
+	}
+
+	/**
+	 * Render the per-instance tip line: a purple "Tip:" label followed by the
+	 * tip body in dimmed light blue, the whole line italicized. Returns `[]`
+	 * when no tip is available or the box is too narrow to be useful.
+	 */
+	#renderTip(boxWidth: number): string[] {
+		const tip = this.tip;
+		if (!tip) return [];
+		// A trailing "[NEW]" marker paints an animated rainbow "NEW!" tag. Derive
+		// its hue phase from wall-clock time so it shimmers across the welcome
+		// intro's re-render frames, then settles into a still rainbow once the box
+		// caches its resting frame. Non-"[NEW]" tips ignore the phase entirely.
+		const phase = NEW_TIP_MARKER.test(tip) ? performance.now() / NEW_GLOW_PERIOD_MS : 0;
+		return renderWelcomeTip(tip, boxWidth, phase);
 	}
 
 	/** Center text within a given width */
@@ -256,23 +449,11 @@ export class WelcomeComponent implements Component {
 		if (this.#animStart == null) return REST_FRAME;
 		const elapsed = performance.now() - this.#animStart;
 		if (elapsed >= INTRO_MS) return REST_FRAME;
-		// Ease-out cubic so the spin decelerates into the resting state.
-		const progress = elapsed / INTRO_MS;
-		const eased = 1 - (1 - progress) ** 3;
-		// Sweep backward through INTRO_SWEEPS full rotations so the gradient
-		// visibly spins multiple times. `eased == 1` → phase = 0 = resting frame.
-		const phase = ((((1 - eased) * INTRO_SWEEPS) % 1) + 1) % 1;
-		// Shine traverses the diagonal at a steady pace, decoupled from the
-		// gradient phase so the two layers parallax. Strength fades out with
-		// the same ease-out curve so the highlight is gone by the resting frame.
-		const shinePos = (((progress * INTRO_SHINE_TRAVERSALS) % 1) + 1) % 1;
-		const shineStrength = (1 - eased) ** 1.5;
-		return gradientLogo(PI_LOGO, phase, { strength: shineStrength, pos: shinePos });
+		return introLogoFrame(elapsed / INTRO_MS);
 	}
 }
 
-// biome-ignore format: preserve ASCII art layout
-const PI_LOGO = ["▀██████████▀", " ╘██    ██  ", "  ██    ██  ", "  ██    ██  ", " ▄██▄  ▄██▄ "];
+export const PI_LOGO = ["▀██████████▀", " ╘██    ██  ", "  ██    ██  ", "  ██    ██  ", " ▄██▄  ▄██▄ "];
 
 /** Multi-stop palette for the diagonal gradient. */
 const GRADIENT_STOPS: ReadonlyArray<readonly [number, number, number]> = [
@@ -289,11 +470,54 @@ const GRADIENT_RAMP_256 = [199, 171, 135, 99, 75, 51, 87];
 /** Half-width of the shine highlight band, expressed in gradient-t units. */
 const SHINE_HALF_WIDTH = 0.18;
 
-interface ShineConfig {
+export interface ShineConfig {
 	/** Overall opacity of the shine overlay, in [0, 1]. */
 	strength: number;
 	/** Center of the shine band along the diagonal, in [0, 1]. */
 	pos: number;
+}
+
+/**
+ * Resolve the gradient SGR foreground escape for a normalized position `t`
+ * (0..1) along the diagonal, compositing the optional sliding shine highlight.
+ * Shared by {@link gradientLogo} and the setup splash so both stay
+ * color-identical (truecolor when available, 256-color ramp otherwise).
+ */
+export function gradientEscape(t: number, shine?: ShineConfig): string {
+	const shineStrength = shine && shine.strength > 0 ? shine.strength : 0;
+	const shinePos = shine ? shine.pos : 0;
+	if (TERMINAL.trueColor) {
+		// 5-stop palette widens the visible color range and avoids the
+		// deep-blue valley a naive HSL lerp falls into.
+		const stops = GRADIENT_STOPS;
+		const seg = t * (stops.length - 1);
+		const i = Math.min(stops.length - 2, Math.floor(seg));
+		const f = seg - i;
+		const a = stops[i];
+		const b = stops[i + 1];
+		let r = a[0] + (b[0] - a[0]) * f;
+		let g = a[1] + (b[1] - a[1]) * f;
+		let bl = a[2] + (b[2] - a[2]) * f;
+		if (shineStrength > 0) {
+			const dist = Math.abs(t - shinePos);
+			const intensity = Math.max(0, 1 - dist / SHINE_HALF_WIDTH) * shineStrength;
+			if (intensity > 0) {
+				r += (255 - r) * intensity;
+				g += (255 - g) * intensity;
+				bl += (255 - bl) * intensity;
+			}
+		}
+		return `\x1b[38;2;${Math.round(r)};${Math.round(g)};${Math.round(bl)}m`;
+	}
+	const ramp = GRADIENT_RAMP_256;
+	let idx = Math.min(ramp.length - 1, Math.max(0, Math.floor(t * (ramp.length - 1) + 0.5)));
+	if (shineStrength > 0) {
+		const dist = Math.abs(t - shinePos);
+		const intensity = Math.max(0, 1 - dist / SHINE_HALF_WIDTH) * shineStrength;
+		// Promote to the brightest ramp slot when the shine band peaks here.
+		if (intensity > 0.5) idx = ramp.length - 1;
+	}
+	return `\x1b[38;5;${ramp[idx]}m`;
 }
 
 /**
@@ -302,50 +526,13 @@ interface ShineConfig {
  * gradient along the diagonal, wrapping at 1. When `shine` is provided, a soft
  * white highlight is composited on top, centered at `shine.pos`.
  */
-function gradientLogo(lines: readonly string[], phase = 0, shine?: ShineConfig): string[] {
+export function gradientLogo(lines: readonly string[], phase = 0, shine?: ShineConfig): string[] {
 	const reset = "\x1b[0m";
 	const rows = lines.length;
 	const cols = Math.max(...lines.map(l => l.length));
 	// span+1 so `base` stays strictly < 1: avoids the wrap-around at the
 	// far corner mapping back to t=0 (hot pink) on the resting frame.
 	const span = Math.max(1, cols + rows - 1);
-	const shineStrength = shine && shine.strength > 0 ? shine.strength : 0;
-	const shinePos = shine ? shine.pos : 0;
-	const colorAt = TERMINAL.trueColor
-		? (t: number): string => {
-				// 5-stop palette widens the visible color range and avoids the
-				// deep-blue valley a naive HSL lerp falls into.
-				const stops = GRADIENT_STOPS;
-				const seg = t * (stops.length - 1);
-				const i = Math.min(stops.length - 2, Math.floor(seg));
-				const f = seg - i;
-				const a = stops[i];
-				const b = stops[i + 1];
-				let r = a[0] + (b[0] - a[0]) * f;
-				let g = a[1] + (b[1] - a[1]) * f;
-				let bl = a[2] + (b[2] - a[2]) * f;
-				if (shineStrength > 0) {
-					const dist = Math.abs(t - shinePos);
-					const intensity = Math.max(0, 1 - dist / SHINE_HALF_WIDTH) * shineStrength;
-					if (intensity > 0) {
-						r += (255 - r) * intensity;
-						g += (255 - g) * intensity;
-						bl += (255 - bl) * intensity;
-					}
-				}
-				return `\x1b[38;2;${Math.round(r)};${Math.round(g)};${Math.round(bl)}m`;
-			}
-		: (t: number): string => {
-				const ramp = GRADIENT_RAMP_256;
-				let idx = Math.min(ramp.length - 1, Math.max(0, Math.floor(t * (ramp.length - 1) + 0.5)));
-				if (shineStrength > 0) {
-					const dist = Math.abs(t - shinePos);
-					const intensity = Math.max(0, 1 - dist / SHINE_HALF_WIDTH) * shineStrength;
-					// Promote to the brightest ramp slot when the shine band peaks here.
-					if (intensity > 0.5) idx = ramp.length - 1;
-				}
-				return `\x1b[38;5;${ramp[idx]}m`;
-			};
 	return lines.map((line, y) => {
 		let result = "";
 		for (let x = 0; x < line.length; x++) {
@@ -357,7 +544,7 @@ function gradientLogo(lines: readonly string[], phase = 0, shine?: ShineConfig):
 			// Diagonal: bottom-left (x=0, y=rows-1) → top-right (x=cols-1, y=0)
 			const base = (x + (rows - 1 - y)) / span;
 			const t = (((base + phase) % 1) + 1) % 1;
-			result += colorAt(t) + char + reset;
+			result += gradientEscape(t, shine) + char + reset;
 		}
 		return result;
 	});
@@ -371,6 +558,24 @@ const INTRO_TICK_MS = 33;
 const INTRO_SWEEPS = 2.5;
 /** Number of times the shine highlight crosses the diagonal across the intro. */
 const INTRO_SHINE_TRAVERSALS = 3;
+
+/**
+ * Logo frame for a normalized intro progress in [0, 1).
+ *
+ * Ease-out cubic so the spin decelerates into the resting state. The gradient
+ * sweeps backward through INTRO_SWEEPS full rotations (`eased == 1` → phase =
+ * 0 = resting frame) while the shine traverses the diagonal at a steady pace,
+ * decoupled from the gradient phase so the two layers parallax; its strength
+ * fades with the same ease-out curve so the highlight is gone by the resting
+ * frame.
+ */
+function introLogoFrame(progress: number): string[] {
+	const eased = 1 - (1 - progress) ** 3;
+	const phase = ((((1 - eased) * INTRO_SWEEPS) % 1) + 1) % 1;
+	const shinePos = (((progress * INTRO_SHINE_TRAVERSALS) % 1) + 1) % 1;
+	const shineStrength = (1 - eased) ** 1.5;
+	return gradientLogo(PI_LOGO, phase, { strength: shineStrength, pos: shinePos });
+}
 
 /** Resting gradient frame, cached for re-renders outside of the intro. */
 const REST_FRAME = gradientLogo(PI_LOGO, 0);

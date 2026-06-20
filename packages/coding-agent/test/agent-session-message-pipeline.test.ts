@@ -1,15 +1,23 @@
 import { afterEach, describe, expect, it, vi } from "bun:test";
 import { Agent, type AgentMessage } from "@oh-my-pi/pi-agent-core";
 import {
+	type Api,
+	type Context,
 	clearCustomApis,
+	type ImageContent,
 	type Message,
 	type Model,
+	type ModelSpec,
 	registerCustomApi,
 	type SimpleStreamOptions,
+	type TextContent,
 } from "@oh-my-pi/pi-ai";
 import { AssistantMessageEventStream } from "@oh-my-pi/pi-ai/utils/event-stream";
+import { buildModel } from "@oh-my-pi/pi-catalog/build";
 import { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
+import { SecretObfuscator } from "@oh-my-pi/pi-coding-agent/secrets";
 import { AgentSession, type AgentSessionEvent } from "@oh-my-pi/pi-coding-agent/session/agent-session";
+import { convertToLlm, wrapSteeringForModel } from "@oh-my-pi/pi-coding-agent/session/messages";
 import { SessionManager } from "@oh-my-pi/pi-coding-agent/session/session-manager";
 import { createAssistantMessage } from "./helpers/agent-session-setup";
 
@@ -21,6 +29,27 @@ function createAgent(): Agent {
 			tools: [],
 		},
 	});
+}
+
+function createModelRegistryStub(key = "key") {
+	return {
+		getApiKey: vi.fn(async () => key),
+		resolver: vi.fn(() => async () => key),
+	};
+}
+
+function getConvertedUserText(message: Message | undefined): string {
+	if (message?.role !== "user") {
+		throw new Error("Expected converted user message");
+	}
+	if (typeof message.content === "string") {
+		return message.content;
+	}
+	const text = message.content.find((content): content is TextContent => content.type === "text");
+	if (!text) {
+		throw new Error("Expected converted text content");
+	}
+	return text.text;
 }
 
 describe("AgentSession message pipeline", () => {
@@ -73,6 +102,84 @@ describe("AgentSession message pipeline", () => {
 		expect(result).toEqual(convertedMessages);
 	});
 
+	it("marks queued user steers without changing the public queue text", async () => {
+		const session = new AgentSession({
+			agent: createAgent(),
+			sessionManager: SessionManager.inMemory(),
+			settings: Settings.isolated({ "compaction.enabled": false }),
+			modelRegistry: {} as never,
+		});
+		sessions.push(session);
+
+		await session.sendUserMessage("raw <steer> &", { deliverAs: "steer" });
+
+		expect(session.getQueuedMessages().steering).toEqual(["raw <steer> &"]);
+		const queued = session.agent.popLastSteer();
+		if (queued?.role !== "user") {
+			throw new Error("Expected queued user steer");
+		}
+		expect(queued.steering).toBe(true);
+		expect(queued.content).toEqual([{ type: "text", text: "raw <steer> &" }]);
+		session.clearQueue();
+	});
+
+	it("resolves image attachments from submitted messages, not tool-result images", () => {
+		const userImage: ImageContent = { type: "image", data: "user-image", mimeType: "image/png" };
+		const toolImage: ImageContent = { type: "image", data: "tool-image", mimeType: "image/png" };
+		const session = new AgentSession({
+			agent: createAgent(),
+			sessionManager: SessionManager.inMemory(),
+			settings: Settings.isolated({ "compaction.enabled": false }),
+			modelRegistry: {} as never,
+		});
+		sessions.push(session);
+
+		session.agent.appendMessage({
+			role: "user",
+			content: [{ type: "text", text: "inspect this" }, userImage],
+			timestamp: Date.now(),
+		});
+		session.agent.appendMessage({
+			role: "toolResult",
+			toolCallId: "eval-1",
+			toolName: "eval",
+			content: [{ type: "text", text: "plot output" }, toolImage],
+			timestamp: Date.now(),
+			isError: false,
+		});
+
+		expect(session.getImageAttachments()).toEqual([{ label: "Image #1", uri: "attachment://1", image: userImage }]);
+	});
+
+	it("keeps stored steering text raw while pre-LLM conversion wraps it", async () => {
+		const session = new AgentSession({
+			agent: createAgent(),
+			sessionManager: SessionManager.inMemory(),
+			settings: Settings.isolated({ "compaction.enabled": false }),
+			modelRegistry: {} as never,
+			transformContext: wrapSteeringForModel,
+			convertToLlm,
+		});
+		sessions.push(session);
+		const raw: AgentMessage = {
+			role: "user",
+			content: [{ type: "text", text: "steer with <xml> & ampersand" }],
+			steering: true,
+			timestamp: 1,
+		};
+		session.agent.appendMessage(raw);
+
+		const converted = await session.convertMessagesToLlm(session.messages);
+
+		expect(session.messages[0]).toBe(raw);
+		expect(raw.content).toEqual([{ type: "text", text: "steer with <xml> & ampersand" }]);
+		const convertedText = getConvertedUserText(converted[0]);
+		expect(convertedText).toContain("<user_interjection>");
+		expect(convertedText).toContain("<message>\nsteer with <xml> & ampersand\n</message>");
+		expect(convertedText).not.toContain("&lt;xml&gt;");
+		expect(convertedText).not.toContain("&amp;");
+	});
+
 	it("composes session payload hooks into direct side-request options", async () => {
 		const sessionOnPayload = vi.fn(async (payload: unknown) => ({
 			...(payload as Record<string, unknown>),
@@ -113,7 +220,7 @@ describe("AgentSession message pipeline", () => {
 			return stream;
 		});
 
-		const model = {
+		const model = buildModel({
 			id: "side-model",
 			name: "Side Model",
 			api,
@@ -124,7 +231,75 @@ describe("AgentSession message pipeline", () => {
 			cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
 			contextWindow: 4096,
 			maxTokens: 1024,
-		} satisfies Model;
+		} as ModelSpec<Api>) as Model<Api>;
+		const session = new AgentSession({
+			agent: new Agent({
+				initialState: {
+					model,
+					systemPrompt: ["system prompt"],
+					messages: [],
+					tools: [],
+				},
+			}),
+			sessionManager: SessionManager.inMemory(),
+			settings: Settings.isolated({ "compaction.enabled": false }),
+			modelRegistry: createModelRegistryStub() as never,
+		});
+		sessions.push(session);
+		const cacheSessionId = session.sessionId;
+
+		const result = await session.runEphemeralTurn({ promptText: "Question?" });
+
+		expect(result.replyText).toBe("Answer");
+		expect(capturedOptions?.promptCacheKey).toBe(cacheSessionId);
+		expect(capturedOptions?.sessionId).toStartWith(`${cacheSessionId}:side:`);
+		expect(capturedOptions?.sessionId).not.toBe(cacheSessionId);
+		expect(capturedOptions?.preferWebsockets).toBe(false);
+	});
+
+	it("rotates ephemeral side-channel credentials on Google Resource exhausted", async () => {
+		const api = "test-ephemeral-google-resource-exhausted";
+		const googleErrorMessage = "Google API error (429): Resource exhausted. Please try again later.";
+		const keys: unknown[] = [];
+		let capturedOptions: SimpleStreamOptions | undefined;
+		registerCustomApi(api, (_model, _context, options) => {
+			capturedOptions = options;
+			keys.push(options?.apiKey);
+			const stream = new AssistantMessageEventStream();
+			queueMicrotask(() => {
+				if (options?.apiKey === "next-key") {
+					const message = createAssistantMessage("Recovered");
+					stream.push({ type: "text_delta", contentIndex: 0, delta: "Recovered", partial: message });
+					stream.push({ type: "done", reason: "stop", message });
+					return;
+				}
+
+				const error = createAssistantMessage("");
+				error.content = [];
+				error.stopReason = "error";
+				error.errorMessage = googleErrorMessage;
+				error.errorStatus = 429;
+				stream.push({ type: "start", partial: error });
+				stream.push({ type: "error", reason: "error", error });
+			});
+			return stream;
+		});
+
+		const model = buildModel({
+			id: "side-google-model",
+			name: "Side Google Model",
+			api,
+			provider: "google",
+			baseUrl: "",
+			reasoning: false,
+			input: ["text"],
+			cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+			contextWindow: 4096,
+			maxTokens: 1024,
+		} as ModelSpec<Api>) as Model<Api>;
+		const resolver = vi.fn(
+			() => async (ctx: { error: unknown }) => (ctx.error === undefined ? "old-key" : "next-key"),
+		);
 		const session = new AgentSession({
 			agent: new Agent({
 				initialState: {
@@ -137,7 +312,8 @@ describe("AgentSession message pipeline", () => {
 			sessionManager: SessionManager.inMemory(),
 			settings: Settings.isolated({ "compaction.enabled": false }),
 			modelRegistry: {
-				getApiKey: vi.fn(async () => "key"),
+				getApiKey: vi.fn(async () => "old-key"),
+				resolver,
 			} as never,
 		});
 		sessions.push(session);
@@ -145,11 +321,11 @@ describe("AgentSession message pipeline", () => {
 
 		const result = await session.runEphemeralTurn({ promptText: "Question?" });
 
-		expect(result.replyText).toBe("Answer");
+		expect(result.replyText).toBe("Recovered");
+		expect(keys).toEqual(["old-key", "next-key"]);
 		expect(capturedOptions?.promptCacheKey).toBe(cacheSessionId);
 		expect(capturedOptions?.sessionId).toStartWith(`${cacheSessionId}:side:`);
-		expect(capturedOptions?.sessionId).not.toBe(cacheSessionId);
-		expect(capturedOptions?.preferWebsockets).toBe(false);
+		expect(resolver).toHaveBeenCalledWith(model, cacheSessionId);
 	});
 
 	it("applies configured OpenRouter routing variant to ephemeral side-channel options", async () => {
@@ -166,7 +342,7 @@ describe("AgentSession message pipeline", () => {
 			return stream;
 		});
 
-		const model = {
+		const model = buildModel({
 			id: "anthropic/claude-sonnet-4",
 			name: "OpenRouter Model",
 			api,
@@ -177,7 +353,7 @@ describe("AgentSession message pipeline", () => {
 			cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
 			contextWindow: 4096,
 			maxTokens: 1024,
-		} satisfies Model;
+		} as ModelSpec<Api>) as Model<Api>;
 		const session = new AgentSession({
 			agent: new Agent({
 				initialState: {
@@ -192,9 +368,7 @@ describe("AgentSession message pipeline", () => {
 				"compaction.enabled": false,
 				"providers.openrouterVariant": "nitro",
 			}),
-			modelRegistry: {
-				getApiKey: vi.fn(async () => "key"),
-			} as never,
+			modelRegistry: createModelRegistryStub() as never,
 		});
 		sessions.push(session);
 
@@ -202,6 +376,56 @@ describe("AgentSession message pipeline", () => {
 
 		expect(result.replyText).toBe("Answer");
 		expect(capturedOptions?.openrouterVariant).toBe("nitro");
+	});
+
+	it("obfuscates the system prompt and messages on ephemeral side-channel requests", async () => {
+		const api = "test-ephemeral-secret-redaction";
+		const secret = "EPHEMERAL_SECRET_TOKEN_12345";
+		let capturedContext: Context | undefined;
+		registerCustomApi(api, (_model, context, _options) => {
+			capturedContext = context;
+			const stream = new AssistantMessageEventStream();
+			queueMicrotask(() => {
+				const message = createAssistantMessage("Answer");
+				stream.push({ type: "text_delta", contentIndex: 0, delta: "Answer", partial: message });
+				stream.push({ type: "done", reason: "stop", message });
+			});
+			return stream;
+		});
+
+		const model = buildModel({
+			id: "side-model-secrets",
+			name: "Side Model Secrets",
+			api,
+			provider: "test-provider",
+			baseUrl: "",
+			reasoning: false,
+			input: ["text"],
+			cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+			contextWindow: 4096,
+			maxTokens: 1024,
+		} as ModelSpec<Api>) as Model<Api>;
+		const session = new AgentSession({
+			agent: new Agent({
+				initialState: {
+					model,
+					systemPrompt: [`system prompt with ${secret}`],
+					messages: [],
+					tools: [],
+				},
+			}),
+			sessionManager: SessionManager.inMemory(),
+			settings: Settings.isolated({ "compaction.enabled": false }),
+			modelRegistry: createModelRegistryStub() as never,
+			obfuscator: new SecretObfuscator([{ type: "plain", content: secret }]),
+		});
+		sessions.push(session);
+
+		const result = await session.runEphemeralTurn({ promptText: `question about ${secret}` });
+
+		expect(result.replyText).toBe("Answer");
+		expect(capturedContext).toBeDefined();
+		expect(JSON.stringify(capturedContext)).not.toContain(secret);
 	});
 
 	it("records raw SSE diagnostics into the session buffer before request hooks", async () => {
@@ -238,6 +462,7 @@ describe("AgentSession message pipeline", () => {
 			settings: Settings.isolated({ "compaction.enabled": false }),
 			modelRegistry: {} as never,
 			extensionRunner: {
+				hasHandlers: () => true,
 				emit: extensionEmit,
 			} as never,
 		});

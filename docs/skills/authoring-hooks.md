@@ -123,8 +123,8 @@ Contract:
 - Handlers run in registration order. For `HookAPI`, each handler receives the original tool result event, and the last returned override wins.
 - `content` replaces the full content array for the LLM.
 - `details` replaces the structured details object.
-- `isError` overrides the error flag (typed, but note: `HookToolWrapper` behavior for error path rethrows regardless).
-- On a tool failure, `tool_result` is still emitted with `isError: true`; the original error is rethrown after handlers complete.
+- `isError` exists on the shared result type, but `HookToolWrapper` does not propagate it into a successful tool result; on a tool failure, the original error is rethrown after handlers complete.
+- On a tool failure, `tool_result` is still emitted with `isError: true`.
 
 ## Context modification contract
 
@@ -179,11 +179,15 @@ export default function rmRfBlocker(omp: HookAPI): void {
 ```ts
 import type { HookAPI } from "@oh-my-pi/pi-coding-agent/extensibility/hooks";
 
-// Matches common API key patterns: sk-..., pk-..., AKIA..., ghp_..., etc.
+// Common API-key shapes. Not exhaustive — providers using bespoke formats
+// (Anthropic `sk-ant-…`, JWT-style bearers, gateway-specific prefixes, etc.)
+// need their own entries.
 const SECRET_PATTERNS = [
   /\b(sk|pk)-[a-zA-Z0-9]{20,}\b/g,
   /\bAKIA[A-Z0-9]{16}\b/g,
   /\bghp_[a-zA-Z0-9]{36}\b/g,
+  // Zhipu / GLM Coding Plan: `<id>.<secret>` (no `sk-` prefix).
+  /\b[a-zA-Z0-9]{16,}\.[a-zA-Z0-9]{16,}\b/g,
   /\b[a-zA-Z0-9_-]{20,}\s*=\s*["']?[a-zA-Z0-9._/+=-]{20,}["']?/g,
 ];
 
@@ -218,7 +222,7 @@ export default function contextFilter(omp: HookAPI): void {
 
     const trimmed = event.messages.map(msg => {
       // Truncate very large tool results to keep context manageable
-      if (msg.role !== "tool") return msg;
+      if (msg.role !== "toolResult") return msg;
       const content = msg.content.map(chunk => {
         if (chunk.type !== "text" || chunk.text.length <= MAX_TOOL_OUTPUT_CHARS) return chunk;
         return {

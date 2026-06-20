@@ -1,39 +1,47 @@
-import { describe, expect, it, vi } from "bun:test";
-import { defaultEditorTheme } from "../../tui/test/test-themes";
-import { CustomEditor } from "../src/modes/components/custom-editor";
+import { beforeAll, describe, expect, it, vi } from "bun:test";
+import { CustomEditor } from "@oh-my-pi/pi-coding-agent/modes/components/custom-editor";
+import { getEditorTheme, initTheme } from "@oh-my-pi/pi-coding-agent/modes/theme/theme";
 
-function ctrl(key: string): string {
-	return String.fromCharCode(key.toLowerCase().charCodeAt(0) & 31);
-}
-
-function createEditor() {
-	return new CustomEditor(defaultEditorTheme);
-}
-
-describe("CustomEditor temporary model selector keybinding", () => {
-	it("triggers the temporary selector from a remapped action key instead of Alt+P", () => {
-		const editor = createEditor();
-		const onSelectModelTemporary = vi.fn();
-		editor.onSelectModelTemporary = onSelectModelTemporary;
-		editor.setActionKeys("app.model.selectTemporary", ["ctrl+y"]);
-
-		editor.handleInput(ctrl("y"));
-		expect(onSelectModelTemporary).toHaveBeenCalledTimes(1);
-
-		editor.handleInput("\x1bp");
-		expect(onSelectModelTemporary).toHaveBeenCalledTimes(1);
+describe("CustomEditor keybindings", () => {
+	beforeAll(async () => {
+		await initTheme();
 	});
 
-	it("removes the default Alt+P shortcut when the action is disabled", () => {
-		const editor = createEditor();
-		const onSelectModelTemporary = vi.fn();
-		editor.onSelectModelTemporary = onSelectModelTemporary;
+	it("routes the configured retry chord through handleInput", () => {
+		const editor = new CustomEditor(getEditorTheme());
+		const onRetry = vi.fn();
 
-		editor.handleInput("\x1bp");
-		expect(onSelectModelTemporary).toHaveBeenCalledTimes(1);
+		editor.setActionKeys("app.retry", ["alt+shift+r"]);
+		editor.onRetry = onRetry;
+		editor.handleInput("\x1bR");
 
-		editor.setActionKeys("app.model.selectTemporary", []);
-		editor.handleInput("\x1bp");
-		expect(onSelectModelTemporary).toHaveBeenCalledTimes(1);
+		expect(onRetry).toHaveBeenCalledTimes(1);
+	});
+
+	it("lets custom handlers keep precedence over the default retry chord", () => {
+		const editor = new CustomEditor(getEditorTheme());
+		const onRetry = vi.fn();
+		const customHandler = vi.fn();
+
+		editor.onRetry = onRetry;
+		editor.setCustomKeyHandler("alt+r", customHandler);
+		editor.handleInput("\x1br");
+
+		expect(customHandler).toHaveBeenCalledTimes(1);
+		expect(onRetry).not.toHaveBeenCalled();
+	});
+
+	it("lets copy-prompt remaps keep precedence over the default retry chord", () => {
+		const editor = new CustomEditor(getEditorTheme());
+		const onRetry = vi.fn();
+		const onCopyPrompt = vi.fn();
+
+		editor.onRetry = onRetry;
+		editor.onCopyPrompt = onCopyPrompt;
+		editor.setActionKeys("app.clipboard.copyPrompt", ["alt+r"]);
+		editor.handleInput("\x1br");
+
+		expect(onCopyPrompt).toHaveBeenCalledTimes(1);
+		expect(onRetry).not.toHaveBeenCalled();
 	});
 });

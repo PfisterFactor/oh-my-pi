@@ -1,7 +1,7 @@
 {
 	"type": "module",
 	"name": "@oh-my-pi/pi-agent-core",
-	"version": "15.5.10",
+	"version": "16.1.7",
 	"description": "General-purpose agent with transport abstraction, state management, and attachment support",
 	"homepage": "https://omp.sh",
 	"author": "Can Boluk",
@@ -30,14 +30,17 @@
 		"check": "biome check . && bun run check:types",
 		"check:types": "tsgo -p tsconfig.json --noEmit",
 		"lint": "biome lint .",
-		"test": "bun test",
+		"test": "bun test --parallel",
 		"fix": "biome check --write --unsafe .",
 		"fmt": "biome format --write ."
 	},
 	"dependencies": {
 		"@oh-my-pi/pi-ai": "catalog:",
+		"@oh-my-pi/pi-catalog": "catalog:",
 		"@oh-my-pi/pi-natives": "catalog:",
 		"@oh-my-pi/pi-utils": "catalog:",
+		"@oh-my-pi/pi-wire": "catalog:",
+		"@oh-my-pi/snapcompact": "catalog:",
 		"@opentelemetry/api": "catalog:"
 	},
 	"devDependencies": {

@@ -1,4 +1,4 @@
-import { existsSync, readFileSync, writeFileSync } from "node:fs";
+import * as fs from "node:fs";
 import * as path from "node:path";
 import {
 	type Keybinding,
@@ -10,6 +10,7 @@ import {
 	KeybindingsManager as TuiKeybindingsManager,
 } from "@oh-my-pi/pi-tui";
 import { getAgentDir, isEnoent, logger } from "@oh-my-pi/pi-utils";
+import { JSONC, YAML } from "bun";
 
 /**
  * Application-level keybindings (coding agent specific).
@@ -20,6 +21,7 @@ interface AppKeybindings {
 	"app.clear": true;
 	"app.exit": true;
 	"app.suspend": true;
+	"app.display.reset": true;
 	"app.thinking.cycle": true;
 	"app.thinking.toggle": true;
 	"app.model.cycleForward": true;
@@ -29,10 +31,13 @@ interface AppKeybindings {
 	"app.tools.expand": true;
 	"app.editor.external": true;
 	"app.message.followUp": true;
+	"app.retry": true;
 	"app.message.dequeue": true;
 	"app.clipboard.pasteImage": true;
+	"app.clipboard.pasteTextRaw": true;
 	"app.clipboard.copyLine": true;
 	"app.clipboard.copyPrompt": true;
+	"app.agents.hub": true;
 	"app.session.new": true;
 	"app.session.tree": true;
 	"app.session.fork": true;
@@ -57,6 +62,13 @@ declare module "@oh-my-pi/pi-tui" {
 }
 
 /**
+ * Resolve default image-paste shortcuts for the current terminal platform.
+ */
+export function getDefaultPasteImageKeys(platform: NodeJS.Platform = process.platform): KeyId[] {
+	return platform === "win32" ? ["ctrl+v", "alt+v"] : ["ctrl+v"];
+}
+
+/**
  * All keybindings definitions: TUI + app-specific.
  */
 export const KEYBINDINGS = {
@@ -77,6 +89,10 @@ export const KEYBINDINGS = {
 		defaultKeys: "ctrl+z",
 		description: "Suspend application",
 	},
+	"app.display.reset": {
+		defaultKeys: "ctrl+l",
+		description: "Reset terminal display",
+	},
 	"app.thinking.cycle": {
 		defaultKeys: "shift+tab",
 		description: "Cycle thinking level",
@@ -94,7 +110,7 @@ export const KEYBINDINGS = {
 		description: "Cycle to previous model",
 	},
 	"app.model.select": {
-		defaultKeys: "ctrl+l",
+		defaultKeys: "alt+m",
 		description: "Select model",
 	},
 	"app.model.selectTemporary": {
@@ -110,16 +126,27 @@ export const KEYBINDINGS = {
 		description: "Open external editor",
 	},
 	"app.message.followUp": {
-		defaultKeys: "ctrl+enter",
+		// Ctrl+Enter is preserved for terminals that deliver it (Kitty/iTerm2/WezTerm/Ghostty),
+		// but Windows Terminal does not emit a distinct event for Ctrl+Enter — Ctrl+Q is listed
+		// first so the default binding works there without remapping (#1903).
+		defaultKeys: ["ctrl+q", "ctrl+enter"],
 		description: "Send follow-up message",
+	},
+	"app.retry": {
+		defaultKeys: "alt+r",
+		description: "Retry last failed assistant turn",
 	},
 	"app.message.dequeue": {
 		defaultKeys: "alt+up",
 		description: "Dequeue message",
 	},
 	"app.clipboard.pasteImage": {
-		defaultKeys: process.platform === "win32" ? "alt+v" : "ctrl+v",
-		description: "Paste image from clipboard",
+		defaultKeys: getDefaultPasteImageKeys(),
+		description: "Paste image or text from clipboard",
+	},
+	"app.clipboard.pasteTextRaw": {
+		defaultKeys: ["ctrl+shift+v", "alt+shift+v"],
+		description: "Paste text from clipboard as raw text (no collapse)",
 	},
 	"app.clipboard.copyLine": {
 		defaultKeys: "alt+shift+l",
@@ -145,9 +172,13 @@ export const KEYBINDINGS = {
 		defaultKeys: [],
 		description: "Resume session",
 	},
+	"app.agents.hub": {
+		defaultKeys: "alt+a",
+		description: "Open the agent hub",
+	},
 	"app.session.observe": {
 		defaultKeys: "ctrl+s",
-		description: "Observe subagent sessions",
+		description: "Open the agent hub",
 	},
 	"app.session.togglePath": {
 		defaultKeys: "ctrl+p",
@@ -186,8 +217,8 @@ export const KEYBINDINGS = {
 		description: "Search history",
 	},
 	"app.stt.toggle": {
-		defaultKeys: "alt+h",
-		description: "Toggle speech-to-text",
+		defaultKeys: [],
+		description: "Toggle speech-to-text (default gesture: hold Space)",
 	},
 } as const satisfies KeybindingDefinitions;
 
@@ -200,6 +231,7 @@ const KEYBINDING_NAME_MIGRATIONS = {
 	clear: "app.clear",
 	exit: "app.exit",
 	suspend: "app.suspend",
+	displayReset: "app.display.reset",
 	cycleThinkingLevel: "app.thinking.cycle",
 	cycleModelForward: "app.model.cycleForward",
 	cycleModelBackward: "app.model.cycleBackward",
@@ -211,8 +243,10 @@ const KEYBINDING_NAME_MIGRATIONS = {
 	toggleThinking: "app.thinking.toggle",
 	externalEditor: "app.editor.external",
 	followUp: "app.message.followUp",
+	retry: "app.retry",
 	dequeue: "app.message.dequeue",
 	pasteImage: "app.clipboard.pasteImage",
+	pasteTextRaw: "app.clipboard.pasteTextRaw",
 	copyLine: "app.clipboard.copyLine",
 	copyPrompt: "app.clipboard.copyPrompt",
 	newSession: "app.session.new",
@@ -330,17 +364,29 @@ function orderKeybindingsConfig(config: KeybindingsConfig): KeybindingsConfig {
 	return ordered;
 }
 
+const KEYBINDINGS_YML = "keybindings.yml";
+const KEYBINDINGS_YAML = "keybindings.yaml";
+const LEGACY_KEYBINDINGS_JSON = "keybindings.json";
+
+interface KeybindingsConfigPaths {
+	readPath: string;
+	writeBackPath: string;
+}
+
 /**
  * Load raw config from a file synchronously.
- * Returns parsed JSON or null if file doesn't exist or is invalid.
+ * Returns parsed JSON/YAML or null if file doesn't exist or is invalid.
  */
 function loadRawConfig(filePath: string): unknown {
 	try {
-		if (!existsSync(filePath)) {
-			return null;
+		const content = fs.readFileSync(filePath, "utf-8");
+		if (filePath.endsWith(".json")) {
+			return JSONC.parse(content);
 		}
-		const content = readFileSync(filePath, "utf-8");
-		return JSON.parse(content);
+		if (filePath.endsWith(".yml") || filePath.endsWith(".yaml")) {
+			return YAML.parse(content);
+		}
+		throw new Error(`Unsupported keybindings config extension: ${filePath}`);
 	} catch (error) {
 		if (isEnoent(error)) {
 			return null;
@@ -350,34 +396,99 @@ function loadRawConfig(filePath: string): unknown {
 	}
 }
 
+function writeKeybindingsConfig(filePath: string, config: KeybindingsConfig): boolean {
+	try {
+		fs.writeFileSync(filePath, YAML.stringify(config, null, 2), "utf-8");
+		logger.debug("Migrated keybindings config", { path: filePath });
+		return true;
+	} catch (error) {
+		logger.warn("Failed to write migrated keybindings config", { path: filePath, error: String(error) });
+		return false;
+	}
+}
+
+function resolveKeybindingsConfigPaths(agentDir: string): KeybindingsConfigPaths {
+	const ymlPath = path.join(agentDir, KEYBINDINGS_YML);
+	if (fs.existsSync(ymlPath)) {
+		return { readPath: ymlPath, writeBackPath: ymlPath };
+	}
+
+	const yamlPath = path.join(agentDir, KEYBINDINGS_YAML);
+	if (fs.existsSync(yamlPath)) {
+		return { readPath: yamlPath, writeBackPath: yamlPath };
+	}
+
+	const jsonPath = path.join(agentDir, LEGACY_KEYBINDINGS_JSON);
+	if (fs.existsSync(jsonPath)) {
+		return { readPath: jsonPath, writeBackPath: ymlPath };
+	}
+
+	return { readPath: ymlPath, writeBackPath: ymlPath };
+}
+
 /**
- * Migrate keybindings config file from old format to new.
- * Reads from agentDir/keybindings.json, migrates old names, and writes back.
+ * Load and migrate keybindings config.
+ * Legacy JSON is read for compatibility, but successful write-back goes to YAML.
  */
-function loadKeybindingsConfig(filePath: string, writeBack: boolean): KeybindingsConfig {
+function loadKeybindingsConfig(
+	filePath: string,
+	writeBackPath: string | undefined,
+): {
+	config: KeybindingsConfig;
+	persistedPath: string;
+} {
 	const rawConfig = loadRawConfig(filePath);
 
 	if (rawConfig === null) {
-		return {};
+		return { config: {}, persistedPath: filePath };
 	}
 
 	const { config: migratedConfig, migrated } = migrateKeybindingNames(rawConfig);
-	if (writeBack && migrated) {
+	const shouldWriteBack = writeBackPath !== undefined && (migrated || writeBackPath !== filePath);
+	if (shouldWriteBack) {
 		const ordered = orderKeybindingsConfig(migratedConfig);
-		try {
-			writeFileSync(filePath, `${JSON.stringify(ordered, null, 2)}\n`, "utf-8");
-			logger.debug("Migrated keybindings config", { path: filePath });
-		} catch (error) {
-			logger.warn("Failed to write migrated keybindings config", { path: filePath, error: String(error) });
-		}
+		const persistedPath = writeKeybindingsConfig(writeBackPath, ordered) ? writeBackPath : filePath;
+		return { config: migratedConfig, persistedPath };
 	}
 
-	return migratedConfig;
+	return { config: migratedConfig, persistedPath: filePath };
 }
 
 function migrateKeybindingsConfigFile(agentDir: string): void {
-	const configPath = path.join(agentDir, "keybindings.json");
-	loadKeybindingsConfig(configPath, true);
+	const { readPath, writeBackPath } = resolveKeybindingsConfigPaths(agentDir);
+	loadKeybindingsConfig(readPath, writeBackPath);
+}
+
+const FOLLOW_UP_KEYBINDING: AppKeybinding = "app.message.followUp";
+const WINDOWS_FOLLOW_UP_FALLBACK_KEY: KeyId = "ctrl+q";
+function keyListIncludes(keys: KeyId | KeyId[] | undefined, target: KeyId): boolean {
+	if (keys === undefined) return false;
+	const keyList = Array.isArray(keys) ? keys : [keys];
+	for (const key of keyList) {
+		if (key.toLowerCase() === target) return true;
+	}
+	return false;
+}
+
+function userBindingClaimsKey(config: KeybindingsConfig, target: KeyId, except: Keybinding): boolean {
+	for (const [keybinding, keys] of Object.entries(config)) {
+		if (!(keybinding in KEYBINDINGS)) continue;
+		if (keybinding === except) continue;
+		if (keyListIncludes(keys, target)) return true;
+	}
+	return false;
+}
+
+function removeKey(keys: KeyId[], target: KeyId): KeyId[] {
+	return keys.filter(key => key !== target);
+}
+
+function keyConfigValue(keys: KeyId[]): KeyId | KeyId[] {
+	if (keys.length === 1) {
+		const key = keys[0];
+		if (key !== undefined) return key;
+	}
+	return [...keys];
 }
 
 /**
@@ -386,19 +497,22 @@ function migrateKeybindingsConfigFile(agentDir: string): void {
  */
 export class KeybindingsManager extends TuiKeybindingsManager {
 	#configPath: string | undefined;
+	#userBindings: KeybindingsConfig;
 
 	constructor(userBindings: KeybindingsConfig = {}, configPath?: string) {
 		super(KEYBINDINGS, userBindings);
 		this.#configPath = configPath;
+		this.#userBindings = userBindings;
 	}
 
 	/**
-	 * Create from config file at agentDir/keybindings.json.
+	 * Create from config file at agentDir/keybindings.yml.
+	 * Legacy keybindings.json is migrated to keybindings.yml on load.
 	 */
 	static create(agentDir: string = getAgentDir()): KeybindingsManager {
-		const configPath = path.join(agentDir, "keybindings.json");
-		const userBindings = KeybindingsManager.#loadFromFile(configPath);
-		const manager = new KeybindingsManager(userBindings, configPath);
+		const { readPath, writeBackPath } = resolveKeybindingsConfigPaths(agentDir);
+		const { config: userBindings, persistedPath } = KeybindingsManager.#loadFromFile(readPath, writeBackPath);
+		const manager = new KeybindingsManager(userBindings, persistedPath);
 		// Set globally so getKeybindings() returns this manager
 		setKeybindings(manager);
 		return manager;
@@ -416,7 +530,31 @@ export class KeybindingsManager extends TuiKeybindingsManager {
 	 */
 	reload(): void {
 		if (!this.#configPath) return;
-		this.setUserBindings(KeybindingsManager.#loadFromFile(this.#configPath));
+		const { config } = KeybindingsManager.#loadFromFile(this.#configPath);
+		this.setUserBindings(config);
+	}
+
+	setUserBindings(userBindings: KeybindingsConfig): void {
+		this.#userBindings = userBindings;
+		super.setUserBindings(userBindings);
+	}
+
+	getKeys(keybinding: Keybinding): KeyId[] {
+		const keys = super.getKeys(keybinding);
+		if (keybinding === FOLLOW_UP_KEYBINDING) {
+			if (this.#userBindings[FOLLOW_UP_KEYBINDING] !== undefined) return keys;
+			if (!userBindingClaimsKey(this.#userBindings, WINDOWS_FOLLOW_UP_FALLBACK_KEY, FOLLOW_UP_KEYBINDING)) {
+				return keys;
+			}
+			return removeKey(keys, WINDOWS_FOLLOW_UP_FALLBACK_KEY);
+		}
+		return keys;
+	}
+
+	getResolvedBindings(): KeybindingsConfig {
+		const resolved = super.getResolvedBindings();
+		resolved[FOLLOW_UP_KEYBINDING] = keyConfigValue(this.getKeys(FOLLOW_UP_KEYBINDING));
+		return resolved;
 	}
 
 	/**
@@ -437,8 +575,11 @@ export class KeybindingsManager extends TuiKeybindingsManager {
 	/**
 	 * Load user bindings from a file, migrating old names if needed.
 	 */
-	static #loadFromFile(filePath: string): KeybindingsConfig {
-		return loadKeybindingsConfig(filePath, true);
+	static #loadFromFile(
+		filePath: string,
+		writeBackPath?: string,
+	): { config: KeybindingsConfig; persistedPath: string } {
+		return loadKeybindingsConfig(filePath, writeBackPath);
 	}
 }
 

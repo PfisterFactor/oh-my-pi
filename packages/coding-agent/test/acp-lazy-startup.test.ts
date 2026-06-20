@@ -11,14 +11,15 @@ import {
 	type SessionNotification,
 } from "@agentclientprotocol/sdk";
 import type { Model } from "@oh-my-pi/pi-ai";
+import { buildModel } from "@oh-my-pi/pi-catalog/build";
+import { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
+import { createAcpConnection } from "@oh-my-pi/pi-coding-agent/modes/acp/acp-mode";
+import type { AgentSession } from "@oh-my-pi/pi-coding-agent/session/agent-session";
+import { AuthStorage } from "@oh-my-pi/pi-coding-agent/session/auth-storage";
+import { SessionManager } from "@oh-my-pi/pi-coding-agent/session/session-manager";
 import { TempDir } from "@oh-my-pi/pi-utils";
-import { Settings } from "../src/config/settings";
-import { createAcpConnection } from "../src/modes/acp/acp-mode";
-import type { AgentSession } from "../src/session/agent-session";
-import { AuthStorage } from "../src/session/auth-storage";
-import { SessionManager } from "../src/session/session-manager";
 
-const TEST_MODEL: Model = {
+const TEST_MODEL: Model = buildModel({
 	id: "claude-sonnet-4-20250514",
 	name: "Claude Sonnet",
 	api: "anthropic-messages",
@@ -29,7 +30,11 @@ const TEST_MODEL: Model = {
 	cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
 	contextWindow: 200_000,
 	maxTokens: 8_192,
-};
+});
+
+function emptyWorkspaceTree(cwd: string) {
+	return { rootPath: cwd, rendered: ".\n", truncated: false, totalLines: 1, agentsMdFiles: [] };
+}
 
 class TestClient implements Client {
 	readonly updates: SessionNotification[] = [];
@@ -135,7 +140,268 @@ class LazyFakeSession {
 	}
 }
 
+/**
+ * Close one direction of the in-memory transport used by these tests. The ACP
+ * SDK's `ndJsonStream` acquires a transient writer per message, so immediately
+ * after the final response resolves on the peer the writer-release is still a
+ * queued microtask. Closing while that writer is held rejects with "WritableStream
+ * .close ... locked", which leaves the peer's readable open and hangs
+ * `connection.closed`. Wait for the lock to clear (bounded) before closing.
+ */
+async function closeTransport(writable: WritableStream<unknown>): Promise<void> {
+	for (let i = 0; i < 100 && writable.locked; i++) {
+		await Bun.sleep(0);
+	}
+	await Promise.allSettled([writable.close()]);
+}
+
 describe("ACP lazy startup", () => {
+	it("applies schema defaults for ACP background jobs and preserves explicit overrides", async () => {
+		const { runRootCommand } = await import("@oh-my-pi/pi-coding-agent/main");
+
+		type ObservedBackgroundSettings = {
+			asyncEnabled: boolean;
+			asyncMaxJobs: number;
+			bashAutoBackground: boolean;
+			bashAutoBackgroundThresholdMs: number;
+		};
+
+		const runAcpStartup = async (settings: Settings): Promise<ObservedBackgroundSettings> => {
+			using tempDir = TempDir.createSync("@omp-acp-background-settings-");
+			const cwd = tempDir.path();
+			const authStorage = await AuthStorage.create(path.join(cwd, "auth.db"));
+			let observed: ObservedBackgroundSettings | undefined;
+			const stopMessage = "stop test ACP mode";
+			try {
+				await runRootCommand(
+					{
+						mode: "acp",
+						messages: [],
+						fileArgs: [],
+						unknownFlags: new Map(),
+						unrecognizedFlags: [],
+						noSkills: true,
+						noRules: true,
+						noTools: true,
+						noLsp: true,
+						sessionDir: cwd,
+					},
+					[],
+					{
+						discoverAuthStorage: async () => authStorage,
+						settings,
+						runAcpMode: async () => {
+							observed = {
+								asyncEnabled: settings.get("async.enabled"),
+								asyncMaxJobs: settings.get("async.maxJobs"),
+								bashAutoBackground: settings.get("bash.autoBackground.enabled"),
+								bashAutoBackgroundThresholdMs: settings.get("bash.autoBackground.thresholdMs"),
+							};
+							throw new Error(stopMessage);
+						},
+					},
+				);
+			} catch (error) {
+				if (!(error instanceof Error) || error.message !== stopMessage) {
+					throw error;
+				}
+			} finally {
+				authStorage.close();
+			}
+
+			if (!observed) {
+				throw new Error("Expected ACP mode to start");
+			}
+			return observed;
+		};
+
+		// ACP startup must not clobber background-job settings: an unset config
+		// observes the schema defaults (async on since 844c8dbdfe)…
+		await expect(runAcpStartup(Settings.isolated())).resolves.toEqual({
+			asyncEnabled: true,
+			asyncMaxJobs: 100,
+			bashAutoBackground: false,
+			bashAutoBackgroundThresholdMs: 60000,
+		});
+		// …and explicit overrides survive in both directions (here: async
+		// opted OUT against the default, auto-background opted IN).
+		await expect(
+			runAcpStartup(
+				Settings.isolated({
+					"async.enabled": false,
+					"async.maxJobs": 7,
+					"bash.autoBackground.enabled": true,
+					"bash.autoBackground.thresholdMs": 1234,
+				}),
+			),
+		).resolves.toEqual({
+			asyncEnabled: false,
+			asyncMaxJobs: 7,
+			bashAutoBackground: true,
+			bashAutoBackgroundThresholdMs: 1234,
+		});
+	});
+
+	it("default-disables advisor for protocol hosts", async () => {
+		const { runRootCommand } = await import("@oh-my-pi/pi-coding-agent/main");
+
+		type ObservedAdvisorSettings = {
+			enabled: boolean;
+			subagents: boolean;
+			syncBacklog: "off" | "1" | "3" | "5";
+			immuneTurns: number;
+		};
+
+		const runProtocolStartup = async (mode: "rpc" | "rpc-ui" | "acp"): Promise<ObservedAdvisorSettings> => {
+			using tempDir = TempDir.createSync("@omp-protocol-advisor-settings-");
+			const cwd = tempDir.path();
+			const authStorage = await AuthStorage.create(path.join(cwd, "auth.db"));
+			const settings = Settings.isolated({
+				"advisor.enabled": true,
+				"advisor.subagents": true,
+				"advisor.syncBacklog": "5",
+				"advisor.immuneTurns": 3,
+			});
+			let observed: ObservedAdvisorSettings | undefined;
+			const stopMessage = "stop test protocol mode";
+
+			try {
+				await runRootCommand(
+					{
+						mode,
+						messages: [],
+						fileArgs: [],
+						unknownFlags: new Map(),
+						unrecognizedFlags: [],
+						noSkills: true,
+						noRules: true,
+						noTools: true,
+						noLsp: true,
+						noExtensions: true,
+						sessionDir: cwd,
+					},
+					[],
+					{
+						discoverAuthStorage: async () => authStorage,
+						settings,
+						createAgentSession: async () => {
+							observed = {
+								enabled: settings.get("advisor.enabled"),
+								subagents: settings.get("advisor.subagents"),
+								syncBacklog: settings.get("advisor.syncBacklog"),
+								immuneTurns: settings.get("advisor.immuneTurns"),
+							};
+							throw new Error(stopMessage);
+						},
+						runAcpMode: async () => {
+							observed = {
+								enabled: settings.get("advisor.enabled"),
+								subagents: settings.get("advisor.subagents"),
+								syncBacklog: settings.get("advisor.syncBacklog"),
+								immuneTurns: settings.get("advisor.immuneTurns"),
+							};
+							throw new Error(stopMessage);
+						},
+					},
+				);
+			} catch (error) {
+				if (!(error instanceof Error) || error.message !== stopMessage) {
+					throw error;
+				}
+			} finally {
+				authStorage.close();
+			}
+
+			if (!observed) {
+				throw new Error("Expected protocol mode to start");
+			}
+			return observed;
+		};
+
+		for (const mode of ["rpc", "rpc-ui", "acp"] as const) {
+			await expect(runProtocolStartup(mode)).resolves.toEqual({
+				enabled: false,
+				subagents: false,
+				syncBacklog: "off",
+				immuneTurns: 1,
+			});
+		}
+	});
+
+	it("honors explicit todo settings for protocol hosts", async () => {
+		const { runRootCommand } = await import("@oh-my-pi/pi-coding-agent/main");
+
+		type ObservedTodoSettings = {
+			enabled: boolean;
+			reminders: boolean;
+			eager: "default" | "preferred" | "always";
+		};
+
+		const runProtocolStartup = async (mode: "rpc" | "rpc-ui" | "acp"): Promise<ObservedTodoSettings> => {
+			using tempDir = TempDir.createSync("@omp-protocol-todo-settings-");
+			const cwd = tempDir.path();
+			const authStorage = await AuthStorage.create(path.join(cwd, "auth.db"));
+			const settings = Settings.isolated({
+				"todo.enabled": false,
+				"todo.reminders": false,
+				"todo.eager": "always",
+			});
+			let observed: ObservedTodoSettings | undefined;
+			const stopMessage = "stop test protocol todo settings";
+			const observe = () => {
+				observed = {
+					enabled: settings.get("todo.enabled"),
+					reminders: settings.get("todo.reminders"),
+					eager: settings.get("todo.eager"),
+				};
+				throw new Error(stopMessage);
+			};
+
+			try {
+				await runRootCommand(
+					{
+						mode,
+						messages: [],
+						fileArgs: [],
+						unknownFlags: new Map(),
+						unrecognizedFlags: [],
+						noSkills: true,
+						noRules: true,
+						noTools: true,
+						noLsp: true,
+						noExtensions: true,
+						sessionDir: cwd,
+					},
+					[],
+					{
+						discoverAuthStorage: async () => authStorage,
+						settings,
+						createAgentSession: async () => observe(),
+						runAcpMode: async () => observe(),
+					},
+				);
+			} catch (error) {
+				if (!(error instanceof Error) || error.message !== stopMessage) {
+					throw error;
+				}
+			} finally {
+				authStorage.close();
+			}
+
+			if (!observed) {
+				throw new Error("Expected protocol mode to start");
+			}
+			return observed;
+		};
+
+		for (const mode of ["rpc", "rpc-ui", "acp"] as const) {
+			await expect(runProtocolStartup(mode)).resolves.toEqual({
+				enabled: false,
+				reminders: false,
+				eager: "always",
+			});
+		}
+	});
 	it("answers initialize before creating the first AgentSession", async () => {
 		const clientToAgent = new TransformStream();
 		const agentToClient = new TransformStream();
@@ -181,7 +447,8 @@ describe("ACP lazy startup", () => {
 			const sessionResponse = await newSessionPromise;
 			expect(sessionResponse.sessionId).toEqual(expect.any(String));
 		} finally {
-			await Promise.allSettled([clientToAgent.writable.close(), agentToClient.writable.close()]);
+			await closeTransport(clientToAgent.writable);
+			await closeTransport(agentToClient.writable);
 			await Promise.allSettled([agentConnection.closed, serverConnection.closed]);
 		}
 	});
@@ -214,8 +481,8 @@ describe("ACP lazy startup", () => {
 		const authStorage = await AuthStorage.create(path.join(cwd, "auth.db"));
 		try {
 			const settings = Settings.isolated({ "marketplace.autoUpdate": "off" });
-			const { runRootCommand } = await import("../src/main");
-			const { createAgentSession } = await import("../src/sdk");
+			const { runRootCommand } = await import("@oh-my-pi/pi-coding-agent/main");
+			const { createAgentSession } = await import("@oh-my-pi/pi-coding-agent/sdk");
 			let session: AgentSession | undefined;
 
 			const stopped = runRootCommand(
@@ -225,6 +492,7 @@ describe("ACP lazy startup", () => {
 					messages: [],
 					fileArgs: [],
 					unknownFlags: new Map(),
+					unrecognizedFlags: [],
 					noSkills: true,
 					noRules: true,
 					noTools: true,
@@ -236,7 +504,13 @@ describe("ACP lazy startup", () => {
 				[],
 				{
 					discoverAuthStorage: async () => authStorage,
-					createAgentSession,
+					createAgentSession: options => {
+						const sessionOptions = options ?? {};
+						return createAgentSession({
+							...sessionOptions,
+							workspaceTree: sessionOptions.workspaceTree ?? emptyWorkspaceTree(sessionOptions.cwd ?? cwd),
+						});
+					},
 					settings,
 					runAcpMode: async createAcpSession => {
 						session = await createAcpSession(cwd);

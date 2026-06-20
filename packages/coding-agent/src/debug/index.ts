@@ -6,19 +6,33 @@
 import * as fs from "node:fs/promises";
 import * as url from "node:url";
 import { getWorkProfile } from "@oh-my-pi/pi-natives";
-import { Container, Loader, type SelectItem, SelectList, Spacer, Text } from "@oh-my-pi/pi-tui";
+import {
+	Container,
+	isNotificationSuppressed,
+	Loader,
+	type SelectItem,
+	SelectList,
+	Spacer,
+	TERMINAL,
+	type TerminalNotification,
+	Text,
+} from "@oh-my-pi/pi-tui";
 import { getSessionsDir } from "@oh-my-pi/pi-utils";
 import { DynamicBorder } from "../modes/components/dynamic-border";
+import { TranscriptBlock } from "../modes/components/transcript-container";
 import { getSelectListTheme, getSymbolTheme, theme } from "../modes/theme/theme";
 import type { InteractiveModeContext } from "../modes/types";
 import { formatBytes } from "../tools/render-utils";
 import { openPath } from "../utils/open";
 import { DebugLogViewerComponent } from "./log-viewer";
 import { generateHeapSnapshotData, type ProfilerSession, startCpuProfile } from "./profiler";
+import { buildSampleImage, ProtocolProbeComponent } from "./protocol-probe";
 import { RawSseViewerComponent } from "./raw-sse";
 import { resolveRawSseDebugBuffer } from "./raw-sse-buffer";
+import { getRemoteDebugger, type RemoteDebuggerInfo, startRemoteDebuggerServer } from "./remote-debugger";
 import { clearArtifactCache, createDebugLogSource, createReportBundle, getArtifactCacheStats } from "./report-bundle";
 import { collectSystemInfo, formatSystemInfo } from "./system-info";
+import { collectTerminalState, formatTerminalState } from "./terminal-info";
 
 /** Debug menu options */
 const DEBUG_MENU_ITEMS: SelectItem[] = [
@@ -29,7 +43,18 @@ const DEBUG_MENU_ITEMS: SelectItem[] = [
 	{ value: "memory", label: "Report: memory issue", description: "Heap snapshot + bundle" },
 	{ value: "logs", label: "View: recent logs", description: "Show last 50 log entries" },
 	{ value: "system", label: "View: system info", description: "Show environment details" },
+	{ value: "terminal", label: "View: terminal state", description: "Subprotocols, geometry, scrollback strategy" },
+	{
+		value: "protocols",
+		label: "Test: terminal protocols",
+		description: "Styling, links, text sizing, graphics, notify",
+	},
 	{ value: "raw-sse", label: "View: raw SSE stream", description: "Show live provider SSE frames" },
+	{
+		value: "remote-debugger",
+		label: "Start: JS remote debugger",
+		description: "Expose JavaScriptCore inspector socket (experimental)",
+	},
 	{
 		value: "transcript",
 		label: "Export: TUI transcript",
@@ -103,8 +128,17 @@ export class DebugSelectorComponent extends Container {
 			case "raw-sse":
 				await this.#handleViewRawSse();
 				break;
+			case "remote-debugger":
+				await this.#handleStartRemoteDebugger();
+				break;
 			case "system":
 				await this.#handleViewSystemInfo();
+				break;
+			case "terminal":
+				await this.#handleViewTerminalState();
+				break;
+			case "protocols":
+				await this.#handleViewProtocols();
 				break;
 			case "transcript":
 				await this.#handleTranscriptExport();
@@ -126,13 +160,13 @@ export class DebugSelectorComponent extends Container {
 		}
 
 		// Show message and wait for keypress
-		this.ctx.chatContainer.addChild(new Spacer(1));
-		this.ctx.chatContainer.addChild(new Text(theme.fg("accent", `${theme.status.info} CPU profiling started`), 1, 0));
-		this.ctx.chatContainer.addChild(new Spacer(1));
-		this.ctx.chatContainer.addChild(
+		const block = new TranscriptBlock();
+		block.addChild(new Text(theme.fg("accent", `${theme.status.info} CPU profiling started`), 1, 0));
+		block.addChild(new Spacer(1));
+		block.addChild(
 			new Text(theme.fg("muted", "Reproduce the performance issue, then press Enter to stop profiling."), 1, 0),
 		);
-		this.ctx.ui.requestRender();
+		this.ctx.present(block);
 
 		// Wait for Enter keypress
 		const { promise, resolve } = Promise.withResolvers<void>();
@@ -170,6 +204,7 @@ export class DebugSelectorComponent extends Container {
 			const result = await createReportBundle({
 				sessionFile: this.ctx.sessionManager.getSessionFile(),
 				settings: this.#getResolvedSettings(),
+				rawSseText: this.#getRawSseText(),
 				cpuProfile,
 				workProfile,
 			});
@@ -177,19 +212,16 @@ export class DebugSelectorComponent extends Container {
 			loader.stop();
 			this.ctx.statusContainer.clear();
 
-			this.ctx.chatContainer.addChild(new Spacer(1));
-			this.ctx.chatContainer.addChild(
-				new Text(theme.fg("success", `${theme.status.success} Performance report saved`), 1, 0),
-			);
-			this.ctx.chatContainer.addChild(new Text(theme.fg("dim", formatFileHyperlink(result.path)), 1, 0));
-			this.ctx.chatContainer.addChild(new Text(theme.fg("dim", `Files: ${result.files.length}`), 1, 0));
+			const block = new TranscriptBlock();
+			block.addChild(new Text(theme.fg("success", `+ Performance report saved`), 1, 0));
+			block.addChild(new Text(theme.fg("dim", formatFileHyperlink(result.path)), 1, 0));
+			block.addChild(new Text(theme.fg("dim", `Files: ${result.files.length}`), 1, 0));
+			this.ctx.present(block);
 		} catch (err) {
 			loader.stop();
 			this.ctx.statusContainer.clear();
 			this.ctx.showError(`Failed to create report: ${err instanceof Error ? err.message : String(err)}`);
 		}
-
-		this.ctx.ui.requestRender();
 	}
 
 	async #handleWorkReport(): Promise<void> {
@@ -207,15 +239,13 @@ export class DebugSelectorComponent extends Container {
 
 			openPath(tmpPath);
 
-			this.ctx.chatContainer.addChild(new Spacer(1));
-			this.ctx.chatContainer.addChild(
+			this.ctx.present([
+				new Spacer(1),
 				new Text(theme.fg("dim", `Opened flamegraph (${workProfile.sampleCount} samples)`), 1, 0),
-			);
+			]);
 		} catch (err) {
 			this.ctx.showError(`Failed to open profile: ${err instanceof Error ? err.message : String(err)}`);
 		}
-
-		this.ctx.ui.requestRender();
 	}
 
 	async #handleDumpReport(): Promise<void> {
@@ -233,24 +263,22 @@ export class DebugSelectorComponent extends Container {
 			const result = await createReportBundle({
 				sessionFile: this.ctx.sessionManager.getSessionFile(),
 				settings: this.#getResolvedSettings(),
+				rawSseText: this.#getRawSseText(),
 			});
 
 			loader.stop();
 			this.ctx.statusContainer.clear();
 
-			this.ctx.chatContainer.addChild(new Spacer(1));
-			this.ctx.chatContainer.addChild(
-				new Text(theme.fg("success", `${theme.status.success} Report bundle saved`), 1, 0),
-			);
-			this.ctx.chatContainer.addChild(new Text(theme.fg("dim", formatFileHyperlink(result.path)), 1, 0));
-			this.ctx.chatContainer.addChild(new Text(theme.fg("dim", `Files: ${result.files.length}`), 1, 0));
+			const block = new TranscriptBlock();
+			block.addChild(new Text(theme.fg("success", `+ Report bundle saved`), 1, 0));
+			block.addChild(new Text(theme.fg("dim", formatFileHyperlink(result.path)), 1, 0));
+			block.addChild(new Text(theme.fg("dim", `Files: ${result.files.length}`), 1, 0));
+			this.ctx.present(block);
 		} catch (err) {
 			loader.stop();
 			this.ctx.statusContainer.clear();
 			this.ctx.showError(`Failed to create report: ${err instanceof Error ? err.message : String(err)}`);
 		}
-
-		this.ctx.ui.requestRender();
 	}
 
 	async #handleMemoryReport(): Promise<void> {
@@ -271,25 +299,23 @@ export class DebugSelectorComponent extends Container {
 			const result = await createReportBundle({
 				sessionFile: this.ctx.sessionManager.getSessionFile(),
 				settings: this.#getResolvedSettings(),
+				rawSseText: this.#getRawSseText(),
 				heapSnapshot,
 			});
 
 			loader.stop();
 			this.ctx.statusContainer.clear();
 
-			this.ctx.chatContainer.addChild(new Spacer(1));
-			this.ctx.chatContainer.addChild(
-				new Text(theme.fg("success", `${theme.status.success} Memory report saved`), 1, 0),
-			);
-			this.ctx.chatContainer.addChild(new Text(theme.fg("dim", formatFileHyperlink(result.path)), 1, 0));
-			this.ctx.chatContainer.addChild(new Text(theme.fg("dim", `Files: ${result.files.length}`), 1, 0));
+			const block = new TranscriptBlock();
+			block.addChild(new Text(theme.fg("success", `+ Memory report saved`), 1, 0));
+			block.addChild(new Text(theme.fg("dim", formatFileHyperlink(result.path)), 1, 0));
+			block.addChild(new Text(theme.fg("dim", `Files: ${result.files.length}`), 1, 0));
+			this.ctx.present(block);
 		} catch (err) {
 			loader.stop();
 			this.ctx.statusContainer.clear();
 			this.ctx.showError(`Failed to create report: ${err instanceof Error ? err.message : String(err)}`);
 		}
-
-		this.ctx.ui.requestRender();
 	}
 
 	async #handleViewLogs(): Promise<void> {
@@ -336,20 +362,95 @@ export class DebugSelectorComponent extends Container {
 		this.ctx.ui.requestRender();
 	}
 
+	async #handleStartRemoteDebugger(): Promise<void> {
+		const existing = getRemoteDebugger();
+		let info: RemoteDebuggerInfo;
+		try {
+			info = existing ?? (await startRemoteDebuggerServer());
+		} catch (err) {
+			this.ctx.showError(`Failed to start remote debugger: ${err instanceof Error ? err.message : String(err)}`);
+			return;
+		}
+
+		const block = new TranscriptBlock();
+		block.addChild(
+			new Text(
+				theme.fg(
+					"success",
+					`${theme.status.success} JavaScriptCore remote inspector ${existing ? "already running" : "started"}`,
+				),
+				1,
+				0,
+			),
+		);
+		block.addChild(new Text(theme.fg("dim", `Listening on ${info.host}:${info.port}`), 1, 0));
+		block.addChild(
+			new Text(
+				theme.fg(
+					"muted",
+					"Experimental WebKit RemoteInspectorServer socket (Bun marks it untested on macOS). One-way for this process — there is no stop. Attach a compatible WebKit/Safari Web Inspector client.",
+				),
+				1,
+				0,
+			),
+		);
+		this.ctx.present(block);
+	}
+
 	async #handleViewSystemInfo(): Promise<void> {
 		try {
 			const info = await collectSystemInfo();
 			const formatted = formatSystemInfo(info);
 
-			this.ctx.chatContainer.addChild(new Spacer(1));
-			this.ctx.chatContainer.addChild(new DynamicBorder());
-			this.ctx.chatContainer.addChild(new Text(formatted, 1, 0));
-			this.ctx.chatContainer.addChild(new DynamicBorder());
+			const block = new TranscriptBlock();
+			block.addChild(new DynamicBorder());
+			block.addChild(new Text(formatted, 1, 0));
+			block.addChild(new DynamicBorder());
+			this.ctx.present(block);
 		} catch (err) {
 			this.ctx.showError(`Failed to collect system info: ${err instanceof Error ? err.message : String(err)}`);
 		}
+	}
 
-		this.ctx.ui.requestRender();
+	async #handleViewTerminalState(): Promise<void> {
+		const info = collectTerminalState({
+			columns: this.ctx.ui.terminal.columns,
+			rows: this.ctx.ui.terminal.rows,
+			synchronizedOutput: this.ctx.ui.synchronizedOutput,
+		});
+		const formatted = formatTerminalState(info);
+
+		const block = new TranscriptBlock();
+		block.addChild(new DynamicBorder());
+		block.addChild(new Text(formatted, 1, 0));
+		block.addChild(new DynamicBorder());
+		this.ctx.present(block);
+	}
+
+	async #handleViewProtocols(): Promise<void> {
+		// Fire the desktop notification as a real side effect, then render a
+		// panel that samples every other special protocol and reports the
+		// notification outcome.
+		const suppressed = isNotificationSuppressed();
+		if (!suppressed) {
+			const sessionName = this.ctx.sessionManager.getSessionName();
+			const notification: TerminalNotification = {
+				title: sessionName || "Oh My Pi",
+				body: "Terminal protocol test",
+				type: "test",
+				actions: "focus",
+			};
+			TERMINAL.sendNotification(notification);
+		}
+
+		this.ctx.present([
+			new Spacer(1),
+			new ProtocolProbeComponent({
+				image: buildSampleImage(),
+				imageBudget: this.ctx.ui.imageBudget,
+				notificationSuppressed: suppressed,
+			}),
+		]);
 	}
 
 	async #handleTranscriptExport(): Promise<void> {
@@ -421,21 +522,20 @@ export class DebugSelectorComponent extends Container {
 			loader.stop();
 			this.ctx.statusContainer.clear();
 
-			this.ctx.chatContainer.addChild(new Spacer(1));
-			this.ctx.chatContainer.addChild(
-				new Text(
-					theme.fg("success", `${theme.status.success} Cleared ${result.removed} artifact directories`),
-					1,
-					0,
-				),
-			);
+			this.ctx.present([
+				new Spacer(1),
+				new Text(theme.fg("success", `- Cleared ${result.removed} artifact directories`), 1, 0),
+			]);
 		} catch (err) {
 			loader.stop();
 			this.ctx.statusContainer.clear();
 			this.ctx.showError(`Failed to clear cache: ${err instanceof Error ? err.message : String(err)}`);
 		}
+	}
 
-		this.ctx.ui.requestRender();
+	#getRawSseText(): string | undefined {
+		const rawSseText = resolveRawSseDebugBuffer(this.ctx.session).toRawText();
+		return rawSseText.trim().length > 0 ? rawSseText : undefined;
 	}
 
 	#getResolvedSettings(): Record<string, unknown> {

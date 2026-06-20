@@ -1,5 +1,5 @@
 /**
- * Internal URL router for internal protocols (agent://, artifact://, memory://, skill://, rule://, mcp://, omp://, local://).
+ * Internal URL router for internal protocols (`agent://`, `artifact://`, `history://`, `issue://`, `local://`, `mcp://`, `memory://`, `omp://`, `pr://`, `rule://`, `skill://`, and `vault://`).
  *
  * One process-global router with one handler per scheme. Access via
  * `InternalUrlRouter.instance()`. Handlers are stateless; per-session and
@@ -7,6 +7,7 @@
  */
 import { AgentProtocolHandler } from "./agent-protocol";
 import { ArtifactProtocolHandler } from "./artifact-protocol";
+import { HistoryProtocolHandler } from "./history-protocol";
 import { IssueProtocolHandler, PrProtocolHandler } from "./issue-pr-protocol";
 import { LocalProtocolHandler } from "./local-protocol";
 import { McpProtocolHandler } from "./mcp-protocol";
@@ -15,7 +16,7 @@ import { OmpProtocolHandler } from "./omp-protocol";
 import { parseInternalUrl } from "./parse";
 import { RuleProtocolHandler } from "./rule-protocol";
 import { SkillProtocolHandler } from "./skill-protocol";
-import type { InternalResource, InternalUrl, ProtocolHandler, ResolveContext } from "./types";
+import type { InternalResource, InternalUrl, ProtocolHandler, ResolveContext, UrlCompletion } from "./types";
 import { VaultProtocolHandler } from "./vault-protocol";
 
 export class InternalUrlRouter {
@@ -35,6 +36,7 @@ export class InternalUrlRouter {
 		this.register(new McpProtocolHandler());
 		this.register(new IssueProtocolHandler());
 		this.register(new PrProtocolHandler());
+		this.register(new HistoryProtocolHandler());
 	}
 
 	/** Process-global router instance. */
@@ -64,6 +66,25 @@ export class InternalUrlRouter {
 		const match = input.match(/^([a-z][a-z0-9+.-]*):\/\//i);
 		if (!match) return false;
 		return this.#handlers.has(match[1].toLowerCase());
+	}
+
+	/** Schemes whose handler supports host/path autocomplete. */
+	completionSchemes(): string[] {
+		const schemes: string[] = [];
+		for (const [scheme, handler] of this.#handlers) {
+			if (handler.complete) schemes.push(scheme);
+		}
+		return schemes;
+	}
+
+	/**
+	 * Candidate completions for the host/path portion of `scheme://<query>`.
+	 * Returns `null` when the scheme is unknown or does not support completion.
+	 */
+	async complete(scheme: string, query: string): Promise<UrlCompletion[] | null> {
+		const handler = this.#handlers.get(scheme.toLowerCase());
+		if (!handler?.complete) return null;
+		return handler.complete(query);
 	}
 
 	async resolve(input: string, context?: ResolveContext): Promise<InternalResource> {

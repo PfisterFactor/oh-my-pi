@@ -9,10 +9,11 @@ import {
 	highlightCode as nativeHighlightCode,
 	supportsLanguage as nativeSupportsLanguage,
 } from "@oh-my-pi/pi-natives";
-import type { EditorTheme, MarkdownTheme, SelectListTheme, SymbolTheme } from "@oh-my-pi/pi-tui";
-import { adjustHsv, getCustomThemesDir, isEnoent, logger } from "@oh-my-pi/pi-utils";
+import type { EditorTheme, MarkdownTheme, SelectListTheme, SettingsListTheme, SymbolTheme } from "@oh-my-pi/pi-tui";
+import { adjustHsv, colorLuma, getCustomThemesDir, isEnoent, logger, relativeLuminance } from "@oh-my-pi/pi-utils";
+import { type } from "arktype";
 import chalk from "chalk";
-import * as z from "zod/v4";
+import { LRUCache } from "lru-cache/raw";
 // Embed theme JSON files at build time
 import darkThemeJson from "./dark.json" with { type: "json" };
 import { defaultThemes } from "./defaults";
@@ -42,6 +43,7 @@ export type SymbolKey =
 	| "status.running"
 	| "status.shadowed"
 	| "status.aborted"
+	| "status.done"
 	// Navigation
 	| "nav.cursor"
 	| "nav.selected"
@@ -94,6 +96,7 @@ export type SymbolKey =
 	| "icon.pause"
 	| "icon.loop"
 	| "icon.folder"
+	| "icon.search"
 	| "icon.scratchFolder"
 	| "icon.file"
 	| "icon.git"
@@ -104,8 +107,11 @@ export type SymbolKey =
 	| "icon.cost"
 	| "icon.time"
 	| "icon.pi"
+	| "icon.ghost"
 	| "icon.agents"
+	| "icon.job"
 	| "icon.cache"
+	| "icon.cacheMiss"
 	| "icon.input"
 	| "icon.output"
 	| "icon.host"
@@ -126,15 +132,21 @@ export type SymbolKey =
 	| "icon.extensionInstruction"
 	// STT
 	| "icon.mic"
+	// Compaction divider
+	| "icon.camera"
 	// Thinking Levels
 	| "thinking.minimal"
 	| "thinking.low"
 	| "thinking.medium"
 	| "thinking.high"
 	| "thinking.xhigh"
+	| "thinking.autoPending"
 	// Checkboxes
 	| "checkbox.checked"
 	| "checkbox.unchecked"
+	// Radio (single-choice)
+	| "radio.selected"
+	| "radio.unselected"
 	// Text Formatting
 	| "format.bullet"
 	| "format.dash"
@@ -144,6 +156,7 @@ export type SymbolKey =
 	| "md.quoteBorder"
 	| "md.hrChar"
 	| "md.bullet"
+	| "md.colorSwatch"
 	// Language/file type icons
 	| "lang.default"
 	| "lang.typescript"
@@ -186,11 +199,35 @@ export type SymbolKey =
 	| "tab.model"
 	| "tab.interaction"
 	| "tab.context"
-	| "tab.editing"
+	| "tab.files"
+	| "tab.shell"
 	| "tab.tools"
 	| "tab.memory"
 	| "tab.tasks"
-	| "tab.providers";
+	| "tab.providers"
+	// Tool identity icons
+	| "tool.write"
+	| "tool.edit"
+	| "tool.bash"
+	| "tool.ssh"
+	| "tool.lsp"
+	| "tool.gh"
+	| "tool.webSearch"
+	| "tool.exa"
+	| "tool.browser"
+	| "tool.eval"
+	| "tool.debug"
+	| "tool.mcp"
+	| "tool.job"
+	| "tool.task"
+	| "tool.todo"
+	| "tool.memory"
+	| "tool.ask"
+	| "tool.resolve"
+	| "tool.review"
+	| "tool.inspectImage"
+	| "tool.goal"
+	| "tool.irc";
 
 type SymbolMap = Record<SymbolKey, string>;
 
@@ -206,6 +243,7 @@ const UNICODE_SYMBOLS: SymbolMap = {
 	"status.running": "⟳",
 	"status.shadowed": "◌",
 	"status.aborted": "⏹",
+	"status.done": "•",
 	// Navigation
 	"nav.cursor": "❯",
 	"nav.selected": "➤",
@@ -258,6 +296,7 @@ const UNICODE_SYMBOLS: SymbolMap = {
 	"icon.pause": "⏸",
 	"icon.loop": "↻",
 	"icon.folder": "📁",
+	"icon.search": "🔍",
 	"icon.scratchFolder": "🗑",
 	"icon.file": "📄",
 	"icon.git": "⎇",
@@ -268,8 +307,11 @@ const UNICODE_SYMBOLS: SymbolMap = {
 	"icon.cost": "💲",
 	"icon.time": "⏱",
 	"icon.pi": "π",
+	"icon.ghost": "👻",
 	"icon.agents": "👥",
+	"icon.job": "⚙",
 	"icon.cache": "💾",
+	"icon.cacheMiss": "⊘",
 	"icon.input": "⤵",
 	"icon.output": "⤴",
 	"icon.host": "🖥",
@@ -290,15 +332,21 @@ const UNICODE_SYMBOLS: SymbolMap = {
 	"icon.extensionInstruction": "📘",
 	// STT
 	"icon.mic": "🎤",
+	// Compaction divider
+	"icon.camera": "📷",
 	// Thinking levels
 	"thinking.minimal": "◔ min",
 	"thinking.low": "◑ low",
 	"thinking.medium": "◒ med",
 	"thinking.high": "◕ high",
 	"thinking.xhigh": "◉ xhigh",
+	"thinking.autoPending": "⟳",
 	// Checkboxes
 	"checkbox.checked": "☑",
 	"checkbox.unchecked": "☐",
+	// Radio (single-choice)
+	"radio.selected": "◉",
+	"radio.unselected": "○",
 	// Formatting
 	"format.bullet": "•",
 	"format.dash": "—",
@@ -308,6 +356,7 @@ const UNICODE_SYMBOLS: SymbolMap = {
 	"md.quoteBorder": "▏",
 	"md.hrChar": "─",
 	"md.bullet": "•",
+	"md.colorSwatch": "■",
 	// Language/file icons (emoji-centric, no Nerd Font required)
 	"lang.default": "⌘",
 	"lang.typescript": "🟦",
@@ -350,11 +399,35 @@ const UNICODE_SYMBOLS: SymbolMap = {
 	"tab.model": "🤖",
 	"tab.interaction": "⌨",
 	"tab.context": "📋",
-	"tab.editing": "💻",
+	"tab.files": "📁",
+	"tab.shell": "💻",
 	"tab.tools": "🔧",
 	"tab.memory": "🧠",
 	"tab.tasks": "📦",
 	"tab.providers": "🌐",
+	// Tool identity icons (per-tool signature glyph on the success header)
+	"tool.write": "✎",
+	"tool.edit": "✎",
+	"tool.bash": "❯",
+	"tool.ssh": "⇄",
+	"tool.lsp": "💡",
+	"tool.gh": "⎇",
+	"tool.webSearch": "⌕",
+	"tool.exa": "🔭",
+	"tool.browser": "🌐",
+	"tool.eval": "▶",
+	"tool.debug": "🐞",
+	"tool.mcp": "🔌",
+	"tool.job": "⚙",
+	"tool.task": "⇶",
+	"tool.todo": "☑",
+	"tool.memory": "🧠",
+	"tool.ask": "?",
+	"tool.resolve": "✓",
+	"tool.review": "◉",
+	"tool.inspectImage": "🖼",
+	"tool.goal": "◎",
+	"tool.irc": "✉",
 };
 
 const NERD_SYMBOLS: SymbolMap = {
@@ -379,6 +452,8 @@ const NERD_SYMBOLS: SymbolMap = {
 	"status.shadowed": "◐",
 	// pick:  | alt:  
 	"status.aborted": "\uf04d",
+	// pick: • | alt: ● ·
+	"status.done": "•",
 	// Navigation
 	// pick:  | alt:  
 	"nav.cursor": "\uf054",
@@ -477,6 +552,7 @@ const NERD_SYMBOLS: SymbolMap = {
 	"icon.loop": "\uf021",
 	// pick:  | alt:  
 	"icon.folder": "\uf115",
+	"icon.search": "\uf002",
 	// pick:  | alt:
 	"icon.scratchFolder": "\uf014",
 	// pick:  | alt:  
@@ -497,10 +573,16 @@ const NERD_SYMBOLS: SymbolMap = {
 	"icon.time": "\uf017",
 	// pick:  | alt: π ∏ ∑
 	"icon.pi": "\ue22c",
+	// pick: 󰊠 (nf-md-ghost) | alt: 👻
+	"icon.ghost": "\u{f02a0}",
 	// pick:  | alt: 
 	"icon.agents": "\uf0c0",
+	// pick:  (nf-fa-gear) | alt:  ⚙
+	"icon.job": "\uf013",
 	// pick:  | alt:  
 	"icon.cache": "\uf1c0",
+	// pick:  (fa-ban) | alt: ⊘
+	"icon.cacheMiss": "\uf05e",
 	// pick:  | alt:  →
 	"icon.input": "\uf090",
 	// pick:  | alt:  →
@@ -537,6 +619,8 @@ const NERD_SYMBOLS: SymbolMap = {
 	"icon.extensionInstruction": "\uf02d",
 	// STT - fa-microphone
 	"icon.mic": "\uf130",
+	// Compaction divider - fa-camera-retro
+	"icon.camera": "\uf083",
 	// Thinking Levels - emoji labels
 	// pick: 🤨 min | alt:  min  min
 	"thinking.minimal": "\u{F0E7} min",
@@ -548,11 +632,18 @@ const NERD_SYMBOLS: SymbolMap = {
 	"thinking.high": "\u{F111} high",
 	// pick: 🧠 xhi | alt:  xhi  xhi
 	"thinking.xhigh": "\u{F06D} xhi",
+	// pick:  (fa-circle-o-notch) | alt: 󰂼 (nf-md-cached) ⟳
+	"thinking.autoPending": "\uf1ce",
 	// Checkboxes
 	// pick:  | alt:  
 	"checkbox.checked": "\uf14a",
 	// pick:  | alt: 
 	"checkbox.unchecked": "\uf096",
+	// Radio (single-choice)
+	// pick:  (fa-dot-circle-o) | alt:  ◉
+	"radio.selected": "\uf192",
+	// pick:  (fa-circle-o) | alt:  ○
+	"radio.unselected": "\uf10c",
 	// pick:  | alt:   •
 	"format.bullet": "\uf111",
 	// pick: – | alt: — ― -
@@ -568,6 +659,8 @@ const NERD_SYMBOLS: SymbolMap = {
 	"md.hrChar": "─",
 	// pick:  | alt:  •
 	"md.bullet": "\uf111",
+	// pick: ■ | alt:  (U+F096)
+	"md.colorSwatch": "■",
 	// Language icons (nerd font devicons)
 	"lang.default": "",
 	"lang.typescript": "\u{E628}",
@@ -610,11 +703,35 @@ const NERD_SYMBOLS: SymbolMap = {
 	"tab.model": "󰚩",
 	"tab.interaction": "󰌌",
 	"tab.context": "󰘸",
-	"tab.editing": "",
+	"tab.files": "󰈔",
+	"tab.shell": "󰆍",
 	"tab.tools": "󰠭",
 	"tab.memory": "󰧑",
 	"tab.tasks": "󰐱",
 	"tab.providers": "󰖟",
+	// Tool identity icons (per-tool signature glyph on the success header)
+	"tool.write": "\uEA7F",
+	"tool.edit": "\uEA73",
+	"tool.bash": "\uEBCA",
+	"tool.ssh": "\uEB3A",
+	"tool.lsp": "\uEA61",
+	"tool.gh": "\uEA84",
+	"tool.webSearch": "\uEB01",
+	"tool.exa": "\uEB68",
+	"tool.browser": "\uEAAE",
+	"tool.eval": "\uEBAF",
+	"tool.debug": "\uEAD8",
+	"tool.mcp": "\uEB2D",
+	"tool.job": "\uEBA2",
+	"tool.task": "\uf4a0",
+	"tool.todo": "\uEAB3",
+	"tool.memory": "\uEACE",
+	"tool.ask": "\uEAC7",
+	"tool.resolve": "\uEBB1",
+	"tool.review": "\uEA70",
+	"tool.inspectImage": "\uEAEA",
+	"tool.goal": "\uEBF8",
+	"tool.irc": "\uF086",
 };
 
 const ASCII_SYMBOLS: SymbolMap = {
@@ -629,6 +746,7 @@ const ASCII_SYMBOLS: SymbolMap = {
 	"status.running": "[~]",
 	"status.shadowed": "[/]",
 	"status.aborted": "[-]",
+	"status.done": "*",
 	// Navigation
 	"nav.cursor": ">",
 	"nav.selected": "->",
@@ -681,6 +799,7 @@ const ASCII_SYMBOLS: SymbolMap = {
 	"icon.pause": "||",
 	"icon.loop": "loop",
 	"icon.folder": "[D]",
+	"icon.search": "[/]",
 	"icon.scratchFolder": "[T]",
 	"icon.file": "[F]",
 	"icon.git": "git:",
@@ -691,8 +810,11 @@ const ASCII_SYMBOLS: SymbolMap = {
 	"icon.cost": "$",
 	"icon.time": "t:",
 	"icon.pi": "pi",
+	"icon.ghost": "@",
 	"icon.agents": "AG",
+	"icon.job": "bg",
 	"icon.cache": "cache",
+	"icon.cacheMiss": "!",
 	"icon.input": "in:",
 	"icon.output": "out:",
 	"icon.host": "host",
@@ -713,15 +835,20 @@ const ASCII_SYMBOLS: SymbolMap = {
 	"icon.extensionInstruction": "IN",
 	// STT
 	"icon.mic": "MIC",
+	// Compaction divider
+	"icon.camera": "[o]",
 	// Thinking Levels
 	"thinking.minimal": "[min]",
 	"thinking.low": "[low]",
 	"thinking.medium": "[med]",
 	"thinking.high": "[high]",
 	"thinking.xhigh": "[xhi]",
+	"thinking.autoPending": "[~]",
 	// Checkboxes
 	"checkbox.checked": "[x]",
 	"checkbox.unchecked": "[ ]",
+	"radio.selected": "(o)",
+	"radio.unselected": "( )",
 	"format.bullet": "*",
 	"format.dash": "-",
 	"format.bracketLeft": "[",
@@ -730,6 +857,7 @@ const ASCII_SYMBOLS: SymbolMap = {
 	"md.quoteBorder": "|",
 	"md.hrChar": "-",
 	"md.bullet": "*",
+	"md.colorSwatch": "[]",
 	// Language icons (ASCII uses abbreviations)
 	"lang.default": "code",
 	"lang.typescript": "ts",
@@ -772,11 +900,35 @@ const ASCII_SYMBOLS: SymbolMap = {
 	"tab.model": "[M]",
 	"tab.interaction": "[I]",
 	"tab.context": "[X]",
-	"tab.editing": "[E]",
+	"tab.files": "[F]",
+	"tab.shell": "[S]",
 	"tab.tools": "[T]",
 	"tab.memory": "[Y]",
 	"tab.tasks": "[K]",
 	"tab.providers": "[P]",
+	// Tool identity icons (per-tool signature glyph on the success header)
+	"tool.write": "+f",
+	"tool.edit": "~",
+	"tool.bash": "$",
+	"tool.ssh": "ssh",
+	"tool.lsp": "lsp",
+	"tool.gh": "gh",
+	"tool.webSearch": "web",
+	"tool.exa": "exa",
+	"tool.browser": "[w]",
+	"tool.eval": ">_",
+	"tool.debug": "dbg",
+	"tool.mcp": "<>",
+	"tool.job": "job",
+	"tool.task": ">>>",
+	"tool.todo": "[x]",
+	"tool.memory": "mem",
+	"tool.ask": "[?]",
+	"tool.resolve": "[v]",
+	"tool.review": "rev",
+	"tool.inspectImage": "[i]",
+	"tool.goal": "(o)",
+	"tool.irc": "irc",
 };
 
 const SYMBOL_PRESETS: Record<SymbolPreset, SymbolMap> = {
@@ -802,115 +954,140 @@ const SPINNER_FRAMES: Record<SymbolPreset, Record<SpinnerType, string[]>> = {
 	},
 };
 
+/**
+ * Shape accepted by `themeJson.symbols.spinnerFrames`. A flat array applies to
+ * both spinner types; an object lets a theme override `status` and/or
+ * `activity` independently. Anything not specified falls back to the symbol
+ * preset's default frames.
+ */
+type SpinnerFramesOverride = string[] | { status?: string[]; activity?: string[] };
+
+function normalizeSpinnerFramesOverride(
+	value: SpinnerFramesOverride | undefined,
+): Partial<Record<SpinnerType, string[]>> {
+	if (value === undefined) return {};
+	if (Array.isArray(value)) return { status: value, activity: value };
+	const result: Partial<Record<SpinnerType, string[]>> = {};
+	if (value.status) result.status = value.status;
+	if (value.activity) result.activity = value.activity;
+	return result;
+}
+
 // ============================================================================
 // Types & Schema
 // ============================================================================
 
-const colorValueSchema = z.union([
-	z.string(), // hex "#ff0000", var ref "primary", or empty ""
-	z.number().int().min(0).max(255), // 256-color index
-]);
+type ColorValue = string | number;
 
-type ColorValue = z.infer<typeof colorValueSchema>;
-
-const THEME_COLOR_KEYS = [
-	"accent",
-	"border",
-	"borderAccent",
-	"borderMuted",
-	"success",
-	"error",
-	"warning",
-	"muted",
-	"dim",
-	"text",
-	"thinkingText",
-	"selectedBg",
-	"userMessageBg",
-	"userMessageText",
-	"customMessageBg",
-	"customMessageText",
-	"customMessageLabel",
-	"toolPendingBg",
-	"toolSuccessBg",
-	"toolErrorBg",
-	"toolTitle",
-	"toolOutput",
-	"mdHeading",
-	"mdLink",
-	"mdLinkUrl",
-	"mdCode",
-	"mdCodeBlock",
-	"mdCodeBlockBorder",
-	"mdQuote",
-	"mdQuoteBorder",
-	"mdHr",
-	"mdListBullet",
-	"toolDiffAdded",
-	"toolDiffRemoved",
-	"toolDiffContext",
-	"syntaxComment",
-	"syntaxKeyword",
-	"syntaxFunction",
-	"syntaxVariable",
-	"syntaxString",
-	"syntaxNumber",
-	"syntaxType",
-	"syntaxOperator",
-	"syntaxPunctuation",
-	"thinkingOff",
-	"thinkingMinimal",
-	"thinkingLow",
-	"thinkingMedium",
-	"thinkingHigh",
-	"thinkingXhigh",
-	"bashMode",
-	"pythonMode",
-	"statusLineBg",
-	"statusLineSep",
-	"statusLineModel",
-	"statusLinePath",
-	"statusLineGitClean",
-	"statusLineGitDirty",
-	"statusLineContext",
-	"statusLineSpend",
-	"statusLineStaged",
-	"statusLineDirty",
-	"statusLineUntracked",
-	"statusLineOutput",
-	"statusLineCost",
-	"statusLineSubagents",
-] as const;
-
-const themeColorsSchema = z.object(
-	Object.fromEntries(THEME_COLOR_KEYS.map(key => [key, colorValueSchema])) as unknown as {
-		[K in (typeof THEME_COLOR_KEYS)[number]]: typeof colorValueSchema;
-	},
-);
-
-const symbolPresetSchema = z.enum(["unicode", "nerd", "ascii"]);
-
-const themeJsonSchema = z.object({
-	$schema: z.string().optional(),
-	name: z.string(),
-	vars: z.record(z.string(), colorValueSchema).optional(),
+const themeColorsSchema = type({
+	accent: "string | number",
+	border: "string | number",
+	borderAccent: "string | number",
+	borderMuted: "string | number",
+	success: "string | number",
+	error: "string | number",
+	warning: "string | number",
+	muted: "string | number",
+	dim: "string | number",
+	text: "string | number",
+	thinkingText: "string | number",
+	selectedBg: "string | number",
+	userMessageBg: "string | number",
+	userMessageText: "string | number",
+	customMessageBg: "string | number",
+	customMessageText: "string | number",
+	customMessageLabel: "string | number",
+	toolPendingBg: "string | number",
+	toolSuccessBg: "string | number",
+	toolErrorBg: "string | number",
+	toolTitle: "string | number",
+	toolOutput: "string | number",
+	mdHeading: "string | number",
+	mdLink: "string | number",
+	mdLinkUrl: "string | number",
+	mdCode: "string | number",
+	mdCodeBlock: "string | number",
+	mdCodeBlockBorder: "string | number",
+	mdQuote: "string | number",
+	mdQuoteBorder: "string | number",
+	mdHr: "string | number",
+	mdListBullet: "string | number",
+	toolDiffAdded: "string | number",
+	toolDiffRemoved: "string | number",
+	toolDiffContext: "string | number",
+	syntaxComment: "string | number",
+	syntaxKeyword: "string | number",
+	syntaxFunction: "string | number",
+	syntaxVariable: "string | number",
+	syntaxString: "string | number",
+	syntaxNumber: "string | number",
+	syntaxType: "string | number",
+	syntaxOperator: "string | number",
+	syntaxPunctuation: "string | number",
+	thinkingOff: "string | number",
+	thinkingMinimal: "string | number",
+	thinkingLow: "string | number",
+	thinkingMedium: "string | number",
+	thinkingHigh: "string | number",
+	thinkingXhigh: "string | number",
+	bashMode: "string | number",
+	pythonMode: "string | number",
+	statusLineBg: "string | number",
+	statusLineSep: "string | number",
+	statusLineModel: "string | number",
+	statusLinePath: "string | number",
+	statusLineGitClean: "string | number",
+	statusLineGitDirty: "string | number",
+	statusLineContext: "string | number",
+	statusLineSpend: "string | number",
+	statusLineStaged: "string | number",
+	statusLineDirty: "string | number",
+	statusLineUntracked: "string | number",
+	statusLineOutput: "string | number",
+	statusLineCost: "string | number",
+	statusLineSubagents: "string | number",
+});
+const spinnerFramesSchema = type("unknown").narrow((value): value is SpinnerFramesOverride => {
+	if (Array.isArray(value)) {
+		return value.length >= 1 && value.every(item => typeof item === "string");
+	}
+	if (value && typeof value === "object") {
+		const obj = value as Record<string, unknown>;
+		const status = obj.status;
+		const activity = obj.activity;
+		if (status === undefined && activity === undefined) return false;
+		if (status !== undefined) {
+			if (!Array.isArray(status) || status.length < 1 || !status.every(item => typeof item === "string")) {
+				return false;
+			}
+		}
+		if (activity !== undefined) {
+			if (!Array.isArray(activity) || activity.length < 1 || !activity.every(item => typeof item === "string")) {
+				return false;
+			}
+		}
+		return true;
+	}
+	return false;
+});
+const themeJsonSchema = type({
+	"$schema?": "string",
+	name: "string",
+	"vars?": "Record<string, string | number>",
 	colors: themeColorsSchema,
-	export: z
-		.object({
-			pageBg: colorValueSchema.optional(),
-			cardBg: colorValueSchema.optional(),
-			infoBg: colorValueSchema.optional(),
-		})
-		.optional(),
-	symbols: z
-		.object({
-			preset: symbolPresetSchema.optional(),
-			overrides: z.record(z.string(), z.string()).optional(),
-		})
-		.optional(),
+	"export?": {
+		"pageBg?": "string | number",
+		"cardBg?": "string | number",
+		"infoBg?": "string | number",
+	},
+	"symbols?": {
+		"preset?": "'unicode' | 'nerd' | 'ascii'",
+		"overrides?": "Record<string, string>",
+		"spinnerFrames?": spinnerFramesSchema,
+	},
 });
 
-type ThemeJson = z.infer<typeof themeJsonSchema>;
+type ThemeJson = typeof themeJsonSchema.infer;
 
 export type ThemeColor =
 	| "accent"
@@ -1229,25 +1406,58 @@ const langMap: Record<string, SymbolKey> = {
 	bin: "lang.binary",
 };
 
+/**
+ * Resolve a theme color value (hex string or 256-color index) to a CSS hex string.
+ * Empty string represents the default terminal color.
+ */
+function resolveToHex(value: string | number, isLight: boolean): string {
+	if (typeof value === "number") return ansi256ToHex(value);
+	if (value === "") return isLight ? "#000000" : "#e5e5e7";
+	return value;
+}
+
 export class Theme {
 	#fgColors: Record<ThemeColor, string>;
 	#bgColors: Record<ThemeBg, string>;
+	/** Resolved hex strings for foreground colors — populated at construction. */
+	readonly #hexFgColors: Record<ThemeColor, string>;
+	/** Resolved hex strings for background colors — populated at construction. */
+	readonly #hexBgColors: Record<ThemeBg, string>;
 	#symbols: SymbolMap;
-
+	#spinnerFramesOverrides: Partial<Record<SpinnerType, string[]>>;
+	/**
+	 * Perceptual luma (0..1) of the status-line background — used to classify the
+	 * theme light/dark. Undefined when it can't be resolved. Classified against the
+	 * status line (the surface session accents render on) rather than the chat bubble
+	 * (`userMessageBg`), which some themes (e.g. `porcelain`) style dark on an
+	 * otherwise-light theme.
+	 */
+	readonly statusLineLuminance: number | undefined;
+	/** WCAG relative luminance of the status-line background — basis for accent contrast. */
+	readonly #statusLineContrastLuminance: number | undefined;
 	constructor(
 		fgColors: Record<ThemeColor, string | number>,
 		bgColors: Record<ThemeBg, string | number>,
 		private readonly mode: ColorMode,
 		private readonly symbolPreset: SymbolPreset,
 		symbolOverrides: Partial<Record<SymbolKey, string>>,
+		spinnerFramesOverrides: Partial<Record<SpinnerType, string[]>> = {},
 	) {
+		this.statusLineLuminance = colorLuma(bgColors.statusLineBg);
+		this.#statusLineContrastLuminance = relativeLuminance(bgColors.statusLineBg);
+		const slIsLight = this.statusLineLuminance !== undefined && this.statusLineLuminance > 0.5;
+
 		this.#fgColors = {} as Record<ThemeColor, string>;
+		this.#hexFgColors = {} as Record<ThemeColor, string>;
 		for (const [key, value] of Object.entries(fgColors) as [ThemeColor, string | number][]) {
 			this.#fgColors[key] = fgAnsi(value, mode);
+			this.#hexFgColors[key] = resolveToHex(value, slIsLight);
 		}
 		this.#bgColors = {} as Record<ThemeBg, string>;
+		this.#hexBgColors = {} as Record<ThemeBg, string>;
 		for (const [key, value] of Object.entries(bgColors) as [ThemeBg, string | number][]) {
 			this.#bgColors[key] = bgAnsi(value, mode);
+			this.#hexBgColors[key] = resolveToHex(value, slIsLight);
 		}
 		// Build symbol map from preset + overrides
 		const baseSymbols = SYMBOL_PRESETS[symbolPreset];
@@ -1259,6 +1469,84 @@ export class Theme {
 				logger.debug("Invalid symbol key in override", { key, availableKeys: Object.keys(this.#symbols) });
 			}
 		}
+		this.#spinnerFramesOverrides = spinnerFramesOverrides;
+	}
+
+	/** True when the active theme has a light status-line background. */
+	get isLight(): boolean {
+		return this.statusLineLuminance !== undefined && this.statusLineLuminance > 0.5;
+	}
+
+	/**
+	 * Surface luminance to size session accents against on light themes; undefined on
+	 * dark themes so accents stay vivid. Pass straight to `getSessionAccentHex`.
+	 */
+	get accentSurfaceLuminance(): number | undefined {
+		return this.isLight ? this.#statusLineContrastLuminance : undefined;
+	}
+
+	/**
+	 * Get the resolved CSS hex string for a foreground theme color.
+	 */
+	getColorHex(color: ThemeColor): string {
+		const hex = this.#hexFgColors[color];
+		if (hex === undefined) throw new Error(`Unknown theme color: ${color}`);
+		return hex || (this.isLight ? "#000000" : "#e5e5e7");
+	}
+
+	/**
+	 * Get all foreground and background theme colors as CSS hex strings.
+	 * Skips colors resolved to the default terminal color (unstyled).
+	 */
+	getAllThemeColorHexes(): string[] {
+		const hexes: string[] = [];
+		for (const hex of Object.values(this.#hexFgColors)) {
+			if (hex) hexes.push(hex);
+		}
+		for (const hex of Object.values(this.#hexBgColors)) {
+			if (hex) hexes.push(hex);
+		}
+		return hexes;
+	}
+
+	/**
+	 * Get the most visually dominant theme colors as CSS hex strings — accent,
+	 * border, success, error, warning, heading, link, diff markers, etc.
+	 * These are the colors the session accent could visually clash with.
+	 * Skips colors resolved to the default terminal color (unstyled).
+	 */
+	getMajorThemeColorHexes(): string[] {
+		const majors: ThemeColor[] = [
+			"accent",
+			"border",
+			"borderAccent",
+			"borderMuted",
+			"success",
+			"error",
+			"warning",
+			"mdHeading",
+			"mdLink",
+			"mdCode",
+			"mdCodeBlock",
+			"mdQuoteBorder",
+			"mdListBullet",
+			"toolDiffAdded",
+			"toolDiffRemoved",
+			"customMessageLabel",
+			"thinkingText",
+		];
+		const hexes: string[] = [];
+		for (const key of majors) {
+			const hex = this.#hexFgColors[key];
+			if (hex) hexes.push(hex);
+		}
+		return hexes;
+	}
+	/**
+	 * Get the resolved CSS hex string for the theme's accent color.
+	 */
+	getAccentColorHex(): string {
+		return this.getColorHex("accent");
 	}
 
 	fg(color: ThemeColor, text: string): string {
@@ -1303,6 +1591,24 @@ export class Theme {
 		const ansi = this.#bgColors[color];
 		if (!ansi) throw new Error(`Unknown theme background color: ${color}`);
 		return ansi;
+	}
+
+	/**
+	 * Foreground ANSI for text drawn **on top of** `fillColor` used as a solid
+	 * background (e.g. a powerline chip). Picks near-black or near-white by the
+	 * fill's perceived luminance (Rec. 601 luma) so the label stays legible on
+	 * both bright and dark fills, across light and dark themes.
+	 *
+	 * Reads the RGB out of the already-resolved truecolor escape; when the fill
+	 * is encoded as a 256-palette index (limited terminals) the RGB is
+	 * unavailable, so it falls back to the theme `text` color.
+	 */
+	getContrastFgAnsi(fillColor: ThemeColor): string {
+		const ansi = this.#fgColors[fillColor];
+		const match = ansi ? /38;2;(\d+);(\d+);(\d+)/.exec(ansi) : null;
+		if (!match) return this.#fgColors.text;
+		const luma = 0.299 * Number(match[1]) + 0.587 * Number(match[2]) + 0.114 * Number(match[3]);
+		return luma > 140 ? "\x1b[38;2;0;0;0m" : "\x1b[38;2;255;255;255m";
 	}
 
 	getColorMode(): ColorMode {
@@ -1378,6 +1684,7 @@ export class Theme {
 			running: this.#symbols["status.running"],
 			shadowed: this.#symbols["status.shadowed"],
 			aborted: this.#symbols["status.aborted"],
+			done: this.#symbols["status.done"],
 		};
 	}
 
@@ -1409,6 +1716,14 @@ export class Theme {
 			bottomRight: this.#symbols["boxRound.bottomRight"],
 			horizontal: this.#symbols["boxRound.horizontal"],
 			vertical: this.#symbols["boxRound.vertical"],
+			// Junctions have no rounded Unicode variant, so a rounded box reuses the
+			// sharp tee/cross glyphs. Sourcing them from the boxSharp.* tokens keeps a
+			// theme's `boxSharp.tee*` overrides effective for rounded-box dividers.
+			cross: this.#symbols["boxSharp.cross"],
+			teeDown: this.#symbols["boxSharp.teeDown"],
+			teeUp: this.#symbols["boxSharp.teeUp"],
+			teeRight: this.#symbols["boxSharp.teeRight"],
+			teeLeft: this.#symbols["boxSharp.teeLeft"],
 		};
 	}
 
@@ -1464,8 +1779,11 @@ export class Theme {
 			cost: this.#symbols["icon.cost"],
 			time: this.#symbols["icon.time"],
 			pi: this.#symbols["icon.pi"],
+			ghost: this.#symbols["icon.ghost"],
 			agents: this.#symbols["icon.agents"],
+			job: this.#symbols["icon.job"],
 			cache: this.#symbols["icon.cache"],
+			cacheMiss: this.#symbols["icon.cacheMiss"],
 			input: this.#symbols["icon.input"],
 			output: this.#symbols["icon.output"],
 			host: this.#symbols["icon.host"],
@@ -1485,6 +1803,7 @@ export class Theme {
 			extensionContextFile: this.#symbols["icon.extensionContextFile"],
 			extensionInstruction: this.#symbols["icon.extensionInstruction"],
 			mic: this.#symbols["icon.mic"],
+			camera: this.#symbols["icon.camera"],
 		};
 	}
 
@@ -1495,6 +1814,7 @@ export class Theme {
 			medium: this.#symbols["thinking.medium"],
 			high: this.#symbols["thinking.high"],
 			xhigh: this.#symbols["thinking.xhigh"],
+			autoPending: this.#symbols["thinking.autoPending"],
 		};
 	}
 
@@ -1502,6 +1822,13 @@ export class Theme {
 		return {
 			checked: this.#symbols["checkbox.checked"],
 			unchecked: this.#symbols["checkbox.unchecked"],
+		};
+	}
+
+	get radio() {
+		return {
+			selected: this.#symbols["radio.selected"],
+			unselected: this.#symbols["radio.unselected"],
 		};
 	}
 
@@ -1519,6 +1846,7 @@ export class Theme {
 			quoteBorder: this.#symbols["md.quoteBorder"],
 			hrChar: this.#symbols["md.hrChar"],
 			bullet: this.#symbols["md.bullet"],
+			colorSwatch: this.#symbols["md.colorSwatch"],
 		};
 	}
 
@@ -1533,7 +1861,7 @@ export class Theme {
 	 * Get spinner frames by type.
 	 */
 	getSpinnerFrames(type: SpinnerType = "status"): string[] {
-		return SPINNER_FRAMES[this.symbolPreset][type];
+		return this.#spinnerFramesOverrides[type] ?? SPINNER_FRAMES[this.symbolPreset][type];
 	}
 
 	/**
@@ -1630,37 +1958,30 @@ async function loadThemeJson(name: string): Promise<ThemeJson> {
 	} catch (error) {
 		throw new Error(`Failed to parse theme ${name}: ${error}`);
 	}
-	const parsed = themeJsonSchema.safeParse(json);
-	if (!parsed.success) {
-		const missingColors: string[] = [];
-		const otherErrors: string[] = [];
-
-		for (const issue of parsed.error.issues) {
-			const parts = issue.path;
-			const colorKey = parts.length === 2 && parts[0] === "colors" && typeof parts[1] === "string" ? parts[1] : null;
-
-			if (colorKey && issue.code === "invalid_type" && (issue as { received?: unknown }).received === undefined) {
-				missingColors.push(colorKey);
-			} else {
-				const pathStr = parts.length === 0 ? "/" : `/${parts.map(String).join("/")}`;
-				otherErrors.push(`  - ${pathStr}: ${issue.message}`);
-			}
+	let parsed: ThemeJson;
+	try {
+		parsed = themeJsonSchema(json) as ThemeJson;
+		if (parsed instanceof type.errors) {
+			throw new Error(parsed.summary);
 		}
+	} catch (error) {
+		const errorMessage = error instanceof Error ? error.message : String(error);
+		// Extract color key information if available
+		const missingColorMatch = errorMessage.match(/missing keys: (.+)/i);
+		const missingColors: string[] = missingColorMatch ? missingColorMatch[1].split(",").map(s => s.trim()) : [];
 
-		let errorMessage = `Invalid theme "${name}":\n`;
+		let fullErrorMessage = `Invalid theme "${name}":\n`;
 		if (missingColors.length > 0) {
-			errorMessage += `\nMissing required color tokens:\n`;
-			errorMessage += missingColors.map(c => `  - ${c}`).join("\n");
-			errorMessage += `\n\nPlease add these colors to your theme's "colors" object.`;
-			errorMessage += `\nSee the built-in themes (dark.json, light.json) for reference values.`;
+			fullErrorMessage += `\nMissing required color tokens:\n`;
+			fullErrorMessage += missingColors.map(c => `  - ${c}`).join("\n");
+			fullErrorMessage += `\n\nPlease add these colors to your theme's "colors" object.`;
+			fullErrorMessage += `\nSee the built-in themes (dark.json, light.json) for reference values.`;
 		}
-		if (otherErrors.length > 0) {
-			errorMessage += `\n\nOther errors:\n${otherErrors.join("\n")}`;
-		}
+		fullErrorMessage += `\n\nValidation error:\n  - ${errorMessage}`;
 
-		throw new Error(errorMessage);
+		throw new Error(fullErrorMessage);
 	}
-	return parsed.data;
+	return parsed;
 }
 
 interface CreateThemeOptions {
@@ -1705,7 +2026,8 @@ function createTheme(themeJson: ThemeJson, options: CreateThemeOptions = {}): Th
 	// Extract symbol configuration - settings override takes precedence over theme
 	const symbolPreset: SymbolPreset = symbolPresetOverride ?? themeJson.symbols?.preset ?? "unicode";
 	const symbolOverrides = themeJson.symbols?.overrides ?? {};
-	return new Theme(fgColors, bgColors, colorMode, symbolPreset, symbolOverrides);
+	const spinnerFramesOverrides = normalizeSpinnerFramesOverride(themeJson.symbols?.spinnerFrames);
+	return new Theme(fgColors, bgColors, colorMode, symbolPreset, symbolOverrides, spinnerFramesOverrides);
 }
 
 async function loadTheme(name: string, options: CreateThemeOptions = {}): Promise<Theme> {
@@ -1775,6 +2097,11 @@ var currentThemeName: string | undefined;
 export function getCurrentThemeName(): string | undefined {
 	return currentThemeName;
 }
+
+/** Returns unstyled `text` before `initTheme()` assigns the global theme; use only for early-render paths. */
+export function fgOrPlain(color: ThemeColor, text: string, styledText: string = text): string {
+	return typeof theme === "undefined" ? text : theme.fg(color, styledText);
+}
 var currentSymbolPresetOverride: SymbolPreset | undefined;
 var currentColorBlindMode: boolean = false;
 var themeWatcher: fs.FSWatcher | undefined;
@@ -1785,6 +2112,7 @@ var autoDarkTheme: string = "dark";
 var autoLightTheme: string = "light";
 var onThemeChangeCallback: (() => void) | undefined;
 var themeLoadRequestId: number = 0;
+let themeEpoch = 0;
 
 function getCurrentThemeOptions(): CreateThemeOptions {
 	return {
@@ -1837,9 +2165,7 @@ export async function setTheme(
 		if (enableWatcher) {
 			await startThemeWatcher();
 		}
-		if (onThemeChangeCallback) {
-			onThemeChangeCallback();
-		}
+		notifyThemeChange();
 		return { success: true };
 	} catch (error) {
 		if (requestId !== themeLoadRequestId) {
@@ -1848,6 +2174,10 @@ export async function setTheme(
 		// Theme is invalid - fall back to dark theme
 		currentThemeName = "dark";
 		theme = await loadTheme("dark", getCurrentThemeOptions());
+		// The active theme just changed to the fallback — bump the epoch so memoized
+		// renderers (e.g. ToolExecutionComponent) re-shape with the fallback colors
+		// instead of holding the failed theme's stale styling.
+		notifyThemeChange();
 		// Don't start watcher for fallback theme
 		return {
 			success: false,
@@ -1864,9 +2194,7 @@ export async function previewTheme(name: string): Promise<{ success: boolean; er
 			return { success: false, error: "Theme preview superseded by a newer request" };
 		}
 		theme = loadedTheme;
-		if (onThemeChangeCallback) {
-			onThemeChangeCallback();
-		}
+		notifyThemeChange();
 		return { success: true };
 	} catch (error) {
 		if (requestId !== themeLoadRequestId) {
@@ -1913,9 +2241,7 @@ export function setThemeInstance(themeInstance: Theme): void {
 	theme = themeInstance;
 	currentThemeName = "<in-memory>";
 	stopThemeWatcher();
-	if (onThemeChangeCallback) {
-		onThemeChangeCallback();
-	}
+	notifyThemeChange();
 }
 
 /**
@@ -1923,17 +2249,20 @@ export function setThemeInstance(themeInstance: Theme): void {
  */
 export async function setSymbolPreset(preset: SymbolPreset): Promise<void> {
 	currentSymbolPresetOverride = preset;
-	if (currentThemeName) {
-		try {
-			theme = await loadTheme(currentThemeName, getCurrentThemeOptions());
-		} catch {
-			// Fall back to dark theme with new preset
-			theme = await loadTheme("dark", getCurrentThemeOptions());
-		}
-		if (onThemeChangeCallback) {
-			onThemeChangeCallback();
-		}
+	if (!currentThemeName) return;
+
+	const requestId = ++themeLoadRequestId;
+	try {
+		const loadedTheme = await loadTheme(currentThemeName, getCurrentThemeOptions());
+		if (requestId !== themeLoadRequestId) return;
+		theme = loadedTheme;
+	} catch {
+		if (requestId !== themeLoadRequestId) return;
+		// Fall back to dark theme with new preset
+		theme = await loadTheme("dark", getCurrentThemeOptions());
+		if (requestId !== themeLoadRequestId) return;
 	}
+	notifyThemeChange();
 }
 
 /**
@@ -1949,17 +2278,20 @@ export function getSymbolPresetOverride(): SymbolPreset | undefined {
  */
 export async function setColorBlindMode(enabled: boolean): Promise<void> {
 	currentColorBlindMode = enabled;
-	if (currentThemeName) {
-		try {
-			theme = await loadTheme(currentThemeName, getCurrentThemeOptions());
-		} catch {
-			// Fall back to dark theme
-			theme = await loadTheme("dark", getCurrentThemeOptions());
-		}
-		if (onThemeChangeCallback) {
-			onThemeChangeCallback();
-		}
+	if (!currentThemeName) return;
+
+	const requestId = ++themeLoadRequestId;
+	try {
+		const loadedTheme = await loadTheme(currentThemeName, getCurrentThemeOptions());
+		if (requestId !== themeLoadRequestId) return;
+		theme = loadedTheme;
+	} catch {
+		if (requestId !== themeLoadRequestId) return;
+		// Fall back to dark theme
+		theme = await loadTheme("dark", getCurrentThemeOptions());
+		if (requestId !== themeLoadRequestId) return;
 	}
+	notifyThemeChange();
 }
 
 /**
@@ -1969,8 +2301,30 @@ export function getColorBlindMode(): boolean {
 	return currentColorBlindMode;
 }
 
-export function onThemeChange(callback: () => void): void {
+export function onThemeChange(callback: () => void): () => void {
 	onThemeChangeCallback = callback;
+	return () => {
+		if (onThemeChangeCallback === callback) {
+			onThemeChangeCallback = undefined;
+		}
+	};
+}
+
+/**
+ * Monotonic counter bumped on any theme-affecting change that should invalidate
+ * cached renders: theme swaps and reloads (including the invalid-theme dark
+ * fallback), theme previews, symbol-preset changes, and color-blind-mode
+ * changes — everything that routes through {@link notifyThemeChange}. Consumers
+ * key cached renders on it so the next render re-shapes their output.
+ */
+export function getThemeEpoch(): number {
+	return themeEpoch;
+}
+
+/** Bump the theme epoch and notify the registered theme-change listener. */
+function notifyThemeChange(): void {
+	themeEpoch++;
+	onThemeChangeCallback?.();
 }
 
 /**
@@ -2025,9 +2379,7 @@ async function startThemeWatcher(): Promise<void> {
 			loadTheme(watchedThemeName, getCurrentThemeOptions())
 				.then(loadedTheme => {
 					theme = loadedTheme;
-					if (onThemeChangeCallback) {
-						onThemeChangeCallback();
-					}
+					notifyThemeChange();
 				})
 				.catch(() => {
 					// Ignore errors (file might be in invalid state while being edited)
@@ -2067,9 +2419,7 @@ function reevaluateAutoTheme(debugLabel: string): void {
 	loadTheme(resolved, getCurrentThemeOptions())
 		.then(loadedTheme => {
 			theme = loadedTheme;
-			if (onThemeChangeCallback) {
-				onThemeChangeCallback();
-			}
+			notifyThemeChange();
 		})
 		.catch(err => {
 			logger.debug(`Theme switch on ${debugLabel} failed`, { error: String(err) });
@@ -2192,17 +2542,73 @@ function ansi256ToHex(index: number): string {
 }
 
 /**
+ * Classify a parsed theme JSON as light/dark by the perceived luminance of its
+ * status-line background. Mirrors {@link Theme.isLight} so the synchronous
+ * helpers below stay in lockstep with the runtime classifier — see the comment
+ * on `Theme.statusLineLuminance` for why `statusLineBg` is the source of truth
+ * (themes like `porcelain` style a dark chat bubble on an otherwise-light
+ * theme, so `userMessageBg` is unreliable).
+ */
+function isLightThemeJson(themeJson: ThemeJson): boolean {
+	try {
+		const resolved = resolveVarRefs(themeJson.colors.statusLineBg, themeJson.vars ?? {});
+		const luminance = colorLuma(resolved);
+		return luminance !== undefined && luminance > 0.5;
+	} catch {
+		return false;
+	}
+}
+
+function getHtmlDefaultTextForSurface(surface: string | number | undefined): string {
+	const luminance = surface === undefined ? undefined : colorLuma(surface);
+	return luminance !== undefined && luminance > 0.5 ? "#000000" : "#e5e5e7";
+}
+
+function resolveThemeExportColors(themeJson: ThemeJson): {
+	pageBg?: string;
+	cardBg?: string;
+	infoBg?: string;
+} {
+	const exportSection = themeJson.export;
+	if (!exportSection) return {};
+
+	const vars = themeJson.vars ?? {};
+	const resolve = (value: string | number | undefined): string | undefined => {
+		if (value === undefined) return undefined;
+		if (typeof value === "number") return ansi256ToHex(value);
+		if (value === "" || value.startsWith("#")) return value;
+		const varName = value.startsWith("$") ? value.slice(1) : value;
+		if (varName in vars) {
+			const resolved = resolveVarRefs(varName, vars);
+			return typeof resolved === "number" ? ansi256ToHex(resolved) : resolved;
+		}
+		return value;
+	};
+
+	return {
+		pageBg: resolve(exportSection.pageBg),
+		cardBg: resolve(exportSection.cardBg),
+		infoBg: resolve(exportSection.infoBg),
+	};
+}
+
+/**
  * Get resolved theme colors as CSS-compatible hex strings.
  * Used by HTML export to generate CSS custom properties.
  */
 export async function getResolvedThemeColors(themeName?: string): Promise<Record<string, string>> {
 	const name = themeName ?? getDefaultTheme();
-	const isLight = name === "light";
 	const themeJson = await loadThemeJson(name);
+	const exportColors = resolveThemeExportColors(themeJson);
 	const resolved = resolveThemeColors(themeJson.colors, themeJson.vars);
 
-	// Default text color for empty values (terminal uses default fg color)
-	const defaultText = isLight ? "#000000" : "#e5e5e7";
+	// Empty foreground tokens use the terminal default color. In HTML export,
+	// that default must contrast the export surface, not the TUI status line:
+	// custom light themes can still export dark transcript cards when they omit
+	// `export`, because generateThemeVars derives those cards from userMessageBg.
+	const defaultText = getHtmlDefaultTextForSurface(
+		exportColors.cardBg ?? exportColors.pageBg ?? resolved.userMessageBg,
+	);
 
 	const cssColors: Record<string, string> = {};
 	for (const [key, value] of Object.entries(resolved)) {
@@ -2219,8 +2625,9 @@ export async function getResolvedThemeColors(themeName?: string): Promise<Record
 }
 
 /**
- * Check if a theme is a "light" theme by analyzing its background color luminance.
- * Loads theme JSON synchronously (built-in or custom file) and resolves userMessageBg.
+ * Check if a theme is a "light" theme by analyzing its status-line background
+ * luminance. Loads theme JSON synchronously (built-in or custom file on disk)
+ * for callers in synchronous flows (settings migration, setup wizard).
  */
 export function isLightTheme(themeName?: string): boolean {
 	const name = themeName ?? "dark";
@@ -2237,18 +2644,7 @@ export function isLightTheme(themeName?: string): boolean {
 			return false;
 		}
 	}
-	try {
-		const resolved = resolveVarRefs(themeJson.colors.userMessageBg, themeJson.vars ?? {});
-		if (typeof resolved !== "string" || !resolved.startsWith("#") || resolved.length !== 7) return false;
-		const r = parseInt(resolved.slice(1, 3), 16) / 255;
-		const g = parseInt(resolved.slice(3, 5), 16) / 255;
-		const b = parseInt(resolved.slice(5, 7), 16) / 255;
-		// Relative luminance (ITU-R BT.709)
-		const luminance = 0.2126 * r + 0.7152 * g + 0.0722 * b;
-		return luminance > 0.5;
-	} catch {
-		return false;
-	}
+	return isLightThemeJson(themeJson);
 }
 
 /**
@@ -2263,27 +2659,7 @@ export async function getThemeExportColors(themeName?: string): Promise<{
 	const name = themeName ?? getDefaultTheme();
 	try {
 		const themeJson = await loadThemeJson(name);
-		const exportSection = themeJson.export;
-		if (!exportSection) return {};
-
-		const vars = themeJson.vars ?? {};
-		const resolve = (value: string | number | undefined): string | undefined => {
-			if (value === undefined) return undefined;
-			if (typeof value === "number") return ansi256ToHex(value);
-			if (value === "" || value.startsWith("#")) return value;
-			const varName = value.startsWith("$") ? value.slice(1) : value;
-			if (varName in vars) {
-				const resolved = resolveVarRefs(varName, vars);
-				return typeof resolved === "number" ? ansi256ToHex(resolved) : resolved;
-			}
-			return value;
-		};
-
-		return {
-			pageBg: resolve(exportSection.pageBg),
-			cardBg: resolve(exportSection.cardBg),
-			infoBg: resolve(exportSection.infoBg),
-		};
+		return resolveThemeExportColors(themeJson);
 	} catch {
 		return {};
 	}
@@ -2317,19 +2693,85 @@ function getHighlightColors(t: Theme): NativeHighlightColors {
 }
 
 /**
+ * Memoized native syntax highlight. Returns the joined ANSI string, or `null`
+ * when the native tokenizer throws so callers can apply their own fallback.
+ *
+ * Keyed on `(lang, code)` and reset whenever the active `theme` instance
+ * changes — the ANSI colors are baked into the highlighted output, so a theme
+ * switch (which always reassigns `theme`) must invalidate every entry.
+ *
+ * Why this exists: animated tool blocks (eval/bash) repaint their box on every
+ * ~33ms border-shimmer frame, and markdown re-lexes on every streamed delta.
+ * Without memoization each frame can re-tokenize an unchanged code body through
+ * the Rust FFI — ~26ms for 100 lines, ~40ms for 150 — consuming or overrunning
+ * the 33ms frame budget and starving the spinner/render timers (the "TUI freeze").
+ */
+const HIGHLIGHT_CACHE_MAX = 256;
+const highlightCache = new LRUCache<string, string>({ max: HIGHLIGHT_CACHE_MAX });
+let highlightCacheTheme: Theme | undefined;
+
+function highlightCached(code: string, validLang: string | undefined, highlightTheme: Theme): string | null {
+	if (highlightCacheTheme !== highlightTheme) {
+		highlightCache.clear();
+		highlightCacheTheme = highlightTheme;
+	}
+	const key = `${validLang ?? ""}\x00${code}`;
+	const hit = highlightCache.get(key);
+	if (hit !== undefined) {
+		return hit;
+	}
+	let highlighted: string;
+	try {
+		highlighted = nativeHighlightCode(code, validLang, getHighlightColors(highlightTheme));
+	} catch {
+		return null;
+	}
+	highlightCache.set(key, highlighted);
+	return highlighted;
+}
+
+/**
  * Highlight code with syntax coloring based on file extension or language.
  * Returns array of highlighted lines.
  */
-export function highlightCode(code: string, lang?: string): string[] {
+export function highlightCode(code: string, lang?: string, highlightTheme: Theme = theme): string[] {
 	const validLang = lang && nativeSupportsLanguage(lang) ? lang : undefined;
-	try {
-		return nativeHighlightCode(code, validLang, getHighlightColors(theme)).split("\n");
-	} catch {
-		return code.split("\n");
-	}
+	const highlighted = highlightCached(code, validLang, highlightTheme);
+	// Always return a fresh array: callers (e.g. renderCodeCell) push extra lines
+	// onto the result, which would corrupt the cached string otherwise.
+	return (highlighted ?? code).split("\n");
 }
 
 export function getSymbolTheme(): SymbolTheme {
+	// Guard against `theme` being undefined (pre-init or cross-module-instance
+	// plugin calls). Fall back to the ASCII preset so the returned symbols are
+	// usable instead of crashing. See #2998.
+	if (typeof theme === "undefined") {
+		const box = {
+			topLeft: "+",
+			topRight: "+",
+			bottomLeft: "+",
+			bottomRight: "+",
+			horizontal: "-",
+			vertical: "|",
+			cross: "+",
+			teeDown: "+",
+			teeUp: "+",
+			teeLeft: "+",
+			teeRight: "+",
+		};
+		return {
+			cursor: ">",
+			inputCursor: "|",
+			boxRound: box,
+			boxSharp: box,
+			table: box,
+			quoteBorder: "|",
+			hrChar: "-",
+			colorSwatch: "[]",
+			spinnerFrames: ["-", "\\", "|", "/"],
+		};
+	}
 	const preset = theme.getSymbolPreset();
 
 	return {
@@ -2340,6 +2782,7 @@ export function getSymbolTheme(): SymbolTheme {
 		table: theme.boxSharp,
 		quoteBorder: theme.md.quoteBorder,
 		hrChar: theme.md.hrChar,
+		colorSwatch: theme.md.colorSwatch,
 		spinnerFrames: theme.getSpinnerFrames("activity"),
 	};
 }
@@ -2351,6 +2794,18 @@ export function getMarkdownTheme(): MarkdownTheme {
 	if (cachedMarkdownTheme !== undefined && cachedMarkdownThemeRef === theme) {
 		return cachedMarkdownTheme;
 	}
+	// Mermaid ASCII diagrams render with the active palette so they read as
+	// content rather than raw monochrome. Roles mirror the SVG renderer's
+	// mapping; `text`/`muted`/`border`/`borderMuted`/`accent` exist in every theme.
+	const mermaidColorMode = theme.getColorMode() === "truecolor" ? "truecolor" : "ansi256";
+	const mermaidTheme = {
+		fg: theme.getColorHex("text"),
+		border: theme.getColorHex("border"),
+		line: theme.getColorHex("muted"),
+		arrow: theme.getColorHex("accent"),
+		corner: theme.getColorHex("muted"),
+		junction: theme.getColorHex("borderMuted"),
+	};
 	const markdownTheme: MarkdownTheme = {
 		heading: (text: string) => theme.fg("mdHeading", text),
 		link: (text: string) => theme.fg("mdLink", text),
@@ -2367,14 +2822,13 @@ export function getMarkdownTheme(): MarkdownTheme {
 		underline: (text: string) => theme.underline(text),
 		strikethrough: (text: string) => chalk.strikethrough(text),
 		symbols: getSymbolTheme(),
-		resolveMermaidAscii,
+		resolveMermaidAscii: (source, maxWidth) =>
+			resolveMermaidAscii(source, { maxWidth, theme: mermaidTheme, colorMode: mermaidColorMode }),
 		highlightCode: (code: string, lang?: string): string[] => {
 			const validLang = lang && nativeSupportsLanguage(lang) ? lang : undefined;
-			try {
-				return nativeHighlightCode(code, validLang, getHighlightColors(theme)).split("\n");
-			} catch {
-				return code.split("\n").map(line => theme.fg("mdCodeBlock", line));
-			}
+			const highlighted = highlightCached(code, validLang, theme);
+			if (highlighted !== null) return highlighted.split("\n");
+			return code.split("\n").map(line => theme.fg("mdCodeBlock", line));
 		},
 	};
 	cachedMarkdownTheme = markdownTheme;
@@ -2383,6 +2837,19 @@ export function getMarkdownTheme(): MarkdownTheme {
 }
 
 export function getSelectListTheme(): SelectListTheme {
+	// Guard against `theme` being undefined (pre-init or cross-module-instance
+	// plugin calls). See #2998.
+	if (typeof theme === "undefined") {
+		return {
+			selectedPrefix: (text: string) => text,
+			selectedText: (text: string) => text,
+			description: (text: string) => text,
+			scrollInfo: (text: string) => text,
+			noMatch: (text: string) => text,
+			symbols: getSymbolTheme(),
+			hovered: (text: string) => text,
+		};
+	}
 	return {
 		selectedPrefix: (text: string) => theme.fg("accent", text),
 		selectedText: (text: string) => theme.fg("accent", text),
@@ -2390,10 +2857,21 @@ export function getSelectListTheme(): SelectListTheme {
 		scrollInfo: (text: string) => theme.fg("muted", text),
 		noMatch: (text: string) => theme.fg("muted", text),
 		symbols: getSymbolTheme(),
+		hovered: (text: string) => theme.bg("selectedBg", text),
 	};
 }
 
 export function getEditorTheme(): EditorTheme {
+	// Guard against `theme` being undefined (pre-init or cross-module-instance
+	// plugin calls). See #2998.
+	if (typeof theme === "undefined") {
+		return {
+			borderColor: (text: string) => text,
+			selectList: getSelectListTheme(),
+			symbols: getSymbolTheme(),
+			hintStyle: (text: string) => text,
+		};
+	}
 	return {
 		borderColor: (text: string) => theme.fg("borderMuted", text),
 		selectList: getSelectListTheme(),
@@ -2402,14 +2880,36 @@ export function getEditorTheme(): EditorTheme {
 	};
 }
 
-export function getSettingsListTheme(): import("@oh-my-pi/pi-tui").SettingsListTheme {
+export function getSettingsListTheme(): SettingsListTheme {
+	// Plugins (e.g. pi-rtk-optimizer) may call this before `initTheme()` assigns
+	// the global `theme`, or from a separate module instance under npm-global
+	// installs where the live binding was never initialized. Fall back to plain
+	// text so the call returns a usable (unstyled) theme instead of crashing with
+	// "undefined is not an object (evaluating 'theme.fg')". See #2998.
+	if (typeof theme === "undefined") {
+		return {
+			label: (text: string) => text,
+			value: (text: string) => text,
+			description: (text: string) => text,
+			cursor: "> ",
+			hint: (text: string) => text,
+			heading: (text: string) => text,
+			section: (text: string) => text,
+			hovered: (text: string) => text,
+		};
+	}
 	return {
 		label: (text: string, selected: boolean, changed: boolean) =>
 			changed ? theme.fg("statusLineGitDirty", text) : selected ? theme.fg("accent", text) : text,
 		value: (text: string, selected: boolean, changed: boolean) =>
-			selected ? theme.fg("accent", text) : changed ? theme.fg("statusLineGitDirty", text) : theme.fg("muted", text),
+			changed ? theme.fg("statusLineGitDirty", text) : selected ? theme.fg("accent", text) : theme.fg("muted", text),
 		description: (text: string) => theme.fg("dim", text),
 		cursor: theme.fg("accent", `${theme.nav.cursor} `),
 		hint: (text: string) => theme.fg("dim", text),
+		heading: (text: string, dimmed: boolean) =>
+			dimmed ? theme.fg("dim", theme.underline(text)) : theme.fg("muted", theme.bold(theme.underline(text))),
+		section: (text: string, active: boolean) =>
+			active ? theme.fg("accent", theme.bold(text)) : theme.fg("muted", text),
+		hovered: (text: string) => theme.bg("selectedBg", text),
 	};
 }

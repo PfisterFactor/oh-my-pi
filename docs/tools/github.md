@@ -32,7 +32,10 @@
 | `reviewer` | `string[]` | No | Used only by `pr_create`; each entry becomes `--reviewer`. |
 | `assignee` | `string[]` | No | Used only by `pr_create`; each entry becomes `--assignee`. |
 | `label` | `string[]` | No | Used only by `pr_create`; each entry becomes `--label`. |
-| `query` | `string` | No | Used by all `search_*` ops. Required there. |
+| `query` | `string` | No | Used by all `search_*` ops. Required by local validation only for `search_code`; the other search ops compose it with optional date/repo/type qualifiers and send the result to GitHub. |
+| `since` | `string` | No | Lower date bound for `search_issues`, `search_prs`, `search_commits`, and `search_repos`. Accepts relative durations (`3d`, `12h`, `2w`, `2mo`, `1y`), `YYYY-MM-DD`, or an ISO datetime. Rejected for `search_code`. |
+| `until` | `string` | No | Upper date bound for `search_issues`, `search_prs`, `search_commits`, and `search_repos`. Same formats as `since`. Rejected for `search_code`. |
+| `dateField` | `"created" \| "updated"` | No | Date qualifier field for issue/PR/repo search. Defaults to `created`; repo search maps `updated` to GitHub's `pushed:` qualifier. Ignored for commit search, which always uses `committer-date:`. |
 | `limit` | `number` | No | Used by all `search_*` ops. Defaults to `10`, floored, clamped to `50`, and must be `> 0`. |
 | `run` | `string` | No | Used only by `run_watch`. Must be a numeric run ID or full GitHub Actions run URL. |
 | `tail` | `number` | No | Used only by `run_watch`. Defaults to `15`, floored, clamped to `200`, and must be `> 0`. |
@@ -61,12 +64,12 @@ The tool returns a single text result built by `buildTextResult()` in `packages/
    - maps common auth/repo-context failures into tool-facing `ToolError` messages;
    - `json()` rejects empty or invalid JSON.
 5. Read-style ops (`repo_view`, `search_*`) fetch JSON and format Markdown-like text summaries. Single-issue and single-PR views were moved out of the tool and now resolve through the `issue://` / `pr://` internal URL schemes, which share the same SQLite cache.
-7. PR diffs moved out of the tool. `pr://<N>/diff` lists changed files, `pr://<N>/diff/<i>` slices a single file, and `pr://<N>/diff/all` returns the full unified diff — see `docs/tools/read.md`. All three variants share one `gh pr diff` invocation through the `pr-diff` cache row.
-8. `pr_checkout` resolves PR metadata first, then enters `git.withRepoLock()` before any git mutation so parallel checkout calls for the same primary repo do not race on shared `.git` state.
-9. `pr_push` reads PR head metadata back from git branch config, derives a refspec, then pushes with `git.push()`.
-10. `pr_create` shells out once, then best-effort re-reads the created PR for a richer summary.
-11. `run_watch` chooses either run mode (`run` supplied) or commit mode (`run` omitted), polls GitHub Actions APIs every 3 seconds, emits streaming updates, and may save a full failed-log artifact before returning.
-12. Final text goes through `toolResult().text(...)`; if `session.allocateOutputArtifact()` returns a slot, failed-log text is persisted with `Bun.write()`.
+6. PR diffs moved out of the tool. `pr://<N>/diff` lists changed files, `pr://<N>/diff/<i>` slices a single file, and `pr://<N>/diff/all` returns the full unified diff — see `docs/tools/read.md`. All three variants share one `gh pr diff` invocation through the `pr-diff` cache row.
+7. `pr_checkout` resolves PR metadata first, then enters `git.withRepoLock()` before any git mutation so parallel checkout calls for the same primary repo do not race on shared `.git` state.
+8. `pr_push` reads PR head metadata back from git branch config, derives a refspec, pushes with `git.push()`, then invalidates the cached `pr://` rows for the pushed PR via `invalidateAllForNumber()` so the next `pr://` read reflects the push.
+9. `pr_create` shells out once, then best-effort re-reads the created PR for a richer summary.
+10. `run_watch` chooses either run mode (`run` supplied) or commit mode (`run` omitted), polls GitHub Actions APIs every 3 seconds for the first minute and every 15 seconds after that, emits streaming updates, and may save a full failed-log artifact before returning.
+11. Final text goes through `toolResult().text(...)`; if `session.allocateOutputArtifact()` returns a slot, failed-log text is persisted with `Bun.write()`.
 
 ## Modes / Variants
 
@@ -107,11 +110,11 @@ Branches:
 | Optional fields | `repo`, `pr`, `force` |
 | `gh` command | For each requested PR: `gh pr view [<pr>] [--repo <repo>] --json <GH_PR_CHECKOUT_FIELDS>`; cross-repo PRs may also call `gh repo view <headRepository> --json <GH_REPO_CLONE_FIELDS>`. |
 | Batching | Yes. `pr` may be `string[]`; each PR is resolved in parallel, but git mutations are serialized per primary repo by `git.withRepoLock()`. |
-| Output | Single PR: checkout/worktree summary plus `details.repo`, `details.branch`, `details.worktreePath`, `details.remote`, `details.remoteBranch`, `details.checkouts`. Batched: `# <n> Pull Request Worktrees (...)` plus one section per PR and aggregated `details.checkouts`. |
+| Output | Single PR: checkout/worktree summary plus `details.repo`, `details.branch`, `details.worktreePath`, `details.remote`, `details.remoteBranch`, `details.checkouts`. Batched: `# <n> Pull Request Worktrees (...)` plus one section per PR and aggregated `details.checkouts`. On partial failure the header becomes `# <n>/<total> Pull Request Worktrees checked out (<k> failed)` with a trailing `## Failed` list. |
 
 Worktree and metadata behavior:
 - Local branch name is always `pr-<number>`.
-- Worktree path is `path.join(getWorktreesDir(), encodeRepoPathForFilesystem(primaryRepoRoot), localBranch)`, where `getWorktreesDir()` is `~/.omp/wt`; effective path is `~/.omp/wt/<encoded-primary-repo-root>/pr-<number>`.
+- Worktree path is `getWorktreeDir("<number>-<repo-hash>")` = `path.join(getWorktreesDir(), "<number>-<repo-hash>")`, where `getWorktreesDir()` is `~/.omp/wt`, `<number>` is the PR number, and `<repo-hash>` is `hashPath(primaryRepoRoot)` (a 7-hex digest of the primary repo root); effective path is `~/.omp/wt/<number>-<repo-hash>`. `resolveAvailableWorktreePath()` appends a `-2`/`-3`… suffix when that path is already registered with git or present on disk.
 - Existing worktree detection is by branch ref `refs/heads/pr-<number>` from `git.worktree.list()`.
 - New worktree creation calls `git.worktree.add(repoRoot, finalWorktreePath, localBranch, { signal })` after verifying the path is neither already registered nor already present on disk.
 - For same-repo PRs, remote is `origin`. For cross-repo PRs, the tool resolves a clone URL for the head repo, reuses an existing remote with the same URL when possible, or creates `fork-<owner>` / `fork-<owner>-<n>`.
@@ -142,21 +145,21 @@ Push target resolution reads the `branch.<name>.ompPrHeadRef`, `pushRemote`/`rem
 
 | Aspect | Value |
 | --- | --- |
-| Required fields | `op`, `query` |
-| Optional fields | `repo`, `limit` |
-| `gh` command | `gh api -X GET /search/issues -f q="<query> [repo:<repo>] is:issue" -F per_page=<limit>` |
+| Required fields | `op` |
+| Optional fields | `repo`, `query`, `limit`, `since`, `until`, `dateField` |
+| `gh` command | `gh api -X GET /search/issues -f q="<query> [date qualifier] [repo:<repo>] is:issue" -F per_page=<limit>` |
 | Batching | None |
 | Output | `# GitHub issues search`, echoed query, optional repo, result count, then one bullet per issue with repo/state/author/labels/timestamps/URL. |
 
-`repo` defaults to the current checkout's `owner/repo` via `resolveSearchRepoScope()` when omitted. The default is suppressed when the query already contains a leading `repo:`/`org:`/`user:`/`owner:` qualifier or when `gh repo view` fails to resolve the current checkout (e.g. outside a github remote).
+`repo` defaults to the current checkout's `owner/repo` via `resolveSearchRepoScope()` when omitted. The default is suppressed when the composed query already contains a leading `repo:`/`org:`/`user:`/`owner:` qualifier or when `gh repo view` fails to resolve the current checkout (e.g. outside a github remote).
 
 ### `search_prs`
 
 | Aspect | Value |
 | --- | --- |
-| Required fields | `op`, `query` |
-| Optional fields | `repo`, `limit` |
-| `gh` command | `gh api -X GET /search/issues -f q="<query> [repo:<repo>] is:pr" -F per_page=<limit>` |
+| Required fields | `op` |
+| Optional fields | `repo`, `query`, `limit`, `since`, `until`, `dateField` |
+| `gh` command | `gh api -X GET /search/issues -f q="<query> [date qualifier] [repo:<repo>] is:pr" -F per_page=<limit>` |
 | Batching | None |
 | Output | Same shape as `search_issues`, labeled as pull requests. |
 
@@ -172,15 +175,15 @@ Push target resolution reads the `branch.<name>.ompPrHeadRef`, `pushRemote`/`rem
 | Batching | None |
 | Output | `# GitHub code search`, result count, then one bullet per match with path, repo, short commit SHA, URL, and first normalized text-match fragment line when present. |
 
-`repo` defaults to the current checkout's `owner/repo` as in `search_issues`.
+`repo` defaults to the current checkout's `owner/repo` as in `search_issues`. `since` and `until` are explicitly rejected for this op because GitHub code search has no supported date qualifier.
 
 ### `search_commits`
 
 | Aspect | Value |
 | --- | --- |
-| Required fields | `op`, `query` |
-| Optional fields | `repo`, `limit` |
-| `gh` command | `gh api -X GET /search/commits -f q="<query> [repo:<repo>]" -F per_page=<limit>` |
+| Required fields | `op` |
+| Optional fields | `repo`, `query`, `limit`, `since`, `until`, `dateField` (accepted but ignored; commit searches use `committer-date`) |
+| `gh` command | `gh api -X GET /search/commits -f q="<query> [committer-date qualifier] [repo:<repo>]" -F per_page=<limit>` |
 | Batching | None |
 | Output | `# GitHub commits search`, result count, then one bullet per commit: short SHA + first commit-message line, repo, author, date, URL. |
 
@@ -190,13 +193,13 @@ Push target resolution reads the `branch.<name>.ompPrHeadRef`, `pushRemote`/`rem
 
 | Aspect | Value |
 | --- | --- |
-| Required fields | `op`, `query` |
-| Optional fields | `limit` |
-| `gh` command | `gh api -X GET /search/repositories -f q="<query>" -F per_page=<limit>` |
+| Required fields | `op` |
+| Optional fields | `query`, `limit`, `since`, `until`, `dateField` |
+| `gh` command | `gh api -X GET /search/repositories -f q="<query> [date qualifier]" -F per_page=<limit>` |
 | Batching | None |
 | Output | `# GitHub repositories search`, result count, then one bullet per repo with first description line, language, stars, forks, open issues, visibility, archive/fork flags, updated time, URL. |
 
-`repo` is intentionally not used for this op.
+`repo` is intentionally not used for this op. If `query`, `since`, and `until` are all omitted, the tool sends an empty GitHub repository-search query and the GitHub API may reject it.
 
 ### `run_watch`
 
@@ -210,7 +213,7 @@ Push target resolution reads the `branch.<name>.ompPrHeadRef`, `pushRemote`/`rem
 
 Watch flow:
 - `run` parsing accepts either a decimal run ID or a full run URL. URL repo must match explicit `repo` when both are given.
-- Poll interval is fixed at 3 seconds (`RUN_WATCH_INTERVAL_DEFAULT`).
+- Poll interval is `3` seconds (`RUN_WATCH_INTERVAL_DEFAULT`) for the first `60` seconds of the watch (`RUN_WATCH_FAST_WINDOW_MS`), then `15` seconds (`RUN_WATCH_INTERVAL_SLOW`). Rate-limited poll errors back off at the slow interval and are retried up to `5` consecutive failures (`RUN_WATCH_MAX_POLL_FAILURES`). Commit mode gives up with a clear message after `90` seconds if no runs ever appear (`RUN_WATCH_NO_RUNS_GIVE_UP_MS`).
 - Failure grace period is fixed at 5 seconds (`RUN_WATCH_GRACE_DEFAULT`). When any failed job appears before completion, the tool emits a note, waits once, re-fetches state, then collects logs so concurrent failures are included.
 - Failed-job logs are fetched with `gh api /repos/<repo>/actions/jobs/<jobId>/logs` via `git.github.run()`, not `json()`. Non-zero exit leaves `available: false` instead of failing the whole watch.
 - Inline result includes only the last `tail` lines per failed job. The saved artifact contains full logs (`mode: "full"`).
@@ -220,7 +223,7 @@ Watch flow:
 ## Side Effects
 - Filesystem
   - `pr_create` may create a temp dir under `os.tmpdir()` named `gh-pr-body-*`, write `body.md`, then remove the dir in `finally`.
-  - `pr_checkout` may create directories under `~/.omp/wt/<encoded-primary-repo-root>/` and add git worktrees there.
+  - `pr_checkout` may create worktree directories named `<pr-number>-<repo-hash>` directly under `~/.omp/wt/` and add git worktrees there.
   - `run_watch` may write a session artifact with full failed-job logs.
 - Network
   - Every op shells out to `gh`, which then talks to GitHub APIs except `pr_push`.
@@ -242,14 +245,14 @@ Watch flow:
 - Search result default: `10` (`SEARCH_LIMIT_DEFAULT` in `packages/coding-agent/src/tools/gh.ts`).
 - Search result max: `50` (`SEARCH_LIMIT_MAX`).
 - PR file preview inside the `pr://` view: first `50` files only (`FILE_PREVIEW_LIMIT` in `gh.ts`).
-- Run-watch poll interval: `3s` (`RUN_WATCH_INTERVAL_DEFAULT`).
+- Run-watch poll interval: `3s` for the first `60s`, then `15s` (`RUN_WATCH_INTERVAL_DEFAULT`, `RUN_WATCH_FAST_WINDOW_MS`, `RUN_WATCH_INTERVAL_SLOW`); commit mode with no runs gives up after `90s` (`RUN_WATCH_NO_RUNS_GIVE_UP_MS`); up to `5` consecutive rate-limited poll failures are tolerated (`RUN_WATCH_MAX_POLL_FAILURES`).
 - Run-watch failure grace period: `5s` (`RUN_WATCH_GRACE_DEFAULT`).
 - Run-watch failed-log tail default: `15` lines (`RUN_WATCH_TAIL_DEFAULT`).
 - Run-watch failed-log tail max: `200` lines (`RUN_WATCH_TAIL_MAX`).
 - PR review comments page size: `100` (`REVIEW_COMMENTS_PAGE_SIZE`).
 - Actions jobs page size: `100` (`RUN_JOBS_PAGE_SIZE`).
 - Search and tail numeric inputs are floored with `Math.floor()`, clamped to the max, and rejected when non-finite or `<= 0`.
-- `pr_checkout` batch fan-out is unbounded in tool code; all requested PRs are launched with `Promise.all()`.
+- `pr_checkout` batch fan-out is unbounded in tool code; all requested PRs are launched with `Promise.allSettled()` so individual failures surface as a partial result instead of aborting the batch.
 
 ## Errors
 - Tool creation is skipped entirely when `gh` is not installed.
@@ -260,8 +263,9 @@ Watch flow:
   - otherwise stderr/stdout text, or fallback `GitHub CLI command failed: gh ...`
 - `json()` also throws on empty stdout or invalid JSON.
 - Local validation errors throw `ToolError`, including:
-  - missing required per-op fields (`query`, `title unless fill=true`)
+  - missing required per-op fields (`query` for `search_code`, `title unless fill=true`)
   - invalid numeric `limit` / `tail`
+  - invalid `since` / `until` date bound
   - invalid `run` format
   - `fill` combined with `title` or `body`
   - missing git repo / branch / HEAD context for checkout, push, or watch

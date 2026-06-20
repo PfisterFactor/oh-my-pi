@@ -1,9 +1,9 @@
-import { afterEach, beforeEach, describe, expect, test, vi } from "bun:test";
+import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, test, vi } from "bun:test";
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
-import type { Model } from "@oh-my-pi/pi-ai";
 import * as ai from "@oh-my-pi/pi-ai";
+import { Effort, type Model } from "@oh-my-pi/pi-ai";
 import { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
 import {
 	buildMemoryToolDeveloperInstructions,
@@ -11,7 +11,7 @@ import {
 	startMemoryStartupTask,
 } from "@oh-my-pi/pi-coding-agent/memories";
 import * as memoryStorage from "@oh-my-pi/pi-coding-agent/memories/storage";
-import { getAgentDbPath, Snowflake } from "@oh-my-pi/pi-utils";
+import { getAgentDbPath, Snowflake, TempDir } from "@oh-my-pi/pi-utils";
 
 interface SessionFixture {
 	agentDir: string;
@@ -21,14 +21,22 @@ interface SessionFixture {
 	session: any;
 	modelRegistry: any;
 	model: Model;
+	whenSettled: Promise<void>;
 }
 
-const createdDirs = new Set<string>();
+let sharedRoot: TempDir | undefined;
 
+function deferred(): { promise: Promise<void>; resolve: () => void } {
+	let resolve!: () => void;
+	const promise = new Promise<void>(res => {
+		resolve = res;
+	});
+	return { promise, resolve };
+}
 async function makeTempDir(prefix: string): Promise<string> {
-	const dir = path.join(os.tmpdir(), `${prefix}-${Snowflake.next()}`);
+	const base = sharedRoot?.path() ?? os.tmpdir();
+	const dir = path.join(base, `${prefix}-${Snowflake.next()}`);
 	await fs.mkdir(dir, { recursive: true });
-	createdDirs.add(dir);
 	return dir;
 }
 
@@ -46,6 +54,7 @@ function createModelRegistry(model: Model): any {
 		find: vi.fn(() => model),
 		getAll: vi.fn(() => [model]),
 		getApiKey: vi.fn(async () => "test-api-key"),
+		resolver: vi.fn(() => async () => "test-api-key"),
 	};
 }
 
@@ -66,7 +75,10 @@ async function createFixture(overrides?: Partial<Record<string, unknown>>): Prom
 	});
 	const model = createModel();
 	const modelRegistry = createModelRegistry(model);
-	const refreshBaseSystemPrompt = vi.fn(async () => undefined);
+	const settled = deferred();
+	const refreshBaseSystemPrompt = vi.fn(async () => {
+		settled.resolve();
+	});
 	const session = {
 		sessionManager: {
 			getSessionFile: () => sessionFile,
@@ -80,23 +92,38 @@ async function createFixture(overrides?: Partial<Record<string, unknown>>): Prom
 		refreshBaseSystemPrompt,
 	};
 
-	return { agentDir, sessionDir, sessionFile, settings, session, modelRegistry, model };
+	return { agentDir, sessionDir, sessionFile, settings, session, modelRegistry, model, whenSettled: settled.promise };
 }
 
-async function waitFor(assertion: () => Promise<void> | void, timeoutMs = 3000): Promise<void> {
-	const start = Date.now();
-	let lastError: unknown;
-	while (Date.now() - start < timeoutMs) {
-		try {
-			await assertion();
-			return;
-		} catch (error) {
-			lastError = error;
-		}
-		await Bun.sleep(20);
+// Resolve any already-scheduled microtasks/macrotasks without a fixed wall delay.
+const flushAsync = (): Promise<void> => new Promise<void>(resolve => setTimeout(resolve, 0));
+
+// Await the pipeline's completion signal (its final `refreshBaseSystemPrompt`)
+// instead of polling, racing a generous timeout so a stalled regression fails
+// loudly rather than hanging.
+async function settle(promise: Promise<void>, label: string, timeoutMs = 3000): Promise<void> {
+	let timer: Timer | undefined;
+	const timeout = new Promise<never>((_, reject) => {
+		timer = setTimeout(() => reject(new Error(`Timed out waiting for ${label}`)), timeoutMs);
+	});
+	try {
+		await Promise.race([promise, timeout]);
+	} finally {
+		if (timer) clearTimeout(timer);
 	}
-	throw lastError;
 }
+
+beforeAll(async () => {
+	sharedRoot = await TempDir.create(`memories-runtime-${Snowflake.next()}`);
+});
+
+afterAll(async () => {
+	if (sharedRoot) {
+		await Bun.sleep(0);
+		await sharedRoot.remove();
+	}
+	sharedRoot = undefined;
+});
 
 describe("memories runtime", () => {
 	let savedXdgData: string | undefined;
@@ -116,10 +143,6 @@ describe("memories runtime", () => {
 		vi.restoreAllMocks();
 		process.env.XDG_DATA_HOME = savedXdgData;
 		process.env.XDG_STATE_HOME = savedXdgState;
-		for (const dir of createdDirs) {
-			await fs.rm(dir, { recursive: true, force: true });
-		}
-		createdDirs.clear();
 	});
 
 	test("startup gating skips when disabled or subagent depth", async () => {
@@ -160,7 +183,7 @@ describe("memories runtime", () => {
 			taskDepth: 0,
 		});
 
-		await Bun.sleep(50);
+		await flushAsync();
 		expect(stage1Spy).not.toHaveBeenCalled();
 	});
 
@@ -173,7 +196,8 @@ describe("memories runtime", () => {
 		];
 		await fs.writeFile(rolloutPath, `${rolloutRows.map(row => JSON.stringify(row)).join("\n")}\n`);
 
-		vi.spyOn(ai, "completeSimple")
+		const completeSpy = vi
+			.spyOn(ai, "completeSimple")
 			.mockResolvedValueOnce({
 				stopReason: "end_turn",
 				content: [
@@ -211,21 +235,93 @@ describe("memories runtime", () => {
 		});
 
 		const memoryRoot = getMemoryRoot(fx.agentDir, fx.session.sessionManager.getCwd());
-		await waitFor(async () => {
-			expect((await fs.readFile(path.join(memoryRoot, "MEMORY.md"), "utf8")).trim()).toBe(
-				"# Memory\n\nConsolidated body",
-			);
-			expect((await fs.readFile(path.join(memoryRoot, "memory_summary.md"), "utf8")).trim()).toBe(
-				"Consolidated summary",
-			);
-			expect(
-				(await fs.readFile(path.join(memoryRoot, "skills", "deploy-playbook", "SKILL.md"), "utf8")).trim(),
-			).toBe("# Deploy\nUse blue/green.");
-		});
-
+		await settle(fx.whenSettled, "phase1->phase2 pipeline");
+		expect((await fs.readFile(path.join(memoryRoot, "MEMORY.md"), "utf8")).trim()).toBe(
+			"# Memory\n\nConsolidated body",
+		);
+		expect((await fs.readFile(path.join(memoryRoot, "memory_summary.md"), "utf8")).trim()).toBe(
+			"Consolidated summary",
+		);
+		expect((await fs.readFile(path.join(memoryRoot, "skills", "deploy-playbook", "SKILL.md"), "utf8")).trim()).toBe(
+			"# Deploy\nUse blue/green.",
+		);
 		expect(fx.session.refreshBaseSystemPrompt).toHaveBeenCalledTimes(1);
 		expect(ai.completeSimple).toHaveBeenCalled();
 		expect(ai.completeSimple).toHaveBeenCalledTimes(2);
+		const phase2Prompt = completeSpy.mock.calls[1]?.[1];
+		expect(phase2Prompt?.systemPrompt?.[0]).toContain("memory-stage-two consolidator");
+	});
+
+	test("clamps stage1 and phase2 reasoning effort against the model's supported range", async () => {
+		// Regression for #1480: memory pipeline hardcoded `Effort.Low`/`Effort.Medium`,
+		// which `requireSupportedEffort` rejects on models whose supported range starts
+		// above `low` (e.g. deepseek-v4-pro → [high, xhigh]). The fix routes both call
+		// sites through `clampThinkingLevelForModel`, lifting the requested effort to
+		// the model's floor instead of throwing.
+		const fx = await createFixture();
+		const constrainedModel: Model = {
+			...fx.model,
+			reasoning: true,
+			thinking: { mode: "effort", efforts: [Effort.High, Effort.XHigh] },
+		};
+		fx.session.model = constrainedModel;
+		fx.modelRegistry.find = vi.fn(() => constrainedModel);
+		fx.modelRegistry.getAll = vi.fn(() => [constrainedModel]);
+
+		const rolloutPath = path.join(fx.sessionDir, "thread-constrained.jsonl");
+		const rolloutRows = [
+			{ type: "session", id: "thread-constrained", cwd: fx.agentDir },
+			{ type: "message", message: { role: "user", content: "summarize this rollout" } },
+		];
+		await fs.writeFile(rolloutPath, `${rolloutRows.map(row => JSON.stringify(row)).join("\n")}\n`);
+
+		const spy = vi
+			.spyOn(ai, "completeSimple")
+			.mockResolvedValueOnce({
+				stopReason: "end_turn",
+				content: [
+					{
+						type: "text",
+						text: JSON.stringify({
+							rollout_summary: "Rollout summary",
+							rollout_slug: "thread-constrained",
+							raw_memory: "Raw memory",
+						}),
+					},
+				],
+				usage: { input: 1, output: 1, cacheRead: 0, cacheWrite: 0, totalTokens: 2 },
+			} as any)
+			.mockResolvedValueOnce({
+				stopReason: "end_turn",
+				content: [
+					{
+						type: "text",
+						text: JSON.stringify({
+							memory_md: "# Memory\n\nBody",
+							memory_summary: "Summary",
+							skills: [],
+						}),
+					},
+				],
+			} as any);
+
+		startMemoryStartupTask({
+			session: fx.session,
+			settings: fx.settings,
+			modelRegistry: fx.modelRegistry,
+			agentDir: fx.agentDir,
+			taskDepth: 0,
+		});
+
+		const memoryRoot = getMemoryRoot(fx.agentDir, fx.session.sessionManager.getCwd());
+		await settle(fx.whenSettled, "effort-clamp pipeline");
+		expect((await fs.readFile(path.join(memoryRoot, "MEMORY.md"), "utf8")).trim()).toBe("# Memory\n\nBody");
+
+		expect(spy).toHaveBeenCalledTimes(2);
+		// stage1 requested `low`, phase2 requested `medium`; both must clamp up to the
+		// model's floor (`high`) instead of being passed through and throwing.
+		expect(spy.mock.calls[0]?.[2]?.reasoning).toBe(Effort.High);
+		expect(spy.mock.calls[1]?.[2]?.reasoning).toBe(Effort.High);
 	});
 
 	test("phase2 sync prunes stale summaries and preserves raw memory ordering", async () => {
@@ -284,13 +380,12 @@ describe("memories runtime", () => {
 			taskDepth: 0,
 		});
 
-		await waitFor(async () => {
-			const files = await fs.readdir(path.join(memoryRoot, "rollout_summaries"));
-			expect(files.includes("old.md")).toBe(false);
-			expect(files).toEqual(expect.arrayContaining(["thread-a-alpha.md", "thread-b-beta.md"]));
-			const raw = await fs.readFile(path.join(memoryRoot, "raw_memories.md"), "utf8");
-			expect(raw.indexOf("## thread-b")).toBeLessThan(raw.indexOf("## thread-a"));
-		});
+		await settle(fx.whenSettled, "phase2 sync/prune");
+		const files = await fs.readdir(path.join(memoryRoot, "rollout_summaries"));
+		expect(files.includes("old.md")).toBe(false);
+		expect(files).toEqual(expect.arrayContaining(["thread-a-alpha.md", "thread-b-beta.md"]));
+		const raw = await fs.readFile(path.join(memoryRoot, "raw_memories.md"), "utf8");
+		expect(raw.indexOf("## thread-b")).toBeLessThan(raw.indexOf("## thread-a"));
 	});
 
 	test("phase2 empty-input cleanup removes consolidated files and skills dir", async () => {
@@ -315,14 +410,13 @@ describe("memories runtime", () => {
 			taskDepth: 0,
 		});
 
-		await waitFor(async () => {
-			expect(await Bun.file(path.join(memoryRoot, "MEMORY.md")).exists()).toBe(false);
-			expect(await Bun.file(path.join(memoryRoot, "memory_summary.md")).exists()).toBe(false);
-			expect(await Bun.file(path.join(memoryRoot, "skills")).exists()).toBe(false);
-			expect((await fs.readFile(path.join(memoryRoot, "raw_memories.md"), "utf8")).trim()).toBe(
-				"# Raw Memories\n\nNo raw memories yet.",
-			);
-		});
+		await settle(fx.whenSettled, "phase2 empty-input cleanup");
+		expect(await Bun.file(path.join(memoryRoot, "MEMORY.md")).exists()).toBe(false);
+		expect(await Bun.file(path.join(memoryRoot, "memory_summary.md")).exists()).toBe(false);
+		expect(await Bun.file(path.join(memoryRoot, "skills")).exists()).toBe(false);
+		expect((await fs.readFile(path.join(memoryRoot, "raw_memories.md"), "utf8")).trim()).toBe(
+			"# Raw Memories\n\nNo raw memories yet.",
+		);
 	});
 });
 
@@ -341,10 +435,6 @@ describe("buildMemoryToolDeveloperInstructions", () => {
 		vi.restoreAllMocks();
 		process.env.XDG_DATA_HOME = savedXdgData;
 		process.env.XDG_STATE_HOME = savedXdgState;
-		for (const dir of createdDirs) {
-			await fs.rm(dir, { recursive: true, force: true });
-		}
-		createdDirs.clear();
 	});
 
 	test("returns undefined for missing or empty summaries", async () => {

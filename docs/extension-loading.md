@@ -28,39 +28,48 @@ Extension loading builds a list of module entry files, imports each module with 
 
 `discoverAndLoadExtensions()` first asks discovery providers for `extension-module` capability items, then keeps only provider `native` items.
 
-Effective native locations:
+Native `extension-module` discovery comes from:
 
-- Project: `<cwd>/.omp/extensions`
-- User: `~/.omp/agent/extensions`
+- Project directory: `<cwd>/.omp/extensions`
+- User directory: `~/.omp/agent/extensions`
+- Native legacy/settings JSON entries: `<cwd>/.omp/settings.json#extensions` and `~/.omp/agent/settings.json#extensions`
 
-Path roots come from the native provider (`SOURCE_PATHS.native`).
+The project root is the native provider's `.omp` directory (`SOURCE_PATHS.native.projectDir`), cwd-only; it does not walk ancestors. The user root is the active profile's agent directory via `getAgentDir()`, so under `omp --profile <name>` it becomes `~/.omp/profiles/<name>/agent/extensions` (and it honors `PI_CODING_AGENT_DIR`). See [Profiles](./config-usage.md#profiles).
 
 Notes:
 
 - Native auto-discovery is currently `.omp` based.
-- Legacy `.pi` is still accepted in `package.json` manifest keys (`pi.extensions`), but not as a native root here.
+- Legacy `.pi` is still accepted in package manifests (`pi.extensions`) and project override lookup, but `.pi/extensions` is not a native root here.
 
-### 2) Installed plugin extension entries
+### 2) Discovered JS/TS hook factories
 
-After native auto-discovery, `discoverAndLoadExtensions()` appends extension entry points from enabled installed plugins via `getAllPluginExtensionPaths(cwd)`.
+After native auto-discovery, `discoverAndLoadExtensions()` also appends JS/TS hook factories from the `hook` capability — any hook whose entry path is a `.ts`/`.js` file — so they load through the same module pipeline.
+
+Hook-capability loading already applies its own hook-specific disabled ids, so these paths are not additionally filtered by `disabledExtensions` extension-module names.
+
+### 3) Installed plugin extension entries
+
+After hook discovery, `discoverAndLoadExtensions()` appends extension entry points from enabled installed plugins via `getAllPluginExtensionPaths(cwd)`.
 
 Plugin extension entries come from package `omp.extensions` / `pi.extensions` manifests, including enabled feature entries.
 
-### 3) Explicitly configured paths
+### 4) Explicitly configured paths
 
 After plugin extension entries, configured paths are appended and resolved.
 
 Configured path sources in the main session startup path (`sdk.ts`):
 
 1. CLI-provided paths (`--extension/-e`, and `--hook` is also treated as an extension path)
-2. Settings `extensions` array (merged global + project settings)
+2. Merged settings `extensions` array
 
-Global settings file:
+Settings files:
 
-- `~/.omp/agent/config.yml` (or custom agent dir via `PI_CODING_AGENT_DIR`)
+- User: `~/.omp/agent/config.yml` (or custom agent dir via `PI_CODING_AGENT_DIR`)
+- Project/native settings capability: `<cwd>/.omp/config.yml` and `<cwd>/.omp/settings.json`
 
-Project settings file:
+Native extension-module discovery also reads legacy JSON extension lists from:
 
+- `~/.omp/agent/settings.json`
 - `<cwd>/.omp/settings.json`
 
 Examples:
@@ -160,8 +169,9 @@ Rules and constraints:
 Order:
 
 1. Native auto-discovered modules
-2. Installed plugin extension entries
-3. Explicit configured paths (in provided order)
+2. Discovered JS/TS hook factories
+3. Installed plugin extension entries
+4. Explicit configured paths (in provided order)
 
 In `sdk.ts`, configured order is:
 
@@ -180,10 +190,11 @@ Implication: if the same module path is both auto-discovered and explicitly conf
 
 ## Module import and factory contract
 
-Each candidate path is loaded with dynamic import:
+Each candidate path is loaded via `loadLegacyPiModule()` (`src/extensibility/plugins/legacy-pi-compat.ts`):
 
-- `await import(resolvedPath)`
-- factory is `module.default ?? module`
+- the entry's realpath is resolved, then dynamically imported with an `?mtime` cache-buster so edited source reloads
+- a scoped Bun `onLoad` hook rewrites legacy pi-package specifiers (`@mariozechner/*`, `@earendil-works/*`) and bare `@sinclair/typebox` onto the host-bundled copies before evaluation
+- factory is selected by `getExtensionFactory(module)`: the module itself if it is a function, otherwise `module.default`
 - factory must be a function (`ExtensionFactory`)
 
 If export is not a function, that path fails with a structured error and loading continues.

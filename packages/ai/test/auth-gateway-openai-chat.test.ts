@@ -1,6 +1,6 @@
 import { describe, expect, it } from "bun:test";
-import { encodeResponse, encodeStream, parseRequest } from "../src/providers/openai-chat-server";
-import type { AssistantMessage, AssistantMessageEvent, AssistantMessageEventStream } from "../src/types";
+import { encodeResponse, encodeStream, parseRequest } from "@oh-my-pi/pi-ai/providers/openai-chat-server";
+import type { AssistantMessage, AssistantMessageEvent, AssistantMessageEventStream } from "@oh-my-pi/pi-ai/types";
 
 function makeEventStream(events: AssistantMessageEvent[], final: AssistantMessage): AssistantMessageEventStream {
 	async function* iter() {
@@ -167,7 +167,7 @@ describe("auth-gateway openai-chat: parseRequest", () => {
 			],
 		});
 		const tool = parsed.context.messages.find(m => m.role === "toolResult");
-		if (!tool || tool.role !== "toolResult") throw new Error("expected toolResult");
+		if (tool?.role !== "toolResult") throw new Error("expected toolResult");
 		expect(tool.toolName).toBe("submit_move");
 	});
 
@@ -184,7 +184,7 @@ describe("auth-gateway openai-chat: parseRequest", () => {
 			],
 		});
 		const tool = parsed.context.messages.find(m => m.role === "toolResult");
-		if (!tool || tool.role !== "toolResult") throw new Error("expected toolResult");
+		if (tool?.role !== "toolResult") throw new Error("expected toolResult");
 		expect(tool.toolName).toBe("submit_move");
 	});
 
@@ -198,7 +198,7 @@ describe("auth-gateway openai-chat: parseRequest", () => {
 			],
 		});
 		const tool = parsed.context.messages.find(m => m.role === "toolResult");
-		if (!tool || tool.role !== "toolResult") throw new Error("expected toolResult");
+		if (tool?.role !== "toolResult") throw new Error("expected toolResult");
 		expect(tool.toolName).toBe("");
 	});
 });
@@ -342,5 +342,31 @@ describe("auth-gateway openai-chat: encodeStream", () => {
 		expect(lines).toHaveLength(2); // role chunk + error envelope
 		const payloads = lines.map(parseSseLine) as Array<Record<string, unknown>>;
 		expect(payloads[1]).toEqual({ error: { message: "upstream went away", type: "upstream_error" } });
+	});
+
+	it("aborts the upstream gateway request when the client cancels the response body", async () => {
+		const aborted: unknown[] = [];
+		async function* neverEndingEvents() {
+			await new Promise(() => {});
+		}
+		const events = neverEndingEvents() as unknown as AssistantMessageEventStream;
+		(events as { result(): Promise<AssistantMessage> }).result = async () => emptyAssistant();
+		const requestController = new AbortController();
+		const stream = encodeStream(events, "gpt-test", undefined, {
+			signal: requestController.signal,
+			onCancel(reason) {
+				aborted.push(reason);
+				requestController.abort(reason);
+			},
+		});
+		const reader = stream.getReader();
+
+		const firstChunk = await reader.read();
+		expect(firstChunk.done).toBe(false);
+		await reader.cancel("client timeout");
+
+		expect(aborted).toEqual(["client timeout"]);
+		expect(requestController.signal.aborted).toBe(true);
+		expect(requestController.signal.reason).toBe("client timeout");
 	});
 });

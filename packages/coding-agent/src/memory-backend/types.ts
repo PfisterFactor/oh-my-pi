@@ -1,7 +1,7 @@
 /**
  * Memory backend abstraction.
  *
- * Backends are mutually exclusive — `resolveMemoryBackend(settings)` returns
+ * Backends are mutually exclusive — `await resolveMemoryBackend(settings)` returns
  * exactly one. Implementations MUST be self-contained: they own the per-session
  * state they create in `start()` and tear it down on `clear()`.
  */
@@ -10,9 +10,77 @@ import type { AgentMessage } from "@oh-my-pi/pi-agent-core";
 import type { ModelRegistry } from "../config/model-registry";
 import type { Settings } from "../config/settings";
 import type { HindsightSessionState } from "../hindsight/state";
+import type { MnemopiSessionState } from "../mnemopi/state";
 import type { AgentSession } from "../session/agent-session";
 
-export type MemoryBackendId = "off" | "local" | "hindsight";
+export type MemoryBackendId = "off" | "local" | "hindsight" | "mnemopi";
+
+export interface MemoryBackendStatus {
+	backend: MemoryBackendId;
+	active: boolean;
+	writable: boolean;
+	searchable: boolean;
+	scope?: string;
+	retainBank?: string;
+	recallBanks?: string[];
+	workingCount?: number;
+	episodicCount?: number;
+	tripleCount?: number;
+	lastMemory?: string;
+	lastRecall?: boolean;
+	database?: string;
+	message?: string;
+	error?: string;
+}
+
+export interface MemoryBackendSearchOptions {
+	limit?: number;
+	/** Best-effort abort signal. Backends may only observe it before/after an underlying recall call. */
+	signal?: AbortSignal;
+}
+
+export interface MemoryBackendSearchItem {
+	id?: string;
+	content: string;
+	source?: string;
+	timestamp?: string;
+	score?: number;
+}
+
+export interface MemoryBackendSearchResult {
+	backend: MemoryBackendId;
+	query: string;
+	count: number;
+	items: MemoryBackendSearchItem[];
+	message?: string;
+}
+
+export interface MemoryBackendSaveInput {
+	content: string;
+	context?: string;
+	source?: string;
+	importance?: number;
+}
+
+export interface MemoryBackendSaveResult {
+	backend: MemoryBackendId;
+	stored: number;
+	ids?: string[];
+	queued?: boolean;
+	message?: string;
+}
+
+export interface MemoryBackendOperationContext {
+	agentDir: string;
+	cwd: string;
+	session?: AgentSession;
+}
+
+export interface MemoryRuntimeContext {
+	status(): Promise<MemoryBackendStatus>;
+	search(query: string, options?: MemoryBackendSearchOptions): Promise<MemoryBackendSearchResult>;
+	save(input: string | MemoryBackendSaveInput): Promise<MemoryBackendSaveResult>;
+}
 
 export interface MemoryBackendStartOptions {
 	session: AgentSession;
@@ -21,6 +89,7 @@ export interface MemoryBackendStartOptions {
 	agentDir: string;
 	taskDepth: number;
 	parentHindsightSessionState?: HindsightSessionState;
+	parentMnemopiSessionState?: MnemopiSessionState;
 }
 
 export interface MemoryBackend {
@@ -51,6 +120,24 @@ export interface MemoryBackend {
 	/** Force consolidation/retain to happen now (slash `/memory enqueue`). */
 	enqueue(agentDir: string, cwd: string, session?: AgentSession): Promise<void>;
 
+	/** Structured state for UI, slash commands, and extensions. */
+	status?(context: MemoryBackendOperationContext): Promise<MemoryBackendStatus>;
+
+	/** Explicit user-facing semantic/lexical search. */
+	search?(
+		context: MemoryBackendOperationContext,
+		query: string,
+		options?: MemoryBackendSearchOptions,
+	): Promise<MemoryBackendSearchResult>;
+
+	/** Explicit user-facing save operation. */
+	save?(context: MemoryBackendOperationContext, input: MemoryBackendSaveInput): Promise<MemoryBackendSaveResult>;
+
+	/** Render backend-specific memory statistics as markdown (`/memory stats`). */
+	stats?(agentDir: string, cwd: string, session?: AgentSession): Promise<string | undefined>;
+
+	/** Render backend-specific memory diagnostics as markdown (`/memory diagnose`). */
+	diagnose?(agentDir: string, cwd: string, session?: AgentSession): Promise<string | undefined>;
 	/**
 	 * Optional hook to inject a backend-specific block into the current turn's
 	 * system prompt before the agent starts generating.

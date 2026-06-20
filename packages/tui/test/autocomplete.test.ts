@@ -61,6 +61,82 @@ describe("CombinedAutocompleteProvider", () => {
 		});
 	});
 
+	describe("slash commands", () => {
+		it("does not suggest slash commands after prose", async () => {
+			const provider = new CombinedAutocompleteProvider([{ name: "skill", description: "Manage skills" }], "/tmp");
+			const line = "run /sk";
+
+			const result = await provider.getSuggestions([line], 0, line.length);
+
+			expect(result).toBeNull();
+		});
+	});
+	describe("applyCompletion", () => {
+		it("replaces the live slash command prefix when rendered suggestions are stale", () => {
+			const provider = new CombinedAutocompleteProvider([], "/tmp");
+			const result = provider.applyCompletion(
+				["/ski"],
+				0,
+				4,
+				{ value: "skills:fix-bug", label: "/skills:fix-bug" },
+				"/s",
+			);
+
+			expect(result.lines[0]).toBe("/skills:fix-bug ");
+			expect(result.cursorCol).toBe("/skills:fix-bug ".length);
+		});
+
+		it("preserves leading whitespace when applying a slash command completion", () => {
+			const provider = new CombinedAutocompleteProvider([], "/tmp");
+			const result = provider.applyCompletion(
+				["  /ski"],
+				0,
+				6,
+				{ value: "skills:fix-bug", label: "/skills:fix-bug" },
+				"/s",
+			);
+
+			expect(result.lines[0]).toBe("  /skills:fix-bug ");
+			expect(result.cursorCol).toBe("  /skills:fix-bug ".length);
+		});
+
+		it("applies a slash completion whose prefix carries leading whitespace", () => {
+			const provider = new CombinedAutocompleteProvider([], "/tmp");
+			const result = provider.applyCompletion(["  /sk"], 0, 5, { value: "skill", label: "skill" }, "  /sk");
+
+			expect(result.lines[0]).toBe("  /skill ");
+			expect(result.cursorCol).toBe("  /skill ".length);
+		});
+
+		it("preserves earlier slash command arguments when completing a path inside the last argument", () => {
+			const provider = new CombinedAutocompleteProvider([], "/tmp");
+			const result = provider.applyCompletion(
+				["/swarm run pac"],
+				0,
+				14,
+				{ value: "package.json", label: "package.json" },
+				"pac",
+			);
+
+			expect(result.lines[0]).toBe("/swarm run package.json");
+			expect(result.cursorCol).toBe("/swarm run package.json".length);
+		});
+
+		it("replaces only the last path token when completing a multi-token slash command argument", () => {
+			const provider = new CombinedAutocompleteProvider([], "/tmp");
+			const result = provider.applyCompletion(
+				["/model claude"],
+				0,
+				13,
+				{ value: "claude-sonnet", label: "claude-sonnet" },
+				"claude",
+			);
+
+			expect(result.lines[0]).toBe("/model claude-sonnet");
+			expect(result.cursorCol).toBe("/model claude-sonnet".length);
+		});
+	});
+
 	describe("hidden paths", () => {
 		let baseDir: string;
 
@@ -97,6 +173,23 @@ describe("CombinedAutocompleteProvider", () => {
 			const values = result?.items.map(item => item.value) ?? [];
 			expect(values).toContain("@.github/");
 			expect(values.some(value => value === "@.git" || value.startsWith("@.git/"))).toBe(false);
+		});
+
+		it("returns more than 20 fuzzy matches when the project contains them", async () => {
+			// Regression: previously hard-capped at 20 by `slice(0, 20)`.
+			const total = 30;
+			for (let i = 0; i < total; i += 1) {
+				fs.writeFileSync(path.join(baseDir, `controller-${i}.ts`), "export {};\n");
+			}
+
+			const provider = new CombinedAutocompleteProvider([], baseDir);
+			const line = "@controller";
+			const result = await provider.getSuggestions([line], 0, line.length);
+
+			expect(result).not.toBeNull();
+			const values = result?.items.map(item => item.value) ?? [];
+			expect(values.length).toBeGreaterThan(20);
+			expect(values.length).toBeGreaterThanOrEqual(total);
 		});
 	});
 
@@ -223,6 +316,17 @@ describe("trySyncSlashCompletion", () => {
 		expect(result!.items.map(i => i.value)).toEqual(["model"]);
 	});
 
+	it("returns matching items when slash is the first non-whitespace token", () => {
+		const provider = new CombinedAutocompleteProvider(
+			[{ name: "model", description: "Switch AI model", value: "model" }],
+			"/tmp",
+		);
+		const result = provider.trySyncSlashCompletion("  /mo");
+		expect(result).not.toBeNull();
+		expect(result!.prefix).toBe("  /mo");
+		expect(result!.items.map(i => i.value)).toEqual(["model"]);
+	});
+
 	it("matches multiple commands and sorts by relevance", () => {
 		const provider = new CombinedAutocompleteProvider(
 			[
@@ -273,5 +377,77 @@ describe("trySyncSlashCompletion", () => {
 		const result = provider.trySyncSlashCompletion("/mod");
 		expect(result).not.toBeNull();
 		expect(result!.items.map(i => i.value)).toEqual(["model"]);
+	});
+
+	it("does not list aliases as separate rows for bare slash suggestions", async () => {
+		const provider = new CombinedAutocompleteProvider(
+			[
+				{ name: "setup", aliases: ["providers"], description: "Open provider setup" },
+				{ name: "usage", description: "Show provider usage and limits" },
+			],
+			"/tmp",
+		);
+		const result = await provider.getSuggestions(["/"], 0, 1);
+		expect(result).not.toBeNull();
+		expect(result!.items.map(i => i.value)).toEqual(["setup", "usage"]);
+	});
+
+	it("keeps registry order for same-prefix commands so /set still applies settings", () => {
+		const provider = new CombinedAutocompleteProvider(
+			[
+				{ name: "settings", description: "Open settings menu", value: "settings" },
+				{ name: "setup", description: "Open provider setup", value: "setup" },
+			],
+			"/tmp",
+		);
+		const result = provider.trySyncSlashCompletion("/set");
+		expect(result).not.toBeNull();
+		// The sync-completion path applies items[0] on Enter; the shorter `setup`
+		// must not jump ahead of the earlier-registered `settings`.
+		expect(result!.items[0]?.value).toBe("settings");
+	});
+
+	it("prefers exact command aliases over fuzzy description matches", () => {
+		const provider = new CombinedAutocompleteProvider(
+			[
+				{ name: "setup", aliases: ["providers"], description: "Open provider setup" },
+				{ name: "usage", description: "Show provider usage and limits" },
+			],
+			"/tmp",
+		);
+		const result = provider.trySyncSlashCompletion("/providers");
+		expect(result).not.toBeNull();
+		expect(result!.items[0]?.value).toBe("providers");
+	});
+
+	it("uses aliases when completing slash command arguments", async () => {
+		const provider = new CombinedAutocompleteProvider(
+			[
+				{
+					name: "setup",
+					aliases: ["onboarding"],
+					getArgumentCompletions: prefix =>
+						"providers".startsWith(prefix) ? [{ value: "providers ", label: "providers" }] : null,
+				},
+			],
+			"/tmp",
+		);
+		const result = await provider.getSuggestions(["/onboarding pro"], 0, "/onboarding pro".length);
+		expect(result?.items.map(i => i.value)).toEqual(["providers "]);
+	});
+
+	it("uses aliases when rendering inline slash command hints", () => {
+		const provider = new CombinedAutocompleteProvider(
+			[
+				{
+					name: "setup",
+					aliases: ["onboarding"],
+					getInlineHint: argumentText => (argumentText === "pro" ? "viders" : null),
+				},
+			],
+			"/tmp",
+		);
+		expect(provider.getInlineHint(["/onboarding pro"], 0, "/onboarding pro".length)).toBe("viders");
+		expect(provider.getInlineHint(["  /onboarding pro"], 0, "  /onboarding pro".length)).toBe("viders");
 	});
 });

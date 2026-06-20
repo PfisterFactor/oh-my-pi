@@ -2,14 +2,18 @@ import { describe, expect, it } from "bun:test";
 import { normalizeAnthropicToolSchema } from "@oh-my-pi/pi-ai/providers/anthropic";
 import type { Tool } from "@oh-my-pi/pi-ai/types";
 import {
+	adaptSchemaForStrict,
 	decontaminateZodInstance,
 	isZodSchema,
 	normalizeEmptySchemas,
 	normalizeSchemaForCCA,
 	normalizeSchemaForGoogle,
+	stripSchemaDescriptions,
+	stripToolDescriptions,
 	toolWireSchema,
 	zodToWireSchema,
 } from "@oh-my-pi/pi-ai/utils/schema";
+import { type } from "arktype";
 import { z } from "zod/v4";
 
 describe("isZodSchema", () => {
@@ -90,6 +94,57 @@ describe("zodToWireSchema — empty-schema normalization", () => {
 	});
 });
 
+describe("zodToWireSchema — nullable scalar normalization", () => {
+	it("rewrites nullable scalar anyOf to a type array while preserving metadata", () => {
+		const schema = z.object({ skip: z.number().nullable().describe("matches to skip") });
+		const wire = zodToWireSchema(schema);
+		const skip = (wire.properties as Record<string, unknown>).skip as Record<string, unknown>;
+		expect(skip).toEqual({
+			type: ["number", "null"],
+			description: "matches to skip",
+		});
+	});
+
+	it("preserves null semantics when rewriting nullable scalar enum anyOf", () => {
+		const wire = toolWireSchema({
+			name: "mcp__sentry_search_docs",
+			description: "",
+			parameters: {
+				type: "object",
+				properties: {
+					guide: {
+						anyOf: [{ type: "string", enum: ["javascript", "python"], description: "guide" }, { type: "null" }],
+					},
+				},
+				required: ["guide"],
+			},
+			async execute() {},
+		} as unknown as Tool);
+		const guide = (wire.properties as Record<string, unknown>).guide as Record<string, unknown>;
+
+		expect(guide).toEqual({
+			type: ["string", "null"],
+			enum: ["javascript", "python", null],
+			description: "guide",
+		});
+	});
+
+	it("keeps nullable integers free of Zod safe-integer bounds", () => {
+		const schema = z.object({ count: z.number().int().nullable() });
+		const wire = zodToWireSchema(schema);
+		const count = (wire.properties as Record<string, unknown>).count as Record<string, unknown>;
+		expect(count).toEqual({ type: ["integer", "null"] });
+	});
+
+	it("leaves mixed nullable unions as anyOf", () => {
+		const schema = z.object({ value: z.union([z.string(), z.number()]).nullable() });
+		const wire = zodToWireSchema(schema);
+		const value = (wire.properties as Record<string, unknown>).value as Record<string, unknown>;
+		expect(value.type).toBeUndefined();
+		expect(Array.isArray(value.anyOf)).toBe(true);
+	});
+});
+
 // ---------------------------------------------------------------------------
 // normalizeEmptySchemas — provider-agnostic post-pipeline normalization
 // ---------------------------------------------------------------------------
@@ -155,6 +210,48 @@ describe("toolWireSchema — empty-schema normalization across both paths", () =
 		const extra = (wire.properties as Record<string, unknown>).extra as Record<string, unknown>;
 		expect(extra.additionalProperties).toBe(true);
 	});
+
+	it("normalizes nullable scalar anyOf for TypeBox / raw JSON Schema tools", () => {
+		const wire = toolWireSchema(
+			jsonTool({
+				type: "object",
+				properties: {
+					skip: {
+						anyOf: [{ type: "number", minimum: 0 }, { type: "null" }],
+						description: "matches to skip",
+					},
+				},
+				required: ["skip"],
+			}),
+		);
+		const skip = (wire.properties as Record<string, unknown>).skip as Record<string, unknown>;
+		expect(skip).toEqual({
+			type: ["number", "null"],
+			description: "matches to skip",
+			minimum: 0,
+		});
+	});
+
+	it("preserves raw JSON Schema required defaults and safe-integer bounds", () => {
+		const wire = toolWireSchema(
+			jsonTool({
+				type: "object",
+				properties: {
+					mode: { type: "string", default: "fast" },
+					limit: {
+						type: "integer",
+						minimum: Number.MIN_SAFE_INTEGER,
+						maximum: Number.MAX_SAFE_INTEGER,
+					},
+				},
+				required: ["mode", "limit"],
+			}),
+		);
+		expect(wire.required).toEqual(["mode", "limit"]);
+		const limit = (wire.properties as Record<string, unknown>).limit as Record<string, unknown>;
+		expect(limit.minimum).toBe(Number.MIN_SAFE_INTEGER);
+		expect(limit.maximum).toBe(Number.MAX_SAFE_INTEGER);
+	});
 });
 
 // ---------------------------------------------------------------------------
@@ -211,5 +308,213 @@ describe("decontaminateZodInstance — nullable union", () => {
 					b => typeof b === "object" && b !== null && (b as Record<string, unknown>).type === "null",
 				));
 		expect(toleratesNull).toBe(true);
+	});
+});
+
+// ---------------------------------------------------------------------------
+// arkToWireSchema — `T | undefined` value-union pruning (Codex strict-mode break)
+// ---------------------------------------------------------------------------
+
+describe("arkToWireSchema — undefined-union branch pruning", () => {
+	function arkTool(parameters: unknown): Tool {
+		return { name: "t", description: "d", parameters } as Tool;
+	}
+	/** True when any `anyOf`/`oneOf`/`allOf` carries a `true` or `{}` branch. */
+	function hasPermissiveBranch(node: unknown): boolean {
+		if (Array.isArray(node)) return node.some(hasPermissiveBranch);
+		if (!node || typeof node !== "object") return false;
+		const obj = node as Record<string, unknown>;
+		for (const key of ["anyOf", "oneOf", "allOf"]) {
+			const arr = obj[key];
+			if (
+				Array.isArray(arr) &&
+				arr.some(
+					b =>
+						b === true ||
+						(b !== null && typeof b === "object" && !Array.isArray(b) && Object.keys(b).length === 0),
+				)
+			) {
+				return true;
+			}
+		}
+		return Object.values(obj).some(hasPermissiveBranch);
+	}
+
+	it("inlines `T | undefined` to the concrete type and keeps the key required", () => {
+		const wire = toolWireSchema(arkTool(type({ id: "string | undefined", assignment: "string" })));
+		const props = wire.properties as Record<string, unknown>;
+		expect(props.id).toEqual({ type: "string" });
+		// ArkType validates `string | undefined` as required-present (an absent key is
+		// rejected at runtime), so the wire must keep the key required for consistency.
+		expect(wire.required).toEqual(expect.arrayContaining(["id", "assignment"]));
+		expect(hasPermissiveBranch(wire)).toBe(false);
+	});
+
+	it("prunes the undefined branch inside nested array items", () => {
+		const wire = toolWireSchema(
+			arkTool(type({ tasks: type({ id: "string | undefined", assignment: "string" }).array() })),
+		);
+		const tasks = (wire.properties as Record<string, unknown>).tasks as Record<string, unknown>;
+		const itemProps = (tasks.items as Record<string, unknown>).properties as Record<string, unknown>;
+		expect(itemProps.id).toEqual({ type: "string" });
+		expect(hasPermissiveBranch(wire)).toBe(false);
+	});
+
+	it("collapses `(string | undefined)[]` element unions to a typed item", () => {
+		const wire = toolWireSchema(arkTool(type({ xs: "(string | undefined)[]" })));
+		const xs = (wire.properties as Record<string, unknown>).xs as Record<string, unknown>;
+		expect(xs.items).toEqual({ type: "string" });
+		expect(hasPermissiveBranch(wire)).toBe(false);
+	});
+
+	it("stays strict-mode-representable end to end (Codex acceptance)", () => {
+		const wire = toolWireSchema(
+			arkTool(
+				type({
+					agent: "string",
+					context: "string",
+					tasks: type({ id: "string | undefined", assignment: "string" }).array(),
+				}),
+			),
+		);
+		const adapted = adaptSchemaForStrict(wire, true);
+		expect(adapted.strict).toBe(true);
+		expect(hasPermissiveBranch(adapted.schema)).toBe(false);
+	});
+});
+
+// ---------------------------------------------------------------------------
+// arkToWireSchema — authored property order (guards the @ark/schema patch)
+// ---------------------------------------------------------------------------
+
+describe("arkToWireSchema — authored property order", () => {
+	function arkTool(parameters: unknown): Tool {
+		return { name: "t", description: "d", parameters } as Tool;
+	}
+
+	it("preserves declaration order rather than alphabetizing keys", () => {
+		// Without the @ark/schema patch, ArkType canonicalizes keys by hash
+		// (alphabetical): `zebra, content, path`. Streaming renderers and prompt
+		// caching depend on the authored order being preserved on the wire.
+		const wire = toolWireSchema(arkTool(type({ path: "string", content: "string", zebra: "string" })));
+		expect(Object.keys(wire.properties as Record<string, unknown>)).toEqual(["path", "content", "zebra"]);
+	});
+
+	it("emits required props before optional props, each in declaration order", () => {
+		const wire = toolWireSchema(
+			arkTool(type({ pattern: "string", "paths?": "string", i: "boolean", "skip?": "number" })),
+		);
+		expect(Object.keys(wire.properties as Record<string, unknown>)).toEqual(["pattern", "i", "paths", "skip"]);
+	});
+});
+
+describe("stripSchemaDescriptions", () => {
+	it("removes annotations through nested schema keywords while preserving structure", () => {
+		const schema = {
+			type: "object",
+			description: "object annotation",
+			properties: {
+				path: { type: "string", description: "the path" },
+				choice: {
+					anyOf: [
+						{ type: "string", description: "string variant" },
+						{ type: "number", description: "number variant" },
+					],
+				},
+			},
+			dependentSchemas: {
+				path: { type: "object", description: "dependent annotation" },
+			},
+			required: ["path"],
+		};
+		const stripped = stripSchemaDescriptions(schema);
+		expect(JSON.stringify(stripped)).not.toContain("annotation");
+		expect(JSON.stringify(stripped)).not.toContain("variant");
+		expect(JSON.stringify(stripped)).not.toContain("the path");
+		// Structure survives: types, property names, required, union arity.
+		const props = stripped.properties as Record<string, { type?: string; anyOf?: unknown[] }>;
+		expect(props.path.type).toBe("string");
+		expect(props.choice.anyOf).toHaveLength(2);
+		expect(stripped.required).toEqual(["path"]);
+	});
+
+	it("keeps a property literally named `description` (only its own annotation is dropped)", () => {
+		const schema = {
+			type: "object",
+			properties: {
+				description: { type: "string", description: "a field that is named description" },
+			},
+		};
+		const stripped = stripSchemaDescriptions(schema);
+		const prop = (stripped.properties as Record<string, { type: string; description?: string }>).description;
+		expect(prop).toBeDefined();
+		expect(prop.type).toBe("string");
+		expect(prop.description).toBeUndefined();
+	});
+
+	it("never descends into data-bearing keywords (default/const/examples)", () => {
+		const schema = {
+			type: "object",
+			properties: {
+				mode: {
+					type: "string",
+					description: "the mode",
+					default: { description: "data, keep me" },
+					examples: [{ description: "example data" }],
+				},
+			},
+		};
+		const stripped = stripSchemaDescriptions(schema);
+		const mode = (stripped.properties as Record<string, Record<string, unknown>>).mode;
+		expect(mode.description).toBeUndefined();
+		expect(mode.default).toEqual({ description: "data, keep me" });
+		expect(mode.examples).toEqual([{ description: "example data" }]);
+	});
+
+	it("does not mutate the input schema", () => {
+		const schema = {
+			type: "object",
+			description: "keep",
+			properties: { a: { type: "string", description: "keep a" } },
+		};
+		stripSchemaDescriptions(schema);
+		expect(schema.description).toBe("keep");
+		expect(schema.properties.a.description).toBe("keep a");
+	});
+
+	it("memoizes the result on the input via a hidden stamp", () => {
+		const schema = { type: "object", properties: { a: { type: "string", description: "x" } } };
+		const first = stripSchemaDescriptions(schema);
+		const second = stripSchemaDescriptions(schema);
+		expect(second).toBe(first);
+	});
+});
+
+describe("stripToolDescriptions", () => {
+	const tool: Tool = {
+		name: "demo",
+		description: "top-level tool description",
+		parameters: {
+			type: "object",
+			properties: {
+				path: { type: "string", description: "where to read" },
+			},
+			required: ["path"],
+		},
+	};
+
+	it("empties the top-level description and strips nested schema descriptions", () => {
+		const [stripped] = stripToolDescriptions([tool]);
+		expect(stripped.description).toBe("");
+		expect(JSON.stringify(stripped.parameters)).not.toContain("where to read");
+		expect((stripped.parameters as { properties: Record<string, { type: string }> }).properties.path.type).toBe(
+			"string",
+		);
+	});
+
+	it("leaves the original tool and the cached wire schema intact", () => {
+		stripToolDescriptions([tool]);
+		expect(tool.description).toBe("top-level tool description");
+		expect(JSON.stringify(toolWireSchema(tool))).toContain("where to read");
 	});
 });

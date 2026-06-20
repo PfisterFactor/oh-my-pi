@@ -301,8 +301,25 @@ class WorkerPool:
                 self.db.mark_event(row.delivery_id, "failed", error="cancelled by operator")
             else:
                 tb = traceback.format_exc(limit=20)
-                log.exception("event handler failed", extra={"delivery": row.delivery_id})
-                self.db.mark_event(row.delivery_id, "failed", error=f"{exc}\n{tb}")
+                err = f"{exc}\n{tb}"
+                max_retries = self.settings.event_max_retries
+                delay = self.settings.retry_delay_seconds(row.attempts)
+                if 0 < row.attempts <= max_retries and self.db.schedule_retry(
+                    row.delivery_id, delay_seconds=delay, error=err
+                ):
+                    log.warning(
+                        "event retry scheduled",
+                        extra={
+                            "delivery": row.delivery_id,
+                            "key": row.issue_key,
+                            "attempt": row.attempts,
+                            "max_retries": max_retries,
+                            "retry_in_seconds": round(delay, 1),
+                        },
+                    )
+                else:
+                    log.exception("event handler failed", extra={"delivery": row.delivery_id})
+                    self.db.mark_event(row.delivery_id, "failed", error=err)
         finally:
             self._cancelled.discard(row.delivery_id)
             self._shutdown_cancelled.discard(row.delivery_id)
@@ -374,6 +391,18 @@ class WorkerPool:
                     attempts=row.attempts,
                     slot_uid=slot_uid,
                 )
+        elif event == "pull_request" and action in ("opened", "reopened", "ready_for_review"):
+            await tasks.review_pr(
+                settings=self.settings,
+                db=self.db,
+                github=self.github,
+                sandbox=self.sandbox,
+                git_transport=self.git_transport,
+                payload=row.payload,
+                delivery_id=row.delivery_id,
+                attempts=row.attempts,
+                slot_uid=slot_uid,
+            )
         elif event == "pull_request_review_comment" and action == "created":
             await tasks.handle_review(
                 settings=self.settings,
@@ -395,12 +424,14 @@ class WorkerPool:
                 target_state="closed",
             )
         elif event == "pull_request" and action == "closed":
+            pr = row.payload.get("pull_request") or {}
+            target_state = "merged" if bool(pr.get("merged")) else "closed"
             await tasks.cleanup_workspace(
                 settings=self.settings,
                 db=self.db,
                 sandbox=self.sandbox,
                 payload=row.payload,
-                target_state="merged",
+                target_state=target_state,
             )
         else:
             log.info("no-op dispatch", extra={"event": event, "action": action})

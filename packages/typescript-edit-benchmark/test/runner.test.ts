@@ -4,9 +4,13 @@ import * as path from "node:path";
 import type { AgentMessage } from "@oh-my-pi/pi-agent-core";
 import { formatSessionDumpText, SessionManager } from "@oh-my-pi/pi-coding-agent";
 import { TempDir } from "@oh-my-pi/pi-utils";
-import { generateReport } from "../src/report";
-import { buildBenchmarkResult, type TaskRunResult, writeConversationDump } from "../src/runner";
-import type { EditTask } from "../src/tasks";
+import { generateReport } from "@oh-my-pi/typescript-edit-benchmark/report";
+import {
+	buildBenchmarkResult,
+	type TaskRunResult,
+	writeConversationDump,
+} from "@oh-my-pi/typescript-edit-benchmark/runner";
+import type { EditTask } from "@oh-my-pi/typescript-edit-benchmark/tasks";
 
 const tempDirs: TempDir[] = [];
 
@@ -270,6 +274,91 @@ describe("buildBenchmarkResult", () => {
 		expect(taskResult.bestRunIndex).toBe(1);
 		expect(taskResult.tokens.total).toBe(60);
 		expect(result.summary.ghostRuns).toBe(1);
+	});
+
+	it("reports median, p1, and p99 token stats across best runs", () => {
+		// Five tasks, each a single successful best run with a distinct token cost.
+		const totals = [110, 220, 330, 440, 550];
+		const tasks = totals.map((_, i) => createTask(`t${i}`));
+		const resultsByTask = new Map(
+			totals.map((total, i) => [
+				tasks[i]!.id,
+				[createRun(0, true, { tokens: { input: (i + 1) * 100, output: (i + 1) * 10, total } })],
+			]),
+		);
+
+		const result = buildBenchmarkResult({
+			tasks,
+			config: {
+				provider: "anthropic",
+				model: "claude",
+				runsPerTask: 1,
+				timeout: 1000,
+				taskConcurrency: 1,
+			},
+			resultsByTask,
+			startTime: "2026-04-28T00:00:00.000Z",
+			endTime: "2026-04-28T00:00:01.000Z",
+		});
+
+		const { summary } = result;
+		// Mean is unchanged by the new fields: total sum 1650 / 5 tasks = 330.
+		expect(summary.avgTokensPerTask.total).toBe(330);
+		// Median = the middle sample (linear interpolation at rank 2 of [110..550]).
+		expect(summary.medianTokensPerTask).toEqual({ input: 300, output: 30, total: 330 });
+		// p1/p99 interpolate near the extremes (ranks 0.04 and 3.96 over 5 samples).
+		expect(summary.p1TokensPerTask).toEqual({ input: 104, output: 10, total: 114 });
+		expect(summary.p99TokensPerTask).toEqual({ input: 496, output: 50, total: 546 });
+	});
+
+	it("separates token stats for successfully one-shot tasks vs overall", () => {
+		// Task 1: Succeeded on run 0 (one-shot success). Tokens: 100
+		// Task 2: Failed on run 0 (150 tokens), succeeded on run 1 (best run, 50 tokens).
+		// Task 3: Failed on run 0 (200 tokens).
+		const tasks = [createTask("t1"), createTask("t2"), createTask("t3")];
+		const resultsByTask = new Map([
+			["t1", [createRun(0, true, { tokens: { input: 80, output: 20, total: 100 } })]],
+			[
+				"t2",
+				[
+					createRun(0, false, { tokens: { input: 120, output: 30, total: 150 } }),
+					createRun(1, true, { tokens: { input: 40, output: 10, total: 50 } }),
+				],
+			],
+			["t3", [createRun(0, false, { tokens: { input: 160, output: 40, total: 200 } })]],
+		]);
+
+		const result = buildBenchmarkResult({
+			tasks,
+			config: {
+				provider: "anthropic",
+				model: "claude",
+				runsPerTask: 2,
+				timeout: 1000,
+				taskConcurrency: 1,
+			},
+			resultsByTask,
+			startTime: "2026-04-28T00:00:00.000Z",
+			endTime: "2026-04-28T00:00:01.000Z",
+		});
+
+		const { summary } = result;
+		// Overall uses best runs:
+		// t1 best run: run 0 (100 tokens, success)
+		// t2 best run: run 1 (50 tokens, success)
+		// t3 best run: run 0 (200 tokens, fail)
+		// Total overall tokens: 100 + 50 + 200 = 350
+		expect(summary.totalTokens.total).toBe(350);
+		expect(summary.avgTokensPerTask.total).toBe(Math.round(350 / 3)); // 117
+
+		// Successfully one-shot tasks (run 0 succeeded):
+		// t1 succeeded on run 0 (100 tokens)
+		// t2 failed on run 0
+		// t3 failed on run 0
+		// Only t1 counts.
+		expect(summary.successfulOneShotTasks).toBe(1);
+		expect(summary.totalOneShotSuccessTokens.total).toBe(100);
+		expect(summary.avgOneShotSuccessTokensPerTask.total).toBe(100);
 	});
 });
 

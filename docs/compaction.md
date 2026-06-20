@@ -10,6 +10,7 @@ Both are persisted as session entries and converted back into user-context messa
 ## Key implementation files
 
 - `packages/agent/src/compaction/compaction.ts` (context-full summarization and handoff generation)
+- `packages/snapcompact/src/snapcompact.ts` (snapcompact strategy: history archived as dense bitmap images)
 - `packages/agent/src/compaction/branch-summarization.ts`
 - `packages/agent/src/compaction/pruning.ts`
 - `packages/agent/src/compaction/utils.ts`
@@ -43,22 +44,24 @@ When context is rebuilt (`buildSessionContext`):
 4. `branch_summary` entries are converted to `branchSummary` messages.
 5. `custom_message` entries are converted to `custom` messages.
 
-Those custom roles are then transformed into LLM-facing user messages in `convertToLlm()` using the static templates:
+Those custom roles are then transformed into LLM-facing messages in `convertToLlm()`: `compactionSummary` and `branchSummary` become user messages rendered through the static templates
 
 - `packages/agent/src/compaction/prompts/compaction-summary-context.md`
 - `packages/agent/src/compaction/prompts/branch-summary-context.md`
-- `packages/agent/src/compaction/prompts/handoff-document.md`
+
+while `custom` messages pass through as developer messages with their raw content (no template).
 
 ## Compaction pipeline
 
 ### Triggers
 
-Compaction/context maintenance can run in four ways:
+Compaction/context maintenance can run in five ways:
 
 1. **Manual context compaction**: `/compact [instructions]` calls `AgentSession.compact(...)`.
 2. **Automatic overflow recovery**: after a same-model assistant error that matches context overflow.
-3. **Automatic threshold maintenance**: after a successful turn when context exceeds the resolved threshold.
-4. **Idle maintenance**: `runIdleCompaction()` can invoke the same auto-maintenance path with reason `"idle"`.
+3. **Automatic incomplete-output recovery**: after a same-model assistant message ends with `stopReason === "length"` (OpenAI/Codex `response.incomplete`).
+4. **Automatic threshold maintenance**: after a successful turn when context exceeds the resolved threshold.
+5. **Idle maintenance**: `runIdleCompaction()` can invoke the same auto-maintenance path with reason `"idle"`.
 
 ### Compaction shape (visual)
 
@@ -94,7 +97,7 @@ What the LLM sees:
     prompt   from cmp          messages from firstKeptEntryId
 ```
 
-### Overflow-retry vs threshold/idle maintenance
+### Overflow/incomplete recovery vs threshold/idle maintenance
 
 The automatic paths are intentionally different:
 
@@ -102,20 +105,43 @@ The automatic paths are intentionally different:
   - Trigger: current-model assistant error is detected as context overflow and the error is not older than the latest compaction.
   - The failing assistant error message is removed from active agent state before retry.
   - Context promotion is tried first; if a configured larger model is available, the agent switches model and retries without compacting.
-  - If promotion is unavailable and compaction is enabled, context-full compaction runs with `reason: "overflow"` and `willRetry: true`; handoff strategy is not used for overflow.
-  - On success, agent auto-continues (`agent.continue()`) after compaction.
+  - If promotion is unavailable and compaction is enabled, context-full compaction runs with `reason: "overflow"` and `willRetry: true`; handoff strategy is not used for overflow because the handoff request would reuse the overflowing input.
+  - On success, `agent.continue()` is scheduled to retry the turn.
+
+- **Incomplete-output recovery**
+  - Trigger: same-model assistant message ends with `stopReason === "length"` and the message is not older than the latest compaction.
+  - The incomplete assistant message is removed from active agent state before recovery.
+  - Context promotion is tried first.
+  - If promotion is unavailable and compaction is enabled, auto maintenance runs with `reason: "incomplete"` and `willRetry: true`.
+  - Unlike overflow, `compaction.strategy: "handoff"` is allowed for incomplete-output recovery because the input context is still usable.
+  - On context-full success, `agent.continue()` is scheduled to retry the turn.
 
 - **Threshold maintenance**
   - Trigger: successful, non-error assistant message whose adjusted context tokens exceed `resolveThresholdTokens(...)`.
   - Tool-output pruning can reduce the measured token count before threshold comparison.
   - Context promotion is tried before compaction.
   - If promotion is unavailable, auto maintenance runs with `reason: "threshold"` and `willRetry: false`.
-  - With `compaction.strategy: "handoff"`, threshold maintenance starts a new handoff session instead of writing a compaction entry; if handoff returns no document without aborting, it falls back to context-full compaction.
+  - With `compaction.strategy: "handoff"`, threshold maintenance normally schedules a post-prompt auto-handoff task instead of writing a compaction entry; pre-prompt checks run it inline to avoid racing the next turn. If handoff returns no document without aborting, it falls back to context-full compaction.
   - On success, if `compaction.autoContinue !== false`, schedules an agent-authored developer auto-continue prompt from `prompts/system/auto-continue.md`.
 
 - **Idle maintenance**
   - Trigger: `runIdleCompaction()` when not streaming or already compacting.
   - Uses `reason: "idle"` and does not auto-continue afterward.
+
+### Snapcompact strategy
+
+`compaction.strategy: "snapcompact"` replaces the LLM summarization call with a local, deterministic archival pass (`compact` from `@oh-my-pi/snapcompact`):
+
+- The discarded history is serialized, whitespace-collapsed, and printed onto model-aware PNG frames (frame width fixed per shape; frame height hugs the rows actually printed) using bundled public-domain pixel fonts. The shape — and frame size — resolve from the **model id** when the model line was measured: Claude reads X.org `8x13` glyphs on an 11px advance (extra letter-spacing, black ink — `11on16-bw`; high-res lines — Opus 4.7+, Fable, Mythos — get 1932px frames under Anthropic's 4,784 visual-token cap, older lines stay at 1568px), Gemini reads `8x13` glyphs on a 22px pitch (extra leading, black ink — `8on22-bw` at 2048px, since Gemini 3.x bills a fixed 1,120-token budget per image at any pixel size), GPT/Codex read the same `8on22-bw` shape at 1568px (patch billing is area-proportional, so larger frames cannot improve chars per token), and Kimi/GLM read `8x13` glyphs on a 16px pitch (`8on16-bw` at 1568px — kimi's processor downscales past 1792px). A Claude routed through Vertex or OpenRouter keeps its Claude shape. Unmeasured models fall back to their wire API family (Anthropic-family/unknown → `11on16-bw`, Google → `8on22-bw`, OpenAI-compatible → `8on22-bw`); billing (per-family patch/budget formulas, OpenAI's `detail: "original"` hint) always follows the API carrying the request, computed for the resolved frame size. The `snapcompact.shape` setting (default `auto`) forces one of the research-eval variants instead: square grids (`8x8r`/`8x8u`/`6x6u`/`5x8` × sentence-hue/black ink) or the per-model eval winners (`6x12-dim`, `8x13-bw`, `8on16-bw`, `8on22-bw`, `11on16-bw`, and the two-column word-wrapped `doc-8on16-bw`/`-sent`/`-sent-dim`, where `dim` prints stopwords in gray). A forced variant keeps its geometry but is re-priced for the target provider's image billing. The same setting governs inline system-prompt/tool-result imaging (`snapcompact.systemPrompt`, `snapcompact.toolResults`).
+- Serialization keeps the archive conversation-dense: tool results are truncated head+tail (default 2,000 chars at a 0.6 head ratio), tool-call argument values are capped per value (500) and per call (2,000), and tool output is printed in dim gray ink so conversation reads louder than tool noise. All budgets and the dimming are configurable via `SerializeOptions` (`toolResultMaxChars`, `toolArgMaxChars`, `toolCallMaxChars`, `truncateHeadRatio`, `dimToolResults`).
+- The snapcompact archive persists under `CompactionEntry.preserveData.snapcompact` as bounded source text plus rendered frames. On each context rebuild it is reconstructed into ordered compaction blocks: plain text at the oldest edge, an imaged middle, then plain text at the newest edge. The entry's `summary` is just the short resume lead-in plus the usual file-operation list.
+- Later compactions re-render from that bounded source text (`Archive.text`), not by carrying old PNGs forward blindly. `maxFrames` now defaults to `MAX_FRAMES_DEFAULT` (80) and acts only as an upper limit; when the imaged middle is large it foveates internally (HQ/LQ/HQ), while both chronological edges stay verbatim text.
+- No model, API key, or network is involved, so snapcompact is also safe for overflow recovery. It requires a vision-capable current model (`model.input` includes `"image"`); otherwise the run falls back to context-full and emits a warning notice (auto and manual paths). Manual `/compact` honors the strategy unless custom instructions are given (those imply a directed LLM summary).
+- Rationale: the shape table comes from the snapcompact 200k-token evals in `packages/snapcompact`, where bitmap frames preserved QA recall at lower billed-token cost than raw text for vision-capable models.
+
+### Display transcript
+
+Compaction no longer visually restarts the conversation. The TUI renders the **display transcript** (`buildSessionContext({ transcript: true })` / `AgentSession.buildTranscriptSessionContext()`): every path entry in chronological order, with each compaction shown inline as a slim divider — `── 📷 compacted · ctrl+o ──` — at the point it fired. Expanding (ctrl+o) reveals the summary. Only the LLM context resets at the compaction boundary; the scrollback above the divider stays intact, including across session resume.
 
 ### Pre-compaction pruning
 
@@ -125,13 +151,24 @@ Default prune policy:
 
 - Protect newest `40_000` tool-output tokens.
 - Require at least `20_000` total estimated savings.
-- Never prune tool results from `skill` or `read`.
+- Never blank a result below `50` tokens (`MIN_PRUNE_TOKENS`): the `[Output truncated - N tokens]` placeholder costs ~8 tokens, so pruning a sub-floor result would grow the context and churn the prompt cache for nothing. (Superseded and useless results keep their own rules — the useless collector already drops no-savings candidates; superseded reads prune for correctness regardless of size.)
+- Never prune `skill` tool results, `read` results of `skill://` paths, or reads of the active plan reference file (added via `AgentSession`'s plan protection).
 
 Pruned tool results are replaced with:
 
 - `[Output truncated - N tokens]`
 
 If pruning changes entries, session storage is rewritten and agent message state is refreshed before compaction decisions.
+
+### Useless-result elision
+
+Tools can flag a finished result as contextually useless — a search with zero matches, a `job` poll that timed out with everything still running, an empty `irc` inbox drain. The flag originates on the tool result (`AgentToolResult.useless`, set via `ToolResultBuilder.useless()` or directly on the returned object), is copied by the agent loop onto the persisted `ToolResultMessage` (never together with `isError` — errors always win), and is consumed in three places:
+
+- **Per-turn stale-result pass** (`pruneSupersededToolResults`, gated by `compaction.dropUseless`, default on): flagged results are blanked to the exact placeholder `[Uneventful result elided]` (`USELESS_NOTICE`) with the same cache-aware timing as superseded reads — only when the suffix after the candidate is small (≤ ~8k tokens) or the session has idled past the provider prompt-cache lifetime. Results smaller than the notice itself are never blanked (no savings), and protected tools are exempt.
+- **Threshold prune** (`pruneToolOutputs`): flagged results bypass the protect-recent window, same as superseded reads, and receive `USELESS_NOTICE` instead of the token-count placeholder.
+- **Summary serialization**: `serializeConversation` (agent and snapcompact) drops the whole tool call/result pair from summarizer/archive input — the source region is discarded after summarization anyway, so the exclusion costs no cache.
+
+The flag never reaches provider wire formats, and flagged pairs are never removed from history (only blanked in place), so tool-call/result pairing and provider-native history replay stay intact.
 
 ### Boundary and cut-point logic
 
@@ -188,7 +225,7 @@ Final stored summary is merged as:
 2. Serialize with `serializeConversation()`.
 3. Wrap in `<conversation>...</conversation>`.
 4. Optionally include `<previous-summary>...</previous-summary>`.
-5. Optionally inject hook context as `<additional-context>` list.
+5. Optionally inject extension hook context and active memory-backend compaction context as `<additional-context>` entries.
 6. Execute summarization prompt with `SUMMARIZATION_SYSTEM_PROMPT`.
 
 Prompt selection:
@@ -224,18 +261,21 @@ Cumulative behavior:
 
 - Includes prior compaction details only when prior entry is pi-generated (`fromExtension !== true`).
 - In split turns, includes turn-prefix file ops too.
-- `readFiles` excludes files also modified.
+- `details.readFiles` excludes files also modified; `details.modifiedFiles` carries the rest (persisted shape is unchanged).
 
-Summary text gets file tags appended via prompt template:
+The file list is a grouped, prefix-folded directory tree (find-tool shape) with a per-file access marker — `(Read)` for read-only files, `(Write)` for modified files never read, `(RW)` for modified files also present in the cumulative read set. Capped at 20 files with an `[…N files elided…]` line. LLM-summary strategies append it as a `<files>` tag (via `upsertFileOperations`); snapcompact renders it inside its summary template as a `FILES` section instead.
 
 ```xml
-<read-files>
-...
-</read-files>
-<modified-files>
-...
-</modified-files>
+<files>
+# packages/agent/src/compaction/
+compaction.ts (Read)
+utils.ts (RW)
+## prompts/
+file-operations.md (Write)
+</files>
 ```
+
+Legacy `<read-files>`/`<modified-files>` tags from summaries written by earlier versions are stripped (alongside `<files>`) before re-appending, so old summaries self-heal on the next compaction.
 
 ### Persist and reload
 
@@ -244,7 +284,8 @@ After summary generation (or hook-provided summary), agent session:
 1. Appends `CompactionEntry` with `appendCompaction(...)` for context-full maintenance; handoff strategy creates a new session and injects a handoff `custom_message` instead.
 2. Rebuilds display context from the active leaf via `buildDisplaySessionContext()`.
 3. Replaces live agent messages with rebuilt context.
-4. Emits `session_compact` hook event.
+4. Synchronizes active todo phases from the rebuilt branch and closes provider sessions whose history was rewritten.
+5. Emits `session_compact` hook event.
 
 ## Branch summarization pipeline
 
@@ -348,13 +389,14 @@ Post-navigation event exposing new/old leaf and optional summary entry.
 ## Runtime behavior and failure semantics
 
 - Manual compaction aborts current agent operation first.
-- `abortCompaction()` cancels both manual and auto-compaction controllers.
+- `abortCompaction()` cancels manual compaction, auto-compaction, and handoff generation controllers.
 - Auto compaction emits start/end session events for UI/state updates.
 - Auto compaction can try multiple model candidates and retry transient failures; long retry delays prefer the next candidate when one is available.
 - Overflow errors are excluded from generic retry path because they are handled by context promotion/compaction.
 - If auto-compaction fails:
   - overflow path emits `Context overflow recovery failed: ...`
-  - threshold path emits `Auto-compaction failed: ...`
+  - incomplete-output path emits `Incomplete response recovery failed: ...`
+  - threshold/idle paths emit `Auto-compaction failed: ...`
 - Branch summarization can be cancelled via abort signal (e.g., Escape), returning canceled/aborted navigation result.
 
 ## Settings and defaults
@@ -362,14 +404,16 @@ Post-navigation event exposing new/old leaf and optional summary entry.
 From `settings-schema.ts`:
 
 - `compaction.enabled` = `true`
-- `compaction.strategy` = `"context-full"` (`"handoff"` and `"off"` are also supported)
+- `compaction.strategy` = `"context-full"` (`"handoff"`, `"shake"`, `"snapcompact"`, and `"off"` are also supported)
 - `compaction.reserveTokens` = `16384`
 - `compaction.keepRecentTokens` = `20000`
 - `compaction.autoContinue` = `true`
 - `compaction.remoteEnabled` = `true`
 - `compaction.remoteEndpoint` = `undefined`
 - `compaction.thresholdPercent` = `-1` and `compaction.thresholdTokens` = `-1`; when no positive override is set, the threshold is `contextWindow - max(15% of contextWindow, reserveTokens)`
-- `compaction.idleEnabled` = `true`
+- `compaction.idleEnabled` = `false`
+- `compaction.idleThresholdTokens` = `200000`
+- `compaction.idleTimeoutSeconds` = `300`
 - `branchSummary.enabled` = `false`
 - `branchSummary.reserveTokens` = `16384`
 

@@ -1,5 +1,12 @@
-import type { Effort } from "../model-thinking";
-import type { AssistantMessage, AssistantMessageEventStream, CacheRetention, Context, ServiceTier } from "../types";
+import type { Effort } from "@oh-my-pi/pi-catalog/effort";
+import type {
+	AssistantMessage,
+	AssistantMessageEventStream,
+	CacheRetention,
+	Context,
+	ServiceTier,
+	TokenTaskBudget,
+} from "../types";
 
 /**
  * Wire types for the omp auth-gateway.
@@ -61,6 +68,8 @@ export interface AuthGatewayParsedRequestOptions {
 	thinkingBudgets?: Partial<Record<Effort, number>>;
 	/** Suppress the provider's reasoning summary stream. */
 	hideThinkingSummary?: boolean;
+	/** Anthropic `output_config.task_budget` advisory loop budget. */
+	taskBudget?: TokenTaskBudget;
 
 	// ── Service / routing ─────────────────────────────────────────────────
 	/** OpenAI service tier (auto|default|flex|scale|priority). */
@@ -101,6 +110,13 @@ export interface AuthGatewayParsedRequest {
 	options: AuthGatewayParsedRequestOptions;
 }
 
+export interface AuthGatewayStreamControl {
+	/** Gateway request signal. Encoders stop producing frames when it aborts. */
+	signal?: AbortSignal;
+	/** Called when the HTTP response body is cancelled by the client. */
+	onCancel?: (reason?: unknown) => void;
+}
+
 export interface AuthGatewayFormatModule {
 	parseRequest(body: unknown, headers?: Headers): AuthGatewayParsedRequest;
 	encodeResponse(message: AssistantMessage, requestedModelId: string): Record<string, unknown>;
@@ -108,6 +124,7 @@ export interface AuthGatewayFormatModule {
 		events: AssistantMessageEventStream,
 		requestedModelId: string,
 		options?: AuthGatewayParsedRequestOptions,
+		control?: AuthGatewayStreamControl,
 	): ReadableStream<Uint8Array>;
 	/**
 	 * Emit a protocol-specific error envelope. OpenAI returns

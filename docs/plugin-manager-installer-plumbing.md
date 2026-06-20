@@ -1,6 +1,6 @@
 # Plugin manager and installer plumbing
 
-This document describes how `omp plugin` operations mutate plugin state on disk and how installed plugins become runtime capabilities (tools and extensions today, hooks/commands path resolution available).
+This document describes how `omp plugin` npm/git/link operations mutate plugin state on disk and how installed npm/git/link plugins become runtime capabilities (tools and extensions today, hooks/commands path resolution available). Marketplace installs use separate marketplace registries and cache plumbing; see `docs/marketplace.md`.
 
 ## Scope and architecture
 
@@ -9,14 +9,14 @@ There are two plugin-management implementations in the codebase:
 1. **Active path used by CLI commands**: `PluginManager` (`src/extensibility/plugins/manager.ts`)
 2. **Legacy helper module**: installer functions (`src/extensibility/plugins/installer.ts`)
 
-`omp plugin ...` command execution goes through `PluginManager`.
+`omp plugin` npm/git/link actions go through `PluginManager`; marketplace actions go through `MarketplaceManager`. `install` classifies each target (`classifyInstallTarget` in `cli/classify-install-target.ts`): `name@marketplace` routes to the marketplace manager, local paths route to `PluginManager.link()`, git and npm specs to `PluginManager.install()`.
 
 `installer.ts` still documents important safety checks and filesystem behavior, but it is not the path used by `src/commands/plugin.ts` + `src/cli/plugin-cli.ts`.
 
 ## Lifecycle: from CLI invocation to runtime availability
 
 ```text
-omp plugin <action> ...
+omp plugin <npm/link action> ...
   -> src/commands/plugin.ts
   -> runPluginCommand(...) in src/cli/plugin-cli.ts
   -> PluginManager method (install/list/uninstall/link/...)
@@ -24,22 +24,28 @@ omp plugin <action> ...
   -> runtime discovery: discoverAndLoadCustomTools(...) and discoverAndLoadExtensions(...)
   -> getAllPluginToolPaths(cwd) / getAllPluginExtensionPaths(cwd)
   -> custom tool loader imports tool modules; extension loader imports extension modules
+
+omp plugin install name@marketplace / omp install name@marketplace
+  -> MarketplaceManager
+  -> mutate ~/.omp/marketplaces.json, ~/.omp/plugins/installed_plugins.json, cache dirs
+  -> installed marketplace plugin cache is surfaced as plugin roots/capabilities
 ```
 
 ### Command entrypoints
 
 - `src/commands/plugin.ts` defines command/flags and forwards to `runPluginCommand`.
-- `src/cli/plugin-cli.ts` maps subcommands to `PluginManager` methods:
+- `src/cli/plugin-cli.ts` maps npm/link subcommands to `PluginManager` methods:
   - `install`, `uninstall`, `list`, `link`, `doctor`, `features`, `config`, `enable`, `disable`
-- No explicit `update` action exists; update is done by re-running `install` with a new package/version spec.
+- `discover`, `upgrade`, and `marketplace ...` subcommands use `MarketplaceManager`.
+- No explicit npm-plugin `update` action exists; update is done by re-running `install` with a new package/version spec.
 
 ## On-disk model
 
 Global plugin state lives under `~/.omp/plugins`:
 
-- `package.json` — dependency manifest used by `bun install`/`bun uninstall`
-- `node_modules/` — installed plugin packages or symlinks
-- `omp-plugins.lock.json` — runtime state:
+- `package.json` — dependency manifest used by `bun install`/`bun uninstall` for npm-installed plugins
+- `node_modules/` — installed npm plugin packages or symlinks
+- `omp-plugins.lock.json` — runtime state for npm/link plugins:
   - enabled/disabled per plugin
   - selected feature set per plugin
   - persisted plugin settings
@@ -49,6 +55,13 @@ Project-local overrides live at:
 - `<cwd>/.omp/plugin-overrides.json`
 
 Overrides are read-only from manager/loader perspective (no write path here) and can disable plugins or override features/settings for this project.
+
+Marketplace registries live separately:
+
+- `~/.omp/marketplaces.json` — configured marketplace catalogs
+- `~/.omp/plugins/installed_plugins.json` — user-scoped marketplace installs
+- `<cwd>/.omp/plugins/installed_plugins.json` — project-scoped marketplace installs when available
+- `~/.omp/plugins/cache/{marketplaces,plugins}/` — cached catalogs and plugin directories
 
 ## Plugin spec parsing and metadata interpretation
 
@@ -61,6 +74,8 @@ Overrides are read-only from manager/loader perspective (no write path here) and
 - `pkg[]` -> enable no optional features
 - `pkg[a,b]` -> enable named features
 - `@scope/pkg@1.2.3[feat]` -> scoped + versioned package with explicit feature selection
+
+`PluginManager.install` also accepts git sources (validated by `validateGitSpec` instead of the npm regex): namespaced shorthands `github:user/repo[#ref]`, `gitlab:`, `bitbucket:`, `codeberg:`, `sourcehut:`/`srht:`, and full git URLs (`https://github.com/user/repo`, `git@github.com:user/repo`, `ssh://…`, `git+https://…`). Git specs do not encode the package name, so install diffs `plugins/package.json#dependencies` before/after `bun install` to resolve it.
 
 `extractPackageName` strips version suffix for on-disk path lookup after install.
 
@@ -84,16 +99,17 @@ Malformed `package.json` JSON is a hard failure at read time; malformed manifest
 ## Install/update flow (`PluginManager.install`)
 
 1. Parse feature bracket syntax from install spec.
-2. Validate package name against regex + shell-metacharacter denylist.
+2. Validate the spec: git specs via `validateGitSpec`; npm specs against the package-name regex + shell-metacharacter denylist.
 3. Ensure plugin `package.json` exists (`omp-plugins`, private dependencies map).
 4. Run `bun install <packageSpec>` in `~/.omp/plugins`.
-5. Read installed package `node_modules/<name>/package.json`.
+5. Resolve the installed package name (npm: strip version via `extractPackageName`; git: diff `dependencies` before/after) and read `node_modules/<name>/package.json`.
 6. Resolve manifest and compute `enabledFeatures`:
    - `[*]`: all declared features (or `null` if no feature map)
    - `[a,b]`: validates each feature exists in manifest features map
    - `[]`: empty feature list
    - bare spec: `null` (use defaults policy later in loader)
-7. Upsert lockfile runtime state: `{ version, enabledFeatures, enabled: true }`.
+7. Validate declared extension entries (`#validateInstalledExtensions`): each manifest `extensions` entry must resolve on disk and import to a factory function. On failure, roll back the install — restore the previous `plugins/package.json`, remove the freshly installed package, and restore any prior version from a backup taken before `bun install` — then abort.
+8. Upsert lockfile runtime state: `{ version, enabledFeatures, enabled: true }`.
 
 ### Update semantics
 
@@ -149,7 +165,7 @@ Caveat: current `PluginManager.link` does not enforce the `cwd` path-boundary ch
 
 `getEnabledPlugins(cwd)` (`plugins/loader.ts`) reads:
 
-- plugin dependency manifest (`package.json`)
+- plugin dependency manifest (`package.json`), unioned with lockfile plugin entries so `plugin link`-only plugins without a dependency entry are still discovered
 - lockfile runtime state
 - project overrides via `getConfigDirPaths("plugin-overrides.json", { user: false, cwd })`
 
@@ -171,10 +187,11 @@ For each enabled plugin:
 
 Each resolver includes base entries plus feature entries:
 
+- base entries are always included
 - explicit feature list -> only selected features
 - `enabledFeatures === null` -> enable features marked `default: true`
 
-Missing files are silently skipped (`existsSync` guard).
+Manifest entries may point to a file or to a directory containing `index.ts`, `index.js`, `index.mjs`, or `index.cjs`. Missing files are silently skipped (`statSync`/`existsSync` guard).
 
 ## Current runtime wiring differences
 
@@ -204,8 +221,9 @@ No cross-process locking or merge strategy exists; concurrent writers can overwr
 
 Active manager path enforces package-name validation:
 
-- regex for scoped/unscoped package specs (optionally with version)
-- explicit shell metacharacter denylist (`[;&|`$(){}[]<>\\]`)
+- npm specs: a package-name regex (`VALID_PACKAGE_NAME`) for scoped/unscoped specs, optionally with version.
+- npm shell-metacharacter denylist: `;`, `&`, `|`, backtick, `$`, `(`, `)`, `{`, `}`, `[`, `]`, `<`, `>`, `\` — applied after `parsePluginSpec` strips the feature brackets, so a normal `pkg[feat]` spec never reaches it.
+- git specs: `validateGitSpec` rejects only the shared `SHELL_METACHARS` set (`;`, `&`, `|`, backtick, `$`, `(`, `)`, `{`, `}`, `<`, `>`, `\`, newline, CR, tab) instead of the npm regex, so `:`, `/`, `#`, `+`, `.`, `-`, `_`, `~`, `@` are permitted.
 
 This limits command-injection risk when invoking `bun install/uninstall`.
 
@@ -231,7 +249,8 @@ The plugin manager is not transactional.
 | Operation stage                                          | Failure behavior           | Rollback                                                                      |
 | -------------------------------------------------------- | -------------------------- | ----------------------------------------------------------------------------- |
 | `bun install` fails                                      | install aborts with stderr | N/A (no state writes yet)                                                     |
-| Install succeeds, then manifest/feature validation fails | command fails              | No uninstall rollback; dependency may remain in `node_modules`/`package.json` |
+| Install succeeds, then feature validation fails          | command fails              | No uninstall rollback; dependency may remain in `node_modules`/`package.json` |
+| Install succeeds, then extension validation fails        | command fails              | Rolls back: restores `package.json`, removes installed package, restores prior version from backup |
 | Install succeeds, then lockfile write fails              | command fails              | No rollback of installed package                                              |
 | `bun uninstall` succeeds, lockfile write fails           | command fails              | Package removed, stale runtime state may remain                               |
 | `link` removes old target then symlink creation fails    | command fails              | No restoration of previous link/dir                                           |
@@ -249,7 +268,7 @@ Operationally, `doctor --fix` can repair some drift (`bun install`, orphaned con
 
 ## Mode differences and precedence
 
-- `--dry-run` (install): returns synthetic install result, no filesystem/network/state writes.
+- `--dry-run` (install): returns a synthetic install result with no `bun install`, no network, and no lockfile/runtime-state writes (it still ensures the plugins `package.json` skeleton exists).
 - `--json`: output formatting only, no behavior change.
 - Project overrides always take precedence over global lockfile for feature/settings view.
 - Effective enablement is `runtimeEnabled && !projectDisabled`.

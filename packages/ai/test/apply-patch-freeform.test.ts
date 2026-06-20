@@ -8,14 +8,15 @@ import {
 	mapOpenAIResponsesToolChoiceForTools,
 	supportsFreeformApplyPatch,
 } from "@oh-my-pi/pi-ai/providers/openai-responses";
+import type { ResponseStreamEvent } from "@oh-my-pi/pi-ai/providers/openai-responses-wire";
 import {
 	appendResponsesToolResultMessages,
 	convertResponsesAssistantMessage,
 	processResponsesStream,
-} from "@oh-my-pi/pi-ai/providers/openai-responses-shared";
-import type { AssistantMessage, Model, Tool, ToolResultMessage } from "@oh-my-pi/pi-ai/types";
-import type { ResponseStreamEvent } from "openai/resources/responses/responses";
-import * as z from "zod/v4";
+} from "@oh-my-pi/pi-ai/providers/openai-shared";
+import type { AssistantMessage, Model, ModelSpec, Tool, ToolResultMessage } from "@oh-my-pi/pi-ai/types";
+import { buildModel } from "@oh-my-pi/pi-catalog/build";
+import { type } from "arktype";
 
 const GRAMMAR = [
 	"// top-level comment",
@@ -27,8 +28,8 @@ const GRAMMAR = [
 ].join("\n");
 const COMPACT_GRAMMAR = 'start: "*** Begin Patch" LF\nPATH: /https?:\\/\\/[^\\n]+/\nLITERAL: "//"';
 
-function makeModel(overrides: Partial<Model<"openai-responses">> = {}): Model<"openai-responses"> {
-	return {
+function makeModel(overrides: Partial<ModelSpec<"openai-responses">> = {}): Model<"openai-responses"> {
+	return buildModel({
 		id: "gpt-5",
 		name: "GPT-5",
 		api: "openai-responses",
@@ -40,11 +41,11 @@ function makeModel(overrides: Partial<Model<"openai-responses">> = {}): Model<"o
 		contextWindow: 400000,
 		maxTokens: 128000,
 		...overrides,
-	};
+	} as ModelSpec<"openai-responses">);
 }
 
-function makeCodexModel(overrides: Partial<Model<"openai-codex-responses">> = {}): Model<"openai-codex-responses"> {
-	return {
+function makeCodexModel(overrides: Partial<ModelSpec<"openai-codex-responses">> = {}): Model<"openai-codex-responses"> {
+	return buildModel({
 		id: "gpt-5",
 		name: "GPT-5",
 		api: "openai-codex-responses",
@@ -56,21 +57,21 @@ function makeCodexModel(overrides: Partial<Model<"openai-codex-responses">> = {}
 		contextWindow: 272000,
 		maxTokens: 128000,
 		...overrides,
-	};
+	} as ModelSpec<"openai-codex-responses">);
 }
 
 const editTool: Tool = {
 	name: "edit",
 	customWireName: "apply_patch",
 	description: "edit files",
-	parameters: z.object({ input: z.string() }),
+	parameters: type({ input: "string" }),
 	customFormat: { syntax: "lark", definition: GRAMMAR },
 };
 
 const plainTool: Tool = {
 	name: "read_file",
 	description: "read a file",
-	parameters: z.object({ path: z.string() }),
+	parameters: type({ path: "string" }),
 };
 
 const unionBranches = [
@@ -224,6 +225,114 @@ describe("custom_tool_call stream receive", () => {
 	async function* makeStream(events: unknown[]): AsyncIterable<ResponseStreamEvent> {
 		for (const e of events) yield e as ResponseStreamEvent;
 	}
+
+	test("strips streaming parse bookkeeping from function-call output blocks", async () => {
+		const output: AssistantMessage = {
+			role: "assistant",
+			content: [],
+			timestamp: Date.now(),
+			provider: "openai",
+			model: "gpt-5",
+			api: "openai-responses",
+			usage: {
+				input: 0,
+				output: 0,
+				cacheRead: 0,
+				cacheWrite: 0,
+				totalTokens: 0,
+				cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+			},
+			stopReason: "stop",
+		};
+		const emitted: unknown[] = [];
+		const stream = {
+			push: (e: unknown) => emitted.push(e),
+			end: () => {},
+		} as never;
+		const args = JSON.stringify({ command: "x".repeat(300) });
+
+		await processResponsesStream(
+			makeStream([
+				{
+					type: "response.output_item.added",
+					item: { type: "function_call", id: "fc_1", call_id: "call_1", name: "bash", arguments: "" },
+				},
+				{ type: "response.function_call_arguments.delta", delta: args },
+				{ type: "response.function_call_arguments.done", arguments: args },
+				{
+					type: "response.output_item.done",
+					item: { type: "function_call", id: "fc_1", call_id: "call_1", name: "bash", arguments: args },
+				},
+			]),
+			output,
+			stream,
+			makeModel(),
+		);
+
+		const block = output.content[0];
+		expect(block?.type).toBe("toolCall");
+		if (block?.type !== "toolCall") throw new Error("expected toolCall block");
+		expect(block.arguments).toEqual({ command: "x".repeat(300) });
+		expect("partialJson" in block).toBe(false);
+		expect("lastParseLen" in block).toBe(false);
+	});
+
+	test("persists final args on the block when finalized via output_item.done without an args.done event", async () => {
+		const output: AssistantMessage = {
+			role: "assistant",
+			content: [],
+			timestamp: Date.now(),
+			provider: "openai",
+			model: "gpt-5",
+			api: "openai-responses",
+			usage: {
+				input: 0,
+				output: 0,
+				cacheRead: 0,
+				cacheWrite: 0,
+				totalTokens: 0,
+				cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+			},
+			stopReason: "stop",
+		};
+		const stream = { push: () => {}, end: () => {} } as never;
+
+		// Two small deltas: the second grows the buffer by far less than the
+		// throttle's min-growth threshold, so parseStreamingJsonThrottled skips the
+		// final re-parse and currentBlock.arguments is left at the first partial
+		// parse. No function_call_arguments.done arrives, so output_item.done is the
+		// sole finalization path and must still persist the full arguments.
+		await processResponsesStream(
+			makeStream([
+				{
+					type: "response.output_item.added",
+					item: { type: "function_call", id: "fc_1", call_id: "call_1", name: "read_file", arguments: "" },
+				},
+				{ type: "response.function_call_arguments.delta", delta: '{"path":"' },
+				{ type: "response.function_call_arguments.delta", delta: 'README.md"}' },
+				{
+					type: "response.output_item.done",
+					item: {
+						type: "function_call",
+						id: "fc_1",
+						call_id: "call_1",
+						name: "read_file",
+						arguments: '{"path":"README.md"}',
+					},
+				},
+			]),
+			output,
+			stream,
+			makeModel(),
+		);
+
+		const block = output.content[0];
+		expect(block?.type).toBe("toolCall");
+		if (block?.type !== "toolCall") throw new Error("expected toolCall block");
+		expect(block.arguments).toEqual({ path: "README.md" });
+		expect("partialJson" in block).toBe(false);
+		expect("lastParseLen" in block).toBe(false);
+	});
 
 	test("aggregates delta events into a ToolCall with input arg", async () => {
 		const output: AssistantMessage = {
@@ -404,13 +513,13 @@ describe("dispatcher wire-name matching", () => {
 			name: "edit",
 			customWireName: "apply_patch",
 			description: "edit files",
-			parameters: z.object({ input: z.string() }),
+			parameters: type({ input: "string" }),
 			customFormat: { syntax: "lark", definition: GRAMMAR },
 		};
 		const readTool: Tool = {
 			name: "read_file",
 			description: "read",
-			parameters: z.object({ path: z.string() }),
+			parameters: type({ path: "string" }),
 		};
 		const tools = [editLikeTool, readTool];
 		const toolCall = { name: "apply_patch" };
@@ -431,13 +540,13 @@ describe("dispatcher wire-name matching", () => {
 		const nameMatch: Tool = {
 			name: "foo",
 			description: "",
-			parameters: z.object({}),
+			parameters: type({}),
 		};
 		const wireMatch: Tool & { customWireName: string } = {
 			name: "bar",
 			customWireName: "foo",
 			description: "",
-			parameters: z.object({}),
+			parameters: type({}),
 		};
 		const tools = [wireMatch, nameMatch]; // wireMatch listed first
 		const toolCall = { name: "foo" };
@@ -550,8 +659,17 @@ describe("history replay: custom_tool_call round-trip", () => {
 		};
 		const knownCallIds = new Set<string>(["call_1"]);
 		const customCallIds = new Set<string>(["call_1"]);
+		const model = makeModel();
 
-		appendResponsesToolResultMessages(messages as never, toolResult, makeModel(), true, knownCallIds, customCallIds);
+		appendResponsesToolResultMessages(
+			messages as never,
+			toolResult,
+			model,
+			true,
+			model.compat.supportsImageDetailOriginal,
+			knownCallIds,
+			customCallIds,
+		);
 
 		expect(messages).toHaveLength(1);
 		const item = messages[0] as { type: string; call_id: string; output: string };
@@ -572,8 +690,17 @@ describe("history replay: custom_tool_call round-trip", () => {
 		};
 		const knownCallIds = new Set<string>(["call_2"]);
 		const customCallIds = new Set<string>(); // call_2 not custom
+		const model = makeModel();
 
-		appendResponsesToolResultMessages(messages as never, toolResult, makeModel(), true, knownCallIds, customCallIds);
+		appendResponsesToolResultMessages(
+			messages as never,
+			toolResult,
+			model,
+			true,
+			model.compat.supportsImageDetailOriginal,
+			knownCallIds,
+			customCallIds,
+		);
 
 		const item = messages[0] as { type: string };
 		expect(item.type).toBe("function_call_output");

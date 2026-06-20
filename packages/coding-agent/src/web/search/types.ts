@@ -4,44 +4,69 @@
  * Unified types for web search responses across supported providers.
  */
 
-/** Supported web search providers */
-export type SearchProviderId =
-	| "exa"
-	| "brave"
-	| "jina"
-	| "kimi"
-	| "zai"
-	| "anthropic"
-	| "perplexity"
-	| "gemini"
-	| "codex"
-	| "tavily"
-	| "parallel"
-	| "kagi"
-	| "synthetic"
-	| "searxng";
+export const SEARCH_PROVIDER_OPTIONS = [
+	{
+		value: "auto",
+		label: "Auto",
+		description: "Automatically uses the first configured web-search provider",
+	},
+	{
+		value: "perplexity",
+		label: "Perplexity",
+		description: "Uses auth when configured; explicit selection falls back to anonymous search",
+	},
+	{
+		value: "gemini",
+		label: "Gemini",
+		description: "Google Search grounding via Gemini (uses google-gemini-cli or google-antigravity OAuth)",
+	},
+	{
+		value: "anthropic",
+		label: "Anthropic",
+		description: "Claude's native web_search tool (uses Anthropic OAuth or ANTHROPIC_API_KEY)",
+	},
+	{
+		value: "codex",
+		label: "OpenAI",
+		description: "OpenAI's native web_search (uses ChatGPT OAuth via /login openai-codex)",
+	},
+	{ value: "zai", label: "Z.AI", description: "Calls Z.AI webSearchPrime MCP" },
+	{ value: "exa", label: "Exa", description: "Uses Exa API when EXA_API_KEY is set; falls back to Exa MCP" },
+	{ value: "jina", label: "Jina", description: "Requires JINA_API_KEY" },
+	{ value: "kagi", label: "Kagi", description: "Requires KAGI_API_KEY and Kagi Search API beta access" },
+	{ value: "tavily", label: "Tavily", description: "Requires TAVILY_API_KEY" },
+	{ value: "brave", label: "Brave", description: "Requires BRAVE_API_KEY" },
+	{ value: "kimi", label: "Kimi", description: "Requires MOONSHOT_SEARCH_API_KEY or MOONSHOT_API_KEY" },
+	{ value: "parallel", label: "Parallel", description: "Requires PARALLEL_API_KEY" },
+	{ value: "synthetic", label: "Synthetic", description: "Requires SYNTHETIC_API_KEY" },
+	{ value: "searxng", label: "SearXNG", description: "Requires SEARXNG_ENDPOINT or searxng.endpoint" },
+] as const;
+
+/** Supported web search providers (every option except `auto`). */
+export type SearchProviderId = Exclude<(typeof SEARCH_PROVIDER_OPTIONS)[number]["value"], "auto">;
+
+/**
+ * Auto-resolution priority order. Derived from {@link SEARCH_PROVIDER_OPTIONS}
+ * (minus `auto`) so the settings/setup dropdown and `resolveProviderChain()`
+ * share one source of truth and never drift apart.
+ */
+export const SEARCH_PROVIDER_ORDER: readonly SearchProviderId[] = SEARCH_PROVIDER_OPTIONS.flatMap(option =>
+	option.value === "auto" ? [] : [option.value],
+);
+
+export const SEARCH_PROVIDER_PREFERENCES = ["auto", ...SEARCH_PROVIDER_ORDER] as const;
+
+/** Display labels, derived from {@link SEARCH_PROVIDER_OPTIONS}. */
+export const SEARCH_PROVIDER_LABELS = Object.fromEntries(
+	SEARCH_PROVIDER_OPTIONS.flatMap(option => (option.value === "auto" ? [] : [[option.value, option.label] as const])),
+) as Record<SearchProviderId, string>;
 
 export function isSearchProviderId(value: string): value is SearchProviderId {
-	return [
-		"exa",
-		"brave",
-		"jina",
-		"kimi",
-		"zai",
-		"anthropic",
-		"perplexity",
-		"gemini",
-		"codex",
-		"tavily",
-		"parallel",
-		"kagi",
-		"synthetic",
-		"searxng",
-	].includes(value);
+	return SEARCH_PROVIDER_ORDER.includes(value as SearchProviderId);
 }
 
 export function isSearchProviderPreference(value: string): value is SearchProviderId | "auto" {
-	return value === "auto" || isSearchProviderId(value);
+	return SEARCH_PROVIDER_PREFERENCES.includes(value as SearchProviderId | "auto");
 }
 
 /** Source returned by search (all providers) */
@@ -431,6 +456,7 @@ export interface PerplexityResponse {
 	choices: PerplexityChoice[];
 	citations?: string[] | null;
 	search_results?: PerplexitySearchResult[] | null;
+	related_questions?: string[] | null;
 	type?: PerplexityCompletionResponseType | null;
 	status?: PerplexityCompletionResponseStatus | null;
 }

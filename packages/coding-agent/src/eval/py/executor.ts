@@ -1,3 +1,4 @@
+import * as fs from "node:fs";
 import * as path from "node:path";
 
 import { getProjectDir, logger } from "@oh-my-pi/pi-utils";
@@ -5,6 +6,7 @@ import { Settings } from "../../config/settings";
 import { OutputSink } from "../../session/streaming-output";
 import type { ToolSession } from "../../tools";
 import { resolveOutputMaxColumns, resolveOutputSinkHeadBytes } from "../../tools/output-meta";
+import { isEvalTimeoutControlEvent } from "../bridge-timeout";
 import type { JsStatusEvent } from "../js/shared/types";
 import {
 	checkPythonKernelAvailability,
@@ -14,6 +16,7 @@ import {
 	type KernelRuntimeEnv,
 	PythonKernel,
 } from "./kernel";
+import { resolveExplicitPythonRuntime } from "./runtime";
 import { ensurePyToolBridge, registerPyToolBridge } from "./tool-bridge";
 
 export type PythonKernelMode = "session" | "per-call";
@@ -25,6 +28,12 @@ export interface PythonExecutorOptions {
 	timeoutMs?: number;
 	/** Absolute wall-clock deadline in milliseconds since epoch */
 	deadlineMs?: number;
+	/**
+	 * Runtime-work budget (ms). Used only for timeout-annotation text when the
+	 * caller drives cancellation via the eval watchdog `signal` instead of a
+	 * wall-clock `deadlineMs`/`timeoutMs`. Does not arm a timer.
+	 */
+	idleTimeoutMs?: number;
 	/** Callback for streaming output chunks (already sanitized) */
 	onChunk?: (chunk: string) => Promise<void> | void;
 	/** AbortSignal for cancellation */
@@ -35,6 +44,11 @@ export interface PythonExecutorOptions {
 	kernelOwnerId?: string;
 	/** Kernel mode (session reuse vs per-call) */
 	kernelMode?: PythonKernelMode;
+	/**
+	 * Explicit interpreter path (`python.interpreter` resolved from the
+	 * session's settings). Skips automatic runtime discovery when set.
+	 */
+	interpreter?: string;
 	/** Restart the kernel before executing */
 	reset?: boolean;
 	/** Session file path for accessing task outputs */
@@ -50,6 +64,13 @@ export interface PythonExecutorOptions {
 	artifactPath?: string;
 	artifactId?: string;
 	/**
+	 * On-disk roots the prelude helpers (`read`/`write`/`append`) substitute for
+	 * internal-URL schemes (e.g. `{ local: "/…/artifacts/local" }`). Exported to
+	 * the kernel as `PI_EVAL_LOCAL_ROOTS` (JSON) so `write("local://x")` lands
+	 * where `read local://x` resolves instead of a literal `local:/` directory.
+	 */
+	localRoots?: Record<string, string>;
+	/**
 	 * ToolSession used to resolve host-side `tool.<name>(args)` calls made from
 	 * the Python prelude's bridge proxy. When omitted, the bridge env vars are
 	 * not injected and any `tool.foo(...)` raises in Python.
@@ -57,6 +78,13 @@ export interface PythonExecutorOptions {
 	toolSession?: ToolSession;
 	/** Callback for status events emitted by tool bridge invocations. */
 	emitStatus?: (event: JsStatusEvent) => void;
+	/**
+	 * Live status events streamed as they are emitted (both host-side bridge
+	 * helpers like `agent()` and kernel-side `display`/`log`/`phase`). Mirrors
+	 * what lands in `displayOutputs` so callers can render progress before the
+	 * cell finishes.
+	 */
+	onStatus?: (event: JsStatusEvent) => void;
 	/** @internal Bridge session id, set by `executePython` before delegating. */
 	bridgeSessionId?: string;
 	/** @internal Bridge endpoint info, set by `executePython` before delegating. */
@@ -95,9 +123,9 @@ export interface PythonResult {
 // ---------------------------------------------------------------------------
 // Session bookkeeping
 //
-// One PythonKernel subprocess per (session id, cwd) tuple. The runner mutates
-// process-global cwd/sys.path during execution, so cross-directory work MUST
-// never share a live kernel. Multiple agent owners can still register against
+// One PythonKernel subprocess per (session id, cwd, interpreter) tuple. The
+// runner mutates process-global cwd/sys.path during execution, so cross-directory
+// work must never share a live kernel. Multiple agent owners can still register against
 // the same tuple; the kernel stays alive until the last owner detaches.
 // ---------------------------------------------------------------------------
 
@@ -112,14 +140,25 @@ interface PythonSession {
 
 const sessions = new Map<string, PythonSession>();
 const startingSessions = new Map<string, Promise<PythonSession>>();
-const resettingSessions = new Set<string>();
+const resettingSessions = new Map<string, Promise<void>>();
 
 function normalizeSessionCwd(cwd: string): string {
 	return path.resolve(cwd);
 }
 
-function buildSessionKey(sessionId: string, cwd: string): string {
-	return `${sessionId}\0${normalizeSessionCwd(cwd)}`;
+function normalizeExplicitInterpreter(cwd: string, interpreter: string | undefined): string {
+	if (interpreter === undefined) return "";
+	const resolved = resolveExplicitPythonRuntime(interpreter, cwd, {}).pythonPath;
+	try {
+		return fs.realpathSync.native(resolved);
+	} catch {
+		return resolved;
+	}
+}
+
+function buildSessionKey(sessionId: string, cwd: string, interpreter: string | undefined): string {
+	const normalizedCwd = normalizeSessionCwd(cwd);
+	return `${sessionId}\0${normalizedCwd}\0${normalizeExplicitInterpreter(normalizedCwd, interpreter)}`;
 }
 
 // ---------------------------------------------------------------------------
@@ -261,6 +300,7 @@ const MANAGED_KERNEL_ENV_KEYS = [
 	"PI_TOOL_BRIDGE_URL",
 	"PI_TOOL_BRIDGE_TOKEN",
 	"PI_TOOL_BRIDGE_SESSION",
+	"PI_EVAL_LOCAL_ROOTS",
 ] as const;
 
 function buildKernelEnvPatch(options: {
@@ -268,13 +308,16 @@ function buildKernelEnvPatch(options: {
 	artifactsDir?: string;
 	bridgeSessionId?: string;
 	bridge?: { url: string; token: string };
+	localRoots?: Record<string, string>;
 }): KernelRuntimeEnv {
+	const localRoots = options.localRoots;
 	return {
 		PI_SESSION_FILE: options.sessionFile ?? null,
 		PI_ARTIFACTS_DIR: options.artifactsDir ?? null,
 		PI_TOOL_BRIDGE_URL: options.bridge?.url ?? null,
 		PI_TOOL_BRIDGE_TOKEN: options.bridge?.token ?? null,
 		PI_TOOL_BRIDGE_SESSION: options.bridge && options.bridgeSessionId ? options.bridgeSessionId : null,
+		PI_EVAL_LOCAL_ROOTS: localRoots && Object.keys(localRoots).length > 0 ? JSON.stringify(localRoots) : null,
 	};
 }
 
@@ -283,6 +326,7 @@ function buildKernelEnv(options: {
 	artifactsDir?: string;
 	bridgeSessionId?: string;
 	bridge?: { url: string; token: string };
+	localRoots?: Record<string, string>;
 }): Record<string, string> | undefined {
 	const patch = buildKernelEnvPatch(options);
 	const env: Record<string, string> = {};
@@ -300,6 +344,7 @@ async function startKernel(cwd: string, options: PythonExecutorOptions): Promise
 		env: buildKernelEnv(options),
 		signal: options.signal,
 		deadlineMs: options.deadlineMs,
+		interpreter: options.interpreter,
 	});
 }
 
@@ -474,11 +519,18 @@ async function executeWithKernel(
 	const deadlineMs = getExecutionDeadlineMs(options);
 	let executionTimeoutMs: number | undefined;
 
-	const emitStatus =
-		options?.emitStatus ??
-		((event: JsStatusEvent) => {
-			displayOutputs.push({ type: "status", event });
-		});
+	// Collect every display output and, for status events, stream them live so
+	// long-running bridge helpers (e.g. `agent()`) surface progress mid-cell.
+	const collectDisplay = (output: KernelDisplayOutput) => {
+		if (output.type === "status") {
+			// Timeout-control events drive the eval watchdog only; never store or
+			// render them as cell output.
+			options?.onStatus?.(output.event);
+			if (isEvalTimeoutControlEvent(output.event)) return;
+		}
+		displayOutputs.push(output);
+	};
+	const emitStatus = options?.emitStatus ?? ((event: JsStatusEvent) => collectDisplay({ type: "status", event }));
 	const runId = `py-${crypto.randomUUID()}`;
 	const unregisterBridge =
 		options?.toolSession && options?.bridgeSessionId
@@ -498,12 +550,12 @@ async function executeWithKernel(
 			signal: options?.signal,
 			timeoutMs: executionTimeoutMs,
 			onChunk: text => sink.push(text),
-			onDisplay: output => void displayOutputs.push(output),
+			onDisplay: output => collectDisplay(output),
 		});
 
 		if (result.cancelled) {
 			const annotation = result.timedOut
-				? formatKernelTimeoutAnnotation(executionTimeoutMs, result.kernelKilled ?? false)
+				? formatKernelTimeoutAnnotation(executionTimeoutMs ?? options?.idleTimeoutMs, result.kernelKilled ?? false)
 				: undefined;
 			return {
 				exitCode: undefined,
@@ -540,7 +592,9 @@ async function executeWithKernel(
 				cancelled: true,
 				displayOutputs,
 				stdinRequested: false,
-				...(await sink.dump(timedOut ? formatTimeoutAnnotation(executionTimeoutMs) : undefined)),
+				...(await sink.dump(
+					timedOut ? formatTimeoutAnnotation(executionTimeoutMs ?? options?.idleTimeoutMs) : undefined,
+				)),
 			};
 		}
 		const error = err instanceof Error ? err : new Error(String(err));
@@ -552,7 +606,10 @@ async function executeWithKernel(
 }
 
 async function ensureKernelAvailable(cwd: string, options: PythonExecutorOptions): Promise<void> {
-	const availability = await waitForPromiseWithCancellation(checkPythonKernelAvailability(cwd), options);
+	const availability = await waitForPromiseWithCancellation(
+		checkPythonKernelAvailability(cwd, options.interpreter),
+		options,
+	);
 	if (!availability.ok) {
 		throw new Error(availability.reason ?? "Python kernel unavailable");
 	}
@@ -575,7 +632,7 @@ async function executePerCall(code: string, cwd: string, options: PythonExecutor
 	}
 	const kernel = await startKernel(cwd, options);
 	try {
-		return await executeWithKernel(kernel, code, { ...options, cwd: undefined });
+		return await executeWithKernel(kernel, code, { ...options, cwd });
 	} finally {
 		await kernel.shutdown().catch(() => undefined);
 	}
@@ -583,22 +640,34 @@ async function executePerCall(code: string, cwd: string, options: PythonExecutor
 
 async function executeOnSession(code: string, cwd: string, options: PythonExecutorOptions): Promise<PythonResult> {
 	const sessionId = options.sessionId ?? `session:${cwd}`;
-	const sessionKey = buildSessionKey(sessionId, cwd);
+	const sessionKey = buildSessionKey(sessionId, cwd, options.interpreter);
 	if (options.bridge && !options.bridgeSessionId) {
 		options.bridgeSessionId = sessionId;
 	}
 	if (options.reset) {
-		if (resettingSessions.has(sessionKey)) {
-			throw new Error("Python kernel reset already in progress");
+		// Coalesce concurrent resets: if another reset is in flight for this
+		// session, await it instead of throwing — the caller's intent ("start
+		// from a clean kernel") is satisfied once that reset settles.
+		const inFlight = resettingSessions.get(sessionKey);
+		if (inFlight) await inFlight.catch(() => undefined);
+		else {
+			const resetPromise = resetSession(sessionKey);
+			resettingSessions.set(
+				sessionKey,
+				resetPromise.then(() => undefined),
+			);
+			try {
+				await resetPromise;
+			} finally {
+				resettingSessions.delete(sessionKey);
+			}
 		}
-		resettingSessions.add(sessionKey);
-		try {
-			await resetSession(sessionKey);
-		} finally {
-			resettingSessions.delete(sessionKey);
-		}
-	} else if (resettingSessions.has(sessionKey)) {
-		throw new Error("Python kernel reset in progress");
+	} else {
+		// A reset already in progress is an internal coordination state, not a
+		// user-visible failure. Wait for it to clear, then proceed with the
+		// requested execution on the freshly-restarted kernel.
+		const inFlight = resettingSessions.get(sessionKey);
+		if (inFlight) await inFlight.catch(() => undefined);
 	}
 	const session = await acquireSession(sessionKey, sessionId, cwd, options);
 	if (options.signal?.aborted) {
@@ -613,7 +682,7 @@ async function executeOnSession(code: string, cwd: string, options: PythonExecut
 			throw new PythonExecutionCancelledError(false);
 		}
 	}
-	const runOptions = { ...options, cwd: undefined };
+	const runOptions = { ...options, cwd };
 	try {
 		return await executeWithKernel(session.kernel, code, runOptions);
 	} catch (err) {

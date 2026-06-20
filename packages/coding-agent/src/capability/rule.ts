@@ -10,6 +10,14 @@ import type { SourceMeta } from "./types";
 const CONDITION_GLOB_SCOPE_TOOLS = ["edit", "write"] as const;
 
 /**
+ * Provider id for the bundled default rules shipped with the agent.
+ * Lowest priority, so any user/project/tool rule of the same name overrides
+ * a bundled default. Also used to gate the whole bundled set via
+ * `ttsr.builtinRules`.
+ */
+export const BUILTIN_DEFAULTS_PROVIDER_ID = "builtin-defaults";
+
+/**
  * Parsed frontmatter from rule files.
  */
 export interface RuleFrontmatter {
@@ -18,6 +26,8 @@ export interface RuleFrontmatter {
 	alwaysApply?: boolean;
 	/** New key for TTSR match conditions. */
 	condition?: string | string[];
+	/** TTSR match condition(s) expressed as ast-grep patterns (edit/write streams only). */
+	astCondition?: string | string[];
 	/** New key for TTSR stream scope. */
 	scope?: string | string[];
 	/** Per-rule TTSR interrupt mode override. */
@@ -43,6 +53,8 @@ export interface Rule {
 	description?: string;
 	/** Regex condition(s) that can trigger TTSR interruption. */
 	condition?: string[];
+	/** ast-grep pattern condition(s) that can trigger TTSR interruption (edit/write streams only). */
+	astCondition?: string[];
 	/** Optional stream scope tokens (for example: text, thinking, tool:edit(*.ts)). */
 	scope?: string[];
 	/** Per-rule TTSR interrupt mode override (falls back to global ttsr.interruptMode). */
@@ -180,10 +192,14 @@ function isLikelyFileGlob(value: string): boolean {
  * - legacy `ttsr_trigger` / `ttsrTrigger` are accepted as a `condition` fallback
  * - condition tokens that look like file globs become scope shorthands:
  *   `*.rs` => `tool:edit(*.rs)`, `tool:write(*.rs)` and a catch-all condition `.*`
+ * - `astCondition` holds ast-grep patterns and is kept verbatim (no glob inference)
  */
-export function parseRuleConditionAndScope(frontmatter: RuleFrontmatter): Pick<Rule, "condition" | "scope"> {
+export function parseRuleConditionAndScope(
+	frontmatter: RuleFrontmatter,
+): Pick<Rule, "condition" | "astCondition" | "scope"> {
 	const rawCondition = frontmatter.condition ?? frontmatter.ttsr_trigger ?? frontmatter.ttsrTrigger;
 	const parsedCondition = normalizeRuleField(rawCondition);
+	const astCondition = normalizeRuleField(frontmatter.astCondition);
 	const parsedScope = normalizeScopeField(frontmatter.scope);
 
 	const inferredScope: string[] = [];
@@ -205,6 +221,7 @@ export function parseRuleConditionAndScope(frontmatter: RuleFrontmatter): Pick<R
 	const scope = [...(parsedScope ?? []), ...inferredScope];
 	return {
 		condition: condition.length > 0 ? Array.from(new Set(condition)) : undefined,
+		astCondition,
 		scope: scope.length > 0 ? Array.from(new Set(scope)) : undefined,
 	};
 }

@@ -4,10 +4,10 @@ import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
 
-import { AuthStorage, SqliteAuthCredentialStore } from "../src/auth-storage";
-import * as deepseekModule from "../src/utils/oauth/deepseek";
-import * as kagiModule from "../src/utils/oauth/kagi";
-import * as ollamaCloudModule from "../src/utils/oauth/ollama-cloud";
+import { AuthStorage, SqliteAuthCredentialStore } from "@oh-my-pi/pi-ai/auth-storage";
+import * as deepseekModule from "@oh-my-pi/pi-ai/registry/deepseek";
+import * as kagiModule from "@oh-my-pi/pi-ai/registry/kagi";
+import * as ollamaCloudModule from "@oh-my-pi/pi-ai/registry/ollama-cloud";
 
 function countCredentialRows(dbPath: string, provider: string): number {
 	const db = new Database(dbPath, { readonly: true });
@@ -15,6 +15,21 @@ function countCredentialRows(dbPath: string, provider: string): number {
 		const row = db.prepare("SELECT COUNT(*) AS count FROM auth_credentials WHERE provider = ?").get(provider) as
 			| { count?: number }
 			| undefined;
+		return row?.count ?? 0;
+	} finally {
+		db.close();
+	}
+}
+
+function countCredentialRowsByDisabledState(dbPath: string, provider: string, disabled: boolean): number {
+	const disabledClause = disabled ? "IS NOT NULL" : "IS NULL";
+	const db = new Database(dbPath, { readonly: true });
+	try {
+		const row = db
+			.prepare(
+				`SELECT COUNT(*) AS count FROM auth_credentials WHERE provider = ? AND disabled_cause ${disabledClause}`,
+			)
+			.get(provider) as { count?: number } | undefined;
 		return row?.count ?? 0;
 	} finally {
 		db.close();
@@ -70,12 +85,24 @@ describe("AuthStorage api-key login replacement", () => {
 		expect(credentials).toHaveLength(1);
 		const [stored] = credentials;
 		expect(stored?.credential.type).toBe("api_key");
-		if (!stored || stored.credential.type !== "api_key") {
+		if (stored?.credential.type !== "api_key") {
 			throw new Error("expected stored api-key credential");
 		}
 		expect(stored.credential.key).toBe("same-kagi-key");
 		expect(store.getApiKey("kagi")).toBe("same-kagi-key");
 		expect(await authStorage.getApiKey("kagi", "session-kagi-relogin")).toBe("same-kagi-key");
+	});
+
+	it("hard-deletes superseded api-key rows when a different key replaces them", () => {
+		if (!store || !dbPath) throw new Error("test setup failed");
+
+		store.saveApiKey("kagi", "old-key-123");
+		store.saveApiKey("kagi", "new-key-456");
+
+		expect(countCredentialRows(dbPath, "kagi")).toBe(1);
+		expect(countCredentialRowsByDisabledState(dbPath, "kagi", false)).toBe(1);
+		expect(countCredentialRowsByDisabledState(dbPath, "kagi", true)).toBe(0);
+		expect(store.getApiKey("kagi")).toBe("new-key-456");
 	});
 
 	it("reuses the stored api-key row when ollama-cloud re-login returns the same key", async () => {
@@ -96,7 +123,7 @@ describe("AuthStorage api-key login replacement", () => {
 		expect(credentials).toHaveLength(1);
 		const [stored] = credentials;
 		expect(stored?.credential.type).toBe("api_key");
-		if (!stored || stored.credential.type !== "api_key") {
+		if (stored?.credential.type !== "api_key") {
 			throw new Error("expected stored api-key credential");
 		}
 		expect(stored.credential.key).toBe("same-ollama-cloud-key");
@@ -122,7 +149,7 @@ describe("AuthStorage api-key login replacement", () => {
 		expect(credentials).toHaveLength(1);
 		const [stored] = credentials;
 		expect(stored?.credential.type).toBe("api_key");
-		if (!stored || stored.credential.type !== "api_key") {
+		if (stored?.credential.type !== "api_key") {
 			throw new Error("expected stored api-key credential");
 		}
 		expect(stored.credential.key).toBe("same-deepseek-key");

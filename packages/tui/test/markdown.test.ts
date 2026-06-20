@@ -1,29 +1,24 @@
-import { afterAll, beforeAll, describe, expect, it } from "bun:test";
-import type { Terminal as XtermTerminalType } from "@xterm/headless";
+import { afterAll, afterEach, beforeAll, describe, expect, it } from "bun:test";
+import { stripVTControlCharacters } from "node:util";
+import { clearRenderCache, Markdown, renderInlineMarkdown } from "@oh-my-pi/pi-tui/components/markdown";
+import { setTerminalTextSizing, TERMINAL } from "@oh-my-pi/pi-tui/terminal-capabilities";
+import { type Component, TUI } from "@oh-my-pi/pi-tui/tui";
+import { visibleWidth } from "@oh-my-pi/pi-tui/utils";
 import { Chalk } from "chalk";
-import { Markdown, renderInlineMarkdown } from "../src/components/markdown.js";
-import { TERMINAL } from "../src/terminal-capabilities.js";
-import { type Component, TUI } from "../src/tui.js";
 import { defaultMarkdownTheme } from "./test-themes.js";
 import { VirtualTerminal } from "./virtual-terminal.js";
 
 // Force full color in CI so ANSI assertions are deterministic
 const chalk = new Chalk({ level: 3 });
 
-function getCellItalic(terminal: VirtualTerminal, row: number, col: number): number {
-	const xterm = (terminal as unknown as { xterm: XtermTerminalType }).xterm;
-	const buffer = xterm.buffer.active;
-	const line = buffer.getLine(buffer.viewportY + row);
-	expect(line, `Missing buffer line at row ${row}`).toBeTruthy();
-	const cell = line!.getCell(col);
-	expect(cell, `Missing cell at row ${row} col ${col}`).toBeTruthy();
-	return cell!.isItalic();
+function getCellItalic(terminal: VirtualTerminal, row: number, col: number): boolean {
+	return terminal.getCellItalic(row, col);
 }
 
 describe("renderInlineMarkdown", () => {
 	it("preserves ordered list items as visible inline text", () => {
 		const rendered = renderInlineMarkdown("1. Review against a base branch (PR Style)", defaultMarkdownTheme);
-		const plain = rendered.replace(/\x1b\[[0-9;]*m/g, "");
+		const plain = stripVTControlCharacters(rendered);
 
 		expect(plain).toBe("1. Review against a base branch (PR Style)");
 	});
@@ -60,7 +55,7 @@ describe("Markdown component", () => {
 			expect(lines.length > 0).toBeTruthy();
 
 			// Strip ANSI codes for checking
-			const plainLines = lines.map(line => line.replace(/\x1b\[[0-9;]*m/g, ""));
+			const plainLines = lines.map(line => stripVTControlCharacters(line));
 
 			// Check structure
 			expect(plainLines.some(line => line.includes("- Item 1"))).toBeTruthy();
@@ -81,7 +76,7 @@ describe("Markdown component", () => {
 			);
 
 			const lines = markdown.render(80);
-			const plainLines = lines.map(line => line.replace(/\x1b\[[0-9;]*m/g, ""));
+			const plainLines = lines.map(line => stripVTControlCharacters(line));
 
 			// Check proper indentation
 			expect(plainLines.some(line => line.includes("- Level 1"))).toBeTruthy();
@@ -102,7 +97,7 @@ describe("Markdown component", () => {
 			);
 
 			const lines = markdown.render(80);
-			const plainLines = lines.map(line => line.replace(/\x1b\[[0-9;]*m/g, ""));
+			const plainLines = lines.map(line => stripVTControlCharacters(line));
 
 			expect(plainLines.some(line => line.includes("1. First"))).toBeTruthy();
 			expect(plainLines.some(line => line.includes("  1. Nested first"))).toBeTruthy();
@@ -123,7 +118,7 @@ describe("Markdown component", () => {
 			);
 
 			const lines = markdown.render(80);
-			const plainLines = lines.map(line => line.replace(/\x1b\[[0-9;]*m/g, ""));
+			const plainLines = lines.map(line => stripVTControlCharacters(line));
 
 			expect(plainLines.some(line => line.includes("1. Ordered item"))).toBeTruthy();
 			expect(plainLines.some(line => line.includes("  - Unordered nested"))).toBeTruthy();
@@ -153,7 +148,7 @@ describe("Markdown component", () => {
 			);
 
 			const lines = markdown.render(80);
-			const plainLines = lines.map(line => line.replace(/\x1b\[[0-9;]*m/g, "").trim());
+			const plainLines = lines.map(line => stripVTControlCharacters(line).trim());
 
 			// Find all lines that start with a number and period
 			const numberedLines = plainLines.filter(line => /^\d+\./.test(line));
@@ -181,7 +176,7 @@ describe("Markdown component", () => {
 			);
 
 			const lines = markdown.render(80);
-			const plainLines = lines.map(line => line.replace(/\x1b\[[0-9;]*m/g, ""));
+			const plainLines = lines.map(line => stripVTControlCharacters(line));
 
 			// Check table structure
 			expect(plainLines.some(line => line.includes("Name"))).toBeTruthy();
@@ -205,7 +200,7 @@ describe("Markdown component", () => {
 			);
 
 			const lines = markdown.render(80);
-			const plainLines = lines.map(line => line.replace(/\x1b\[[0-9;]*m/g, ""));
+			const plainLines = lines.map(line => stripVTControlCharacters(line));
 			const dividerLines = plainLines.filter(line => line.includes("+"));
 
 			expect(dividerLines.length >= 2, "Expected header + row divider").toBeTruthy();
@@ -224,7 +219,7 @@ describe("Markdown component", () => {
 			);
 
 			const lines = markdown.render(32);
-			const plainLines = lines.map(line => line.replace(/\x1b\[[0-9;]*m/g, ""));
+			const plainLines = lines.map(line => stripVTControlCharacters(line));
 			const dataLine = plainLines.find(line => line.includes(longestWord));
 			expect(dataLine, "Expected data row containing longest word").toBeTruthy();
 
@@ -251,7 +246,7 @@ describe("Markdown component", () => {
 			);
 
 			const lines = markdown.render(80);
-			const plainLines = lines.map(line => line.replace(/\x1b\[[0-9;]*m/g, ""));
+			const plainLines = lines.map(line => stripVTControlCharacters(line));
 
 			// Check headers
 			expect(plainLines.some(line => line.includes("Left"))).toBeTruthy();
@@ -277,7 +272,7 @@ describe("Markdown component", () => {
 			// Should render without errors
 			expect(lines.length > 0).toBeTruthy();
 
-			const plainLines = lines.map(line => line.replace(/\x1b\[[0-9;]*m/g, ""));
+			const plainLines = lines.map(line => stripVTControlCharacters(line));
 			expect(plainLines.some(line => line.includes("Very long column header"))).toBeTruthy();
 			expect(plainLines.some(line => line.includes("This is a much longer cell content"))).toBeTruthy();
 		});
@@ -295,7 +290,7 @@ describe("Markdown component", () => {
 
 			// Render at narrow width that forces wrapping
 			const lines = markdown.render(50);
-			const plainLines = lines.map(line => line.replace(/\x1b\[[0-9;]*m/g, "").trimEnd());
+			const plainLines = lines.map(line => stripVTControlCharacters(line).trimEnd());
 
 			// All lines should fit within width
 			for (const line of plainLines) {
@@ -322,12 +317,7 @@ describe("Markdown component", () => {
 
 			// Render at width that forces the cell to wrap
 			const lines = markdown.render(25);
-			const plainLines = lines.map(line =>
-				line
-					.replace(/\x1b\]8;;[^\x07]*\x07/g, "")
-					.replace(/\x1b\[[0-9;]*m/g, "")
-					.trimEnd(),
-			);
+			const plainLines = lines.map(line => stripVTControlCharacters(line).trimEnd());
 
 			// Should have multiple data rows due to wrapping
 			const dataRows = plainLines.filter(line => line.startsWith("|") && !line.includes("-"));
@@ -353,12 +343,7 @@ describe("Markdown component", () => {
 
 			const width = 30;
 			const lines = markdown.render(width);
-			const plainLines = lines.map(line =>
-				line
-					.replace(/\x1b\]8;;[^\x07]*\x07/g, "")
-					.replace(/\x1b\[[0-9;]*m/g, "")
-					.trimEnd(),
-			);
+			const plainLines = lines.map(line => stripVTControlCharacters(line).trimEnd());
 
 			for (const line of plainLines) {
 				expect(
@@ -397,7 +382,7 @@ describe("Markdown component", () => {
 			const joinedOutput = lines.join("\n");
 			expect(joinedOutput.includes("\x1b[33m"), "Inline code should be styled (yellow)").toBeTruthy();
 
-			const plainLines = lines.map(line => line.replace(/\x1b\[[0-9;]*m/g, "").trimEnd());
+			const plainLines = lines.map(line => stripVTControlCharacters(line).trimEnd());
 			for (const line of plainLines) {
 				expect(
 					line.length <= width,
@@ -424,7 +409,7 @@ describe("Markdown component", () => {
 
 			// Very narrow width
 			const lines = markdown.render(15);
-			const plainLines = lines.map(line => line.replace(/\x1b\[[0-9;]*m/g, "").trimEnd());
+			const plainLines = lines.map(line => stripVTControlCharacters(line).trimEnd());
 
 			// Should not crash and should produce output
 			expect(lines.length > 0, "Should produce output").toBeTruthy();
@@ -447,7 +432,7 @@ describe("Markdown component", () => {
 
 			// Wide width where table fits naturally
 			const lines = markdown.render(80);
-			const plainLines = lines.map(line => line.replace(/\x1b\[[0-9;]*m/g, "").trimEnd());
+			const plainLines = lines.map(line => stripVTControlCharacters(line).trimEnd());
 
 			// Should have proper table structure
 			const headerLine = plainLines.find(line => line.includes("A") && line.includes("B"));
@@ -473,7 +458,7 @@ describe("Markdown component", () => {
 
 			// Width 40 with paddingX=2 means contentWidth=36
 			const lines = markdown.render(40);
-			const plainLines = lines.map(line => line.replace(/\x1b\[[0-9;]*m/g, "").trimEnd());
+			const plainLines = lines.map(line => stripVTControlCharacters(line).trimEnd());
 
 			// All lines should respect width
 			for (const line of plainLines) {
@@ -496,7 +481,7 @@ describe("Markdown component", () => {
 			);
 
 			const lines = markdown.render(80);
-			const plainLines = lines.map(line => line.replace(/\x1b\[[0-9;]*m/g, "").trimEnd());
+			const plainLines = lines.map(line => stripVTControlCharacters(line).trimEnd());
 
 			expect(plainLines.at(-1)).not.toBe("");
 		});
@@ -520,7 +505,7 @@ describe("Markdown component", () => {
 			);
 
 			const lines = markdown.render(80);
-			const plainLines = lines.map(line => line.replace(/\x1b\[[0-9;]*m/g, ""));
+			const plainLines = lines.map(line => stripVTControlCharacters(line));
 
 			// Check heading
 			expect(plainLines.some(line => line.includes("Test Document"))).toBeTruthy();
@@ -619,7 +604,7 @@ describe("Markdown component", () => {
 
 			expect(component.markdownLineCount > 0).toBeTruthy();
 			const inputRow = component.markdownLineCount;
-			expect(getCellItalic(terminal, inputRow, 0)).toBe(0);
+			expect(getCellItalic(terminal, inputRow, 0)).toBe(false);
 			tui.stop();
 		});
 	});
@@ -640,7 +625,7 @@ again, hello world`,
 			);
 
 			const lines = markdown.render(80);
-			const plainLines = lines.map(line => line.replace(/\x1b\[[0-9;]*m/g, "").trimEnd());
+			const plainLines = lines.map(line => stripVTControlCharacters(line).trimEnd());
 
 			const closingBackticksIndex = plainLines.indexOf("```");
 			expect(closingBackticksIndex !== -1, "Should have closing backticks").toBeTruthy();
@@ -674,7 +659,7 @@ more text`,
 			for (const text of cases) {
 				const markdown = new Markdown(text, 0, 0, defaultMarkdownTheme);
 				const lines = markdown.render(80);
-				const plainLines = lines.map(line => line.replace(/\x1b\[[0-9;]*m/g, "").trimEnd());
+				const plainLines = lines.map(line => stripVTControlCharacters(line).trimEnd());
 
 				expect(plainLines).toEqual(expectedLines);
 			}
@@ -686,7 +671,7 @@ more text`,
 			for (const text of cases) {
 				const markdown = new Markdown(text, 0, 0, defaultMarkdownTheme);
 				const lines = markdown.render(80);
-				const plainLines = lines.map(line => line.replace(/\x1b\[[0-9;]*m/g, "").trimEnd());
+				const plainLines = lines.map(line => stripVTControlCharacters(line).trimEnd());
 
 				expect(plainLines.at(-1)).not.toBe("");
 			}
@@ -697,7 +682,7 @@ more text`,
 		const renderMermaidLines = (text: string, resolveMermaidAscii: (source: string) => string | null) => {
 			const markdown = new Markdown(text, 0, 0, { ...defaultMarkdownTheme, resolveMermaidAscii });
 
-			return markdown.render(80).map(line => line.replace(/\x1b\[[0-9;]*m/g, "").trimEnd());
+			return markdown.render(80).map(line => stripVTControlCharacters(line).trimEnd());
 		};
 
 		it("renders resolver ASCII only when the mermaid source matches", () => {
@@ -744,7 +729,7 @@ again, hello world`,
 			);
 
 			const lines = markdown.render(80);
-			const plainLines = lines.map(line => line.replace(/\x1b\[[0-9;]*m/g, "").trimEnd());
+			const plainLines = lines.map(line => stripVTControlCharacters(line).trimEnd());
 
 			const dividerIndex = plainLines.findIndex(line => /^-+$/.test(line.trim()));
 			expect(dividerIndex !== -1, "Should have divider").toBeTruthy();
@@ -761,9 +746,76 @@ again, hello world`,
 		it("should not add a trailing blank line when divider is the last rendered block", () => {
 			const markdown = new Markdown("---", 0, 0, defaultMarkdownTheme);
 			const lines = markdown.render(80);
-			const plainLines = lines.map(line => line.replace(/\x1b\[[0-9;]*m/g, "").trimEnd());
+			const plainLines = lines.map(line => stripVTControlCharacters(line).trimEnd());
 
 			expect(plainLines.at(-1)).not.toBe("");
+		});
+	});
+
+	describe("Custom section dividers", () => {
+		it("should render Unicode light line ───────────── as a horizontal rule with ─", () => {
+			const unicodeTheme = {
+				...defaultMarkdownTheme,
+				symbols: {
+					...defaultMarkdownTheme.symbols,
+					hrChar: "─",
+				},
+			};
+			const markdown = new Markdown("─────────────", 0, 0, unicodeTheme);
+			const lines = markdown.render(80);
+			const plainLines = lines.map(line => stripVTControlCharacters(line).trimEnd());
+			expect(plainLines[0]).toBe("─".repeat(80));
+		});
+
+		it("should render double line ============ as a horizontal rule with =", () => {
+			const markdown = new Markdown("============", 0, 0, defaultMarkdownTheme);
+			const lines = markdown.render(80);
+			const plainLines = lines.map(line => stripVTControlCharacters(line).trimEnd());
+			expect(plainLines[0]).toBe("=".repeat(80));
+		});
+
+		it("should render em dash line ——— as a horizontal rule with —", () => {
+			const unicodeTheme = {
+				...defaultMarkdownTheme,
+				symbols: {
+					...defaultMarkdownTheme.symbols,
+					hrChar: "─",
+				},
+			};
+			const markdown = new Markdown("———", 0, 0, unicodeTheme);
+			const lines = markdown.render(80);
+			const plainLines = lines.map(line => stripVTControlCharacters(line).trimEnd());
+			expect(plainLines[0]).toBe("—".repeat(80));
+		});
+
+		it("should render em dash line ——— as a horizontal rule with - in ASCII theme", () => {
+			const asciiTheme = {
+				...defaultMarkdownTheme,
+				symbols: {
+					...defaultMarkdownTheme.symbols,
+					hrChar: "-",
+				},
+			};
+			const markdown = new Markdown("———", 0, 0, asciiTheme);
+			const lines = markdown.render(80);
+			const plainLines = lines.map(line => stripVTControlCharacters(line).trimEnd());
+			expect(plainLines[0]).toBe("-".repeat(80));
+		});
+
+		it("should preserve Setext H1 headings for Title\\n===", () => {
+			const markdown = new Markdown("Title\n===", 0, 0, defaultMarkdownTheme);
+			const lines = markdown.render(80);
+			const plainLines = lines.map(line => stripVTControlCharacters(line).trimEnd());
+			expect(plainLines.some(line => line.includes("Title"))).toBeTruthy();
+			expect(plainLines.includes("=".repeat(80))).toBeFalsy();
+		});
+
+		it("should preserve Setext H2 headings for Title\\n---", () => {
+			const markdown = new Markdown("Title\n---", 0, 0, defaultMarkdownTheme);
+			const lines = markdown.render(80);
+			const plainLines = lines.map(line => stripVTControlCharacters(line).trimEnd());
+			expect(plainLines.some(line => line.includes("Title"))).toBeTruthy();
+			expect(plainLines.includes("─".repeat(80))).toBeFalsy();
 		});
 	});
 
@@ -779,7 +831,7 @@ This is a paragraph`,
 			);
 
 			const lines = markdown.render(80);
-			const plainLines = lines.map(line => line.replace(/\x1b\[[0-9;]*m/g, "").trimEnd());
+			const plainLines = lines.map(line => stripVTControlCharacters(line).trimEnd());
 
 			const headingIndex = plainLines.findIndex(line => line.includes("Hello"));
 			expect(headingIndex !== -1, "Should have heading").toBeTruthy();
@@ -796,7 +848,7 @@ This is a paragraph`,
 		it("should not add a trailing blank line when heading is the last rendered block", () => {
 			const markdown = new Markdown("# Hello", 0, 0, defaultMarkdownTheme);
 			const lines = markdown.render(80);
-			const plainLines = lines.map(line => line.replace(/\x1b\[[0-9;]*m/g, "").trimEnd());
+			const plainLines = lines.map(line => stripVTControlCharacters(line).trimEnd());
 
 			expect(plainLines.at(-1)).not.toBe("");
 		});
@@ -816,7 +868,7 @@ again, hello world`,
 			);
 
 			const lines = markdown.render(80);
-			const plainLines = lines.map(line => line.replace(/\x1b\[[0-9;]*m/g, "").trimEnd());
+			const plainLines = lines.map(line => stripVTControlCharacters(line).trimEnd());
 
 			const quoteIndex = plainLines.findIndex(line => line.includes("This is a quote"));
 			expect(quoteIndex !== -1, "Should have blockquote").toBeTruthy();
@@ -833,7 +885,7 @@ again, hello world`,
 		it("should not add a trailing blank line when blockquote is the last rendered block", () => {
 			const markdown = new Markdown("> This is a quote", 0, 0, defaultMarkdownTheme);
 			const lines = markdown.render(80);
-			const plainLines = lines.map(line => line.replace(/\x1b\[[0-9;]*m/g, "").trimEnd());
+			const plainLines = lines.map(line => stripVTControlCharacters(line).trimEnd());
 
 			expect(plainLines.at(-1)).not.toBe("");
 		});
@@ -856,7 +908,7 @@ bar`,
 			const lines = markdown.render(80);
 
 			// Both lines should have the quote border
-			const plainLines = lines.map(line => line.replace(/\x1b\[[0-9;]*m/g, ""));
+			const plainLines = lines.map(line => stripVTControlCharacters(line));
 			const quotedLines = plainLines.filter(line => line.startsWith("│ "));
 			expect(quotedLines.length).toBe(2);
 
@@ -890,7 +942,7 @@ bar`,
 			const lines = markdown.render(80);
 
 			// Both lines should have the quote border
-			const plainLines = lines.map(line => line.replace(/\x1b\[[0-9;]*m/g, ""));
+			const plainLines = lines.map(line => stripVTControlCharacters(line));
 			const quotedLines = plainLines.filter(line => line.startsWith("│ "));
 			expect(quotedLines.length).toBe(2);
 
@@ -911,7 +963,7 @@ bar`,
 
 			// Render at narrow width to force wrapping
 			const lines = markdown.render(30);
-			const plainLines = lines.map(line => line.replace(/\x1b\[[0-9;]*m/g, "").trimEnd());
+			const plainLines = lines.map(line => stripVTControlCharacters(line).trimEnd());
 
 			// Filter to non-empty lines (exclude trailing blank line after blockquote)
 			const contentLines = plainLines.filter(line => line.length > 0);
@@ -944,7 +996,7 @@ bar`,
 			);
 
 			const lines = markdown.render(25);
-			const plainLines = lines.map(line => line.replace(/\x1b\[[0-9;]*m/g, "").trimEnd());
+			const plainLines = lines.map(line => stripVTControlCharacters(line).trimEnd());
 
 			// Filter to non-empty lines
 			const contentLines = plainLines.filter(line => line.length > 0);
@@ -966,7 +1018,7 @@ bar`,
 			const markdown = new Markdown("> Quote with **bold** and `code`", 0, 0, defaultMarkdownTheme);
 
 			const lines = markdown.render(80);
-			const plainLines = lines.map(line => line.replace(/\x1b\[[0-9;]*m/g, ""));
+			const plainLines = lines.map(line => stripVTControlCharacters(line));
 
 			// Should have the quote border
 			expect(plainLines.some(line => line.startsWith("│ "))).toBeTruthy();
@@ -992,7 +1044,7 @@ bar`,
 			const markdown = new Markdown("> 1. bla bla\n>    - nested bullet", 0, 0, defaultMarkdownTheme);
 
 			const lines = markdown.render(80);
-			const plainLines = lines.map(line => line.replace(/\x1b\[[0-9;]*m/g, "").trimEnd());
+			const plainLines = lines.map(line => stripVTControlCharacters(line).trimEnd());
 			const quotedLines = plainLines.filter(line => line.startsWith("│ "));
 
 			expect(quotedLines.some(line => line.includes("1. bla bla"))).toBeTruthy();
@@ -1003,7 +1055,7 @@ bar`,
 			const markdown = new Markdown("> | A | B |\n> | --- | --- |\n> | 1 | 2 |", 0, 0, defaultMarkdownTheme);
 
 			const lines = markdown.render(80);
-			const plainLines = lines.map(line => line.replace(/\x1b\[[0-9;]*m/g, "").trimEnd());
+			const plainLines = lines.map(line => stripVTControlCharacters(line).trimEnd());
 			const quotedLines = plainLines.filter(line => line.startsWith("│ "));
 			const quotedOutput = quotedLines.join("\n");
 
@@ -1021,7 +1073,7 @@ bar`,
 			});
 
 			const lines = markdown.render(80);
-			const plainLines = lines.map(line => line.replace(/\x1b\[[0-9;]*m/g, "").trimEnd());
+			const plainLines = lines.map(line => stripVTControlCharacters(line).trimEnd());
 			const quotedLines = plainLines.filter(line => line.startsWith("│ "));
 			const output = lines.join("\n");
 			const plainOutput = quotedLines.join("\n");
@@ -1034,8 +1086,7 @@ bar`,
 		});
 	});
 
-	const stripTerminalSequences = (line: string): string =>
-		line.replace(/\x1b\]8;;[^\x07]*\x07/g, "").replace(/\x1b\[[0-9;]*m/g, "");
+	const stripTerminalSequences = (line: string): string => stripVTControlCharacters(line);
 
 	describe("Links", () => {
 		// CI environments often resolve to the "base" terminal which has hyperlinks
@@ -1142,7 +1193,7 @@ bar`,
 			);
 
 			const lines = markdown.render(80);
-			const plainLines = lines.map(line => line.replace(/\x1b\[[0-9;]*m/g, ""));
+			const plainLines = lines.map(line => stripVTControlCharacters(line));
 			const joinedPlain = plainLines.join(" ");
 
 			// The content inside the tags should be visible
@@ -1156,7 +1207,7 @@ bar`,
 			const markdown = new Markdown("```html\n<div>Some HTML</div>\n```", 0, 0, defaultMarkdownTheme);
 
 			const lines = markdown.render(80);
-			const plainLines = lines.map(line => line.replace(/\x1b\[[0-9;]*m/g, ""));
+			const plainLines = lines.map(line => stripVTControlCharacters(line));
 			const joinedPlain = plainLines.join("\n");
 
 			// HTML in code blocks should be visible
@@ -1165,6 +1216,64 @@ bar`,
 				"Should render HTML in code blocks",
 			).toBeTruthy();
 		});
+	});
+});
+
+describe("Inline color swatches", () => {
+	const FMT = TERMINAL.trueColor ? "ansi-16m" : "ansi-256";
+	// defaultMarkdownTheme supplies no `colorSwatch` symbol, so the renderer uses its ■ default.
+	const swatchFor = (hex: string, glyph = "■"): string => `${Bun.color(`#${hex}`, FMT)}${glyph}`;
+
+	it("paints a colored swatch before a bare hex color in prose", () => {
+		const out = new Markdown("Accent is #C5FFD6 today.", 0, 0, defaultMarkdownTheme).render(80).join("\n");
+		// Swatch (color SGR + chip glyph + fg reset + space) sits immediately before the code.
+		expect(out.includes(`${swatchFor("C5FFD6")}\x1b[39m `)).toBeTruthy();
+		expect(out.includes("#C5FFD6")).toBeTruthy();
+	});
+
+	it("paints a swatch before a backticked hex color", () => {
+		const out = new Markdown("Use `#C5FFD6` for the bg.", 0, 0, defaultMarkdownTheme).render(80).join("\n");
+		expect(out.includes(swatchFor("C5FFD6"))).toBeTruthy();
+		// The code text survives as inline code (theme styles it yellow).
+		expect(out.includes("#C5FFD6")).toBeTruthy();
+	});
+
+	it("does not swatch short numeric references that resemble issue numbers", () => {
+		const out = new Markdown("Fixed #1011, see #123, dark #000.", 0, 0, defaultMarkdownTheme).render(80).join("");
+		expect(out.includes("■")).toBe(false);
+	});
+
+	it("swatches a 3-digit shorthand that contains a hex letter", () => {
+		const out = new Markdown("White is #fff.", 0, 0, defaultMarkdownTheme).render(80).join("\n");
+		expect(out.includes(swatchFor("fff"))).toBeTruthy();
+	});
+
+	it("does not swatch 4-digit hashline #TAG snapshot tags", () => {
+		// Hashline tags are 4 hex digits with letters (e.g. #6C5E) and would
+		// otherwise be read as #RGBA colors. Neither prose nor codespans swatch them.
+		const prose = new Markdown("Re-anchor on #6C5E before editing.", 0, 0, defaultMarkdownTheme).render(80).join("");
+		expect(prose.includes("■")).toBe(false);
+		const code = new Markdown("Tag `#6C5E` stays plain.", 0, 0, defaultMarkdownTheme).render(80).join("");
+		expect(code.includes("■")).toBe(false);
+	});
+
+	it("uses the theme's colorSwatch symbol when provided", () => {
+		const themed = { ...defaultMarkdownTheme, symbols: { ...defaultMarkdownTheme.symbols, colorSwatch: "▢" } };
+		const out = new Markdown("Accent #C5FFD6.", 0, 0, themed).render(80).join("\n");
+		expect(out.includes(swatchFor("C5FFD6", "▢"))).toBeTruthy();
+		expect(out.includes(swatchFor("C5FFD6", "■"))).toBe(false);
+	});
+
+	it("re-applies the surrounding style after the swatch in thinking traces", () => {
+		const out = new Markdown("Picked #C5FFD6 for accent.", 1, 0, defaultMarkdownTheme, {
+			color: text => chalk.gray(text),
+			italic: true,
+		})
+			.render(80)
+			.join("\n");
+		expect(out.includes(swatchFor("C5FFD6"))).toBeTruthy();
+		// Gray (\x1b[90m) is re-opened for the code text — the swatch's fg reset must not bleed.
+		expect(out.includes("\x1b[90m#C5FFD6")).toBeTruthy();
 	});
 });
 
@@ -1197,5 +1306,448 @@ describe("Module-level LRU render cache", () => {
 
 		// Output must be byte-identical — cache is transparent to callers.
 		expect(lines2).toEqual(lines1);
+	});
+
+	it("returns the same array reference from L1 and L2 cache hits", () => {
+		clearRenderCache();
+		const text = "Cache identity sentinel";
+		const width = 80;
+		const markdown = new Markdown(text, 0, 0, defaultMarkdownTheme);
+
+		// L1: same instance, same text, same width → exact same reference.
+		// Reference identity is load-bearing: parents memoize their
+		// concatenation on it (Container/TUI skip work for stable refs).
+		const first = markdown.render(width);
+		expect(markdown.render(width)).toBe(first);
+
+		// L2: a distinct instance with identical inputs shares the module-level
+		// cache entry — same reference, not just equal content.
+		const l2Markdown = new Markdown(text, 0, 0, defaultMarkdownTheme);
+		expect(l2Markdown.render(width)).toBe(first);
+	});
+
+	it("skips code-block highlighting for transient streaming renders", () => {
+		clearRenderCache();
+		let highlightCallCount = 0;
+		const themeWithSpy = {
+			...defaultMarkdownTheme,
+			highlightCode: (_code: string, _lang?: string): string[] => {
+				highlightCallCount++;
+				return ["HIGHLIGHTED"];
+			},
+		};
+
+		const markdown = new Markdown("```ts\nconst streamed = true;\n```", 0, 0, themeWithSpy);
+		markdown.transientRenderCache = true;
+		const plain = stripVTControlCharacters(markdown.render(80).join("\n"));
+
+		expect(highlightCallCount).toBe(0);
+		expect(plain).toContain("const streamed = true;");
+		expect(plain).not.toContain("HIGHLIGHTED");
+	});
+
+	it("re-renders code-block highlighting when a transient instance becomes stable", () => {
+		clearRenderCache();
+		let highlightCallCount = 0;
+		const themeWithSpy = {
+			...defaultMarkdownTheme,
+			highlightCode: (_code: string, _lang?: string): string[] => {
+				highlightCallCount++;
+				return ["HIGHLIGHTED"];
+			},
+		};
+
+		const markdown = new Markdown("```ts\nconst streamed = true;\n```", 0, 0, themeWithSpy);
+		markdown.transientRenderCache = true;
+		const plain = stripVTControlCharacters(markdown.render(80).join("\n"));
+		expect(highlightCallCount).toBe(0);
+		expect(plain).toContain("const streamed = true;");
+
+		markdown.transientRenderCache = false;
+		const highlighted = stripVTControlCharacters(markdown.render(80).join("\n"));
+		expect(highlightCallCount).toBe(1);
+		expect(highlighted).toContain("HIGHLIGHTED");
+	});
+
+	it("skips nested list code-block highlighting for transient streaming renders", () => {
+		clearRenderCache();
+		let highlightCallCount = 0;
+		const themeWithSpy = {
+			...defaultMarkdownTheme,
+			highlightCode: (_code: string, _lang?: string): string[] => {
+				highlightCallCount++;
+				return ["HIGHLIGHTED"];
+			},
+		};
+
+		const markdown = new Markdown("- item\n\n  ```ts\n  const streamed = true;\n  ```", 0, 0, themeWithSpy);
+		markdown.transientRenderCache = true;
+		const plain = stripVTControlCharacters(markdown.render(80).join("\n"));
+
+		expect(highlightCallCount).toBe(0);
+		expect(plain).toContain("const streamed = true;");
+		expect(plain).not.toContain("HIGHLIGHTED");
+	});
+});
+
+describe("OSC 66 text-sizing headings", () => {
+	const OSC66_INTRO = "\x1b]66;";
+
+	afterEach(() => {
+		// The capability gate is process-global; never let it leak into other suites.
+		setTerminalTextSizing(false);
+	});
+
+	it("keeps H1 as plain ANSI when text-sizing is disabled (default)", () => {
+		expect(TERMINAL.textSizing).toBe(false);
+		const lines = new Markdown("# Hello", 0, 0, defaultMarkdownTheme).render(80);
+		expect(lines.some(line => line.includes(OSC66_INTRO))).toBe(false);
+		expect(lines.some(line => stripVTControlCharacters(line).includes("Hello"))).toBe(true);
+	});
+
+	it("emits a scale-2 OSC 66 span for H1 and reserves its second visual row", () => {
+		setTerminalTextSizing(true);
+		const lines = new Markdown("# Hello", 0, 0, defaultMarkdownTheme).render(80);
+
+		const oscIndex = lines.findIndex(line => line.includes(OSC66_INTRO));
+		expect(oscIndex).toBeGreaterThanOrEqual(0);
+		const oscLine = lines[oscIndex]!;
+		expect(oscLine).toContain("s=2");
+		// The heading text rides inside the OSC 66 payload, so it survives in the
+		// raw bytes (stripVTControlCharacters would drop the whole OSC span).
+		expect(oscLine.includes("Hello")).toBe(true);
+		expect(lines[oscIndex + 1]).toBe("");
+
+		// Native + emit agree: a scale-2 span measures exactly twice the plain
+		// heading width regardless of how the span is internally encoded.
+		expect(visibleWidth(oscLine)).toBe(2 * visibleWidth("Hello"));
+	});
+
+	it("leaves the reserved row after a scale-2 H1 as a cursor-only blank", () => {
+		setTerminalTextSizing(true);
+		const lines = new Markdown("# Hello\n\nBody", 0, 0, defaultMarkdownTheme).render(80);
+		const oscIndex = lines.findIndex(line => line.includes(OSC66_INTRO));
+		expect(oscIndex).toBeGreaterThanOrEqual(0);
+		expect(lines[oscIndex + 1]).toBe("");
+		expect(lines.some(line => stripVTControlCharacters(line).includes("Body"))).toBe(true);
+	});
+
+	it("doubles the measured width for wide/emoji H1 glyphs", () => {
+		setTerminalTextSizing(true);
+		const lines = new Markdown("# 🚀 Hi", 0, 0, defaultMarkdownTheme).render(80);
+
+		const oscLine = lines.find(line => line.includes(OSC66_INTRO));
+		expect(oscLine).toBeTruthy();
+		expect(visibleWidth(oscLine!)).toBe(2 * visibleWidth("🚀 Hi"));
+	});
+
+	it("falls back to ANSI when the doubled H1 width would overflow the render width", () => {
+		setTerminalTextSizing(true);
+		// "Hello" is 5 cells; 2*5 = 10 > 8 render columns, so the OSC path is skipped.
+		const lines = new Markdown("# Hello", 0, 0, defaultMarkdownTheme).render(8);
+		expect(lines.some(line => line.includes(OSC66_INTRO))).toBe(false);
+		expect(lines.some(line => stripVTControlCharacters(line).includes("Hello"))).toBe(true);
+	});
+
+	it("keeps H2 as plain ANSI even when text-sizing is enabled", () => {
+		setTerminalTextSizing(true);
+		const lines = new Markdown("## Sub", 0, 0, defaultMarkdownTheme).render(80);
+		expect(lines.some(line => line.includes(OSC66_INTRO))).toBe(false);
+		expect(lines.some(line => stripVTControlCharacters(line).includes("Sub"))).toBe(true);
+	});
+});
+
+describe("Markdown.render reference stability", () => {
+	// History: render() used to return caller-owned copies because the ask tool
+	// renderer did `md(question).push(...optionLines)` and grew the shared cache
+	// array every frame. The contract is now the opposite — render() hands out
+	// the live cached array by reference (parents memoize on reference identity)
+	// and callers that decorate results must copy first; ask.ts was fixed to
+	// copy. These tests pin the reference-identity contract.
+	afterEach(() => clearRenderCache());
+
+	it("returns the identical reference for repeated renders of an unchanged instance", () => {
+		const md = new Markdown("Question text", 1, 0, defaultMarkdownTheme);
+		const first = md.render(40);
+		expect(md.render(40)).toBe(first);
+		expect(md.render(40)).toBe(first);
+	});
+
+	it("shares one array across instances with identical inputs via the L2 cache", () => {
+		const a = new Markdown("Shared markdown body", 1, 0, defaultMarkdownTheme);
+		const b = new Markdown("Shared markdown body", 1, 0, defaultMarkdownTheme);
+		expect(b.render(40)).toBe(a.render(40));
+	});
+
+	it("returns a new reference with updated content after setText", () => {
+		const md = new Markdown("Before edit", 1, 0, defaultMarkdownTheme);
+		const before = md.render(40);
+		expect(before.some(line => stripVTControlCharacters(line).includes("Before edit"))).toBe(true);
+
+		md.setText("After edit");
+		const after = md.render(40);
+		expect(after).not.toBe(before);
+		expect(after.some(line => stripVTControlCharacters(line).includes("After edit"))).toBe(true);
+		expect(after.some(line => stripVTControlCharacters(line).includes("Before edit"))).toBe(false);
+
+		// Re-render after the change is stable again at the new reference.
+		expect(md.render(40)).toBe(after);
+	});
+
+	it("returns a different reference per width, each with correctly fitted rows", () => {
+		const md = new Markdown("Width sentinel content", 1, 0, defaultMarkdownTheme);
+		const narrow = md.render(30);
+		const wide = md.render(60);
+		expect(wide).not.toBe(narrow);
+		expect(narrow.every(line => visibleWidth(line) <= 30)).toBe(true);
+		expect(wide.every(line => visibleWidth(line) <= 60)).toBe(true);
+	});
+
+	it("formats common HTML tags inside table cells", () => {
+		const md = new Markdown(
+			"| Gemini result |\n| --- |\n| <ul><li>None. Static checks <br> are green.</li></ul> |",
+			0,
+			0,
+			defaultMarkdownTheme,
+		);
+		const lines = md.render(80).map(line => stripVTControlCharacters(line).trimEnd());
+		const bulletLineIndex = lines.findIndex(line => line.includes("• None. Static checks"));
+		const continuationLineIndex = lines.findIndex(line => line.includes("are green."));
+
+		expect(lines.some(line => /<\/?(?:br|ul|li)\b/i.test(line))).toBe(false);
+		expect(bulletLineIndex).toBeGreaterThan(-1);
+		expect(continuationLineIndex).toBeGreaterThan(bulletLineIndex);
+	});
+
+	it("preserves separators between adjacent HTML tags inside table cells", () => {
+		const md = new Markdown(
+			"| Result |\n| --- |\n| <ul><li>First</li></ul><p>Second&nbsp;result.</p> |",
+			0,
+			0,
+			defaultMarkdownTheme,
+		);
+		const lines = md.render(80).map(line => stripVTControlCharacters(line).trimEnd());
+		const firstLineIndex = lines.findIndex(line => line.includes("• First"));
+		const secondLineIndex = lines.findIndex(line => line.includes("Second result."));
+
+		expect(lines.some(line => /<\/?(?:p|ul|li)\b|&nbsp;/i.test(line))).toBe(false);
+		expect(firstLineIndex).toBeGreaterThan(-1);
+		expect(secondLineIndex).toBeGreaterThan(firstLineIndex);
+	});
+
+	it("preserves ordered HTML list numbering", () => {
+		const md = new Markdown("<ol><li>First</li><li>Second</li></ol>", 0, 0, defaultMarkdownTheme);
+		const lines = md.render(80).map(line => stripVTControlCharacters(line).trimEnd());
+
+		expect(lines).toContain("1. First");
+		expect(lines).toContain("2. Second");
+		expect(lines.some(line => line.includes("• First") || line.includes("• Second"))).toBe(false);
+	});
+
+	it("keeps HTML list markers with paragraph-wrapped list text", () => {
+		const unordered = new Markdown("<ul><li><p>First</p></li></ul>", 0, 0, defaultMarkdownTheme)
+			.render(80)
+			.map(line => stripVTControlCharacters(line).trimEnd());
+		const ordered = new Markdown('<ol start="3"><li><p>Third</p></li></ol>', 0, 0, defaultMarkdownTheme)
+			.render(80)
+			.map(line => stripVTControlCharacters(line).trimEnd());
+		const table = new Markdown("| Result |\n| --- |\n| <ul><li><p>First</p></li></ul> |", 0, 0, defaultMarkdownTheme)
+			.render(80)
+			.map(line => stripVTControlCharacters(line).trimEnd());
+
+		expect(unordered).toContain("• First");
+		expect(unordered).not.toContain("•");
+		expect(unordered).not.toContain("First");
+		expect(ordered).toContain("3. Third");
+		expect(ordered).not.toContain("3.");
+		expect(ordered).not.toContain("Third");
+		expect(table).toContain("| • First |");
+		expect(table).not.toContain("| •       |");
+	});
+
+	it("fits table columns to split HTML lines", () => {
+		const md = new Markdown("| Result |\n| --- |\n| <ul><li>Pass<br>OK</li></ul> |", 0, 0, defaultMarkdownTheme);
+		const lines = md.render(80).map(line => stripVTControlCharacters(line).trimEnd());
+		const topBorder = lines.find(line => line.startsWith("+"));
+
+		expect(topBorder).toBe("+--------+");
+		expect(lines).toContain("| • Pass |");
+		expect(lines).toContain("| OK     |");
+	});
+
+	it("preserves repeated HTML line breaks as intentional blank spacing", () => {
+		const cases = ["First<br><br>Second", "First<br /><br />Second"];
+
+		for (const input of cases) {
+			const md = new Markdown(input, 0, 0, defaultMarkdownTheme);
+			const lines = md.render(80).map(line => stripVTControlCharacters(line).trimEnd());
+			const firstLineIndex = lines.indexOf("First");
+
+			expect(firstLineIndex).toBeGreaterThan(-1);
+			expect(lines[firstLineIndex + 1]).toBe("");
+			expect(lines[firstLineIndex + 2]).toBe("Second");
+		}
+	});
+
+	it("preserves repeated HTML line breaks inside table cells", () => {
+		const md = new Markdown("| Result |\n| --- |\n| First<br><br>Second |", 0, 0, defaultMarkdownTheme);
+		const lines = md.render(80).map(line => stripVTControlCharacters(line).trimEnd());
+		const firstLineIndex = lines.findIndex(line => line.includes("| First"));
+
+		expect(firstLineIndex).toBeGreaterThan(-1);
+		expect(lines[firstLineIndex + 1]).toContain("|        |");
+		expect(lines[firstLineIndex + 2]).toContain("| Second |");
+	});
+
+	it("indents nested HTML list items by list stack depth", () => {
+		const md = new Markdown(
+			'<ul><li>Parent<ul><li>Child</li><li>Second child</li></ul><ol start="3"><li>Ordered child</li></ol></li><li>Sibling</li></ul>',
+			0,
+			0,
+			defaultMarkdownTheme,
+		);
+		const lines = md.render(80).map(line => stripVTControlCharacters(line).trimEnd());
+
+		expect(lines).toContain("• Parent");
+		expect(lines).toContain("  • Child");
+		expect(lines).toContain("  • Second child");
+		expect(lines).toContain("  3. Ordered child");
+		expect(lines).toContain("• Sibling");
+		expect(lines).not.toContain("• Child");
+		expect(lines).not.toContain("• Second child");
+		expect(lines).not.toContain("3. Ordered child");
+	});
+
+	it("indents nested HTML list items inside table cells", () => {
+		const md = new Markdown(
+			"| Result |\n| --- |\n| <ul><li>Parent<ul><li>Child</li></ul></li></ul> |",
+			0,
+			0,
+			defaultMarkdownTheme,
+		);
+		const lines = md.render(80).map(line => stripVTControlCharacters(line).trimEnd());
+
+		expect(lines.some(line => line.includes("| • Parent"))).toBe(true);
+		expect(lines.some(line => line.includes("|   • Child"))).toBe(true);
+		expect(lines.some(line => line.includes("| • Child"))).toBe(false);
+	});
+
+	it("does not emit ANSI-only lines for empty styled HTML replacements", () => {
+		const md = new Markdown("<p></p>Visible", 0, 0, defaultMarkdownTheme, {
+			color: text => chalk.gray(text),
+			italic: true,
+		});
+		const lines = md.render(80);
+
+		const blankLines = lines.filter(line => stripVTControlCharacters(line).trimEnd() === "");
+		expect(blankLines.length).toBeGreaterThan(0);
+		expect(blankLines.every(line => !line.includes("\x1b["))).toBe(true);
+		expect(lines.some(line => stripVTControlCharacters(line).trimEnd() === "Visible")).toBe(true);
+	});
+
+	it("decodes non-breaking spaces in table text", () => {
+		const md = new Markdown("| Result |\n| --- |\n| A&nbsp;B |", 0, 0, defaultMarkdownTheme);
+		const lines = md.render(80).map(line => stripVTControlCharacters(line).trimEnd());
+
+		expect(lines.some(line => line.includes("A B"))).toBe(true);
+		expect(lines.some(line => line.includes("&nbsp;"))).toBe(false);
+	});
+
+	it("separates paragraph HTML tags instead of concatenating text", () => {
+		const md = new Markdown("<p>First result.</p><p>Second result.</p>", 0, 0, defaultMarkdownTheme);
+		const lines = md.render(80).map(line => stripVTControlCharacters(line).trimEnd());
+
+		expect(lines).toContain("First result.");
+		expect(lines).toContain("Second result.");
+		expect(lines).not.toContain("First result.Second result.");
+	});
+
+	it("drops HTML formatting whitespace between pretty-printed list tags", () => {
+		const md = new Markdown("<ul>\n  <li>First</li>\n  <li>Second</li>\n</ul>", 0, 0, defaultMarkdownTheme);
+		const lines = md.render(80).map(line => stripVTControlCharacters(line).trimEnd());
+
+		// Source indentation must not leak in front of the bullets, and the
+		// formatting newlines between items must not become blank rows.
+		expect(lines).toContain("• First");
+		expect(lines).toContain("• Second");
+		expect(lines.some(line => line.startsWith(" ") && line.includes("•"))).toBe(false);
+		expect(lines.filter(line => line === "").length).toBe(0);
+	});
+});
+
+describe("Math rendering", () => {
+	const plain = (c: Markdown): string =>
+		c
+			.render(80)
+			.map(line => stripVTControlCharacters(line))
+			.join("\n");
+
+	it("converts a bare \\begin{cases} block (no $$ delimiters) to Unicode", () => {
+		const md = new Markdown(
+			"\\operatorname{sgn}(x) =\n\\begin{cases}\n-1 & x < 0 \\\\\n1 & x > 0\n\\end{cases}",
+			0,
+			0,
+			defaultMarkdownTheme,
+		);
+		const out = plain(md);
+		expect(out).toContain("sgn(x)");
+		expect(out).toContain("x < 0");
+		expect(out).not.toContain("begin{cases}");
+	});
+
+	it("converts a $$-delimited matrix block to multi-line Unicode", () => {
+		const md = new Markdown("$$\n\\begin{pmatrix} a & b \\\\ c & d \\end{pmatrix}\n$$", 0, 0, defaultMarkdownTheme);
+		const out = plain(md);
+		expect(out).toContain("(a");
+		expect(out).toContain("d)");
+		expect(out).not.toContain("pmatrix");
+	});
+
+	it("leaves a bare \\begin{itemize} block verbatim (non-math environment)", () => {
+		const md = new Markdown(
+			"\\begin{itemize}\n\\item first\n\\item second\n\\end{itemize}",
+			0,
+			0,
+			defaultMarkdownTheme,
+		);
+		const out = plain(md);
+		expect(out).toContain("begin{itemize}");
+		expect(out).toContain("item first");
+	});
+
+	it("keeps a fenced tex block with \\begin{cases} as code, not math", () => {
+		const md = new Markdown(
+			"```tex\n\\begin{cases}\na & x > 0 \\\\\nb & x < 0\n\\end{cases}\n```",
+			0,
+			0,
+			defaultMarkdownTheme,
+		);
+		const out = plain(md);
+		expect(out).toContain("begin{cases}");
+	});
+
+	it("converts inline $…$ and \\(…\\) spans without breaking surrounding prose", () => {
+		const md = new Markdown("Energy $E = mc^2$ and \\(a + b\\) end.", 0, 0, defaultMarkdownTheme);
+		const out = plain(md);
+		expect(out).toContain("Energy");
+		expect(out).toContain("mc²");
+		expect(out).toContain("a + b");
+		expect(out).toContain("end.");
+		expect(out).not.toContain("$");
+	});
+
+	it("folds a plain `f(x) =` prefix line into the bare cases block (no blank-line split)", () => {
+		const md = new Markdown(
+			"f(x) =\n\\begin{cases}\n1 & x > 0 \\\\\n0 & x < 0\n\\end{cases}",
+			0,
+			0,
+			defaultMarkdownTheme,
+		);
+		const lines = md.render(80).map(line => stripVTControlCharacters(line));
+		const fxIdx = lines.findIndex(line => line.includes("f(x)"));
+		expect(fxIdx).toBeGreaterThanOrEqual(0);
+		expect(lines.join("\n")).not.toContain("begin{cases}");
+		// The cases body follows immediately: folding the lhs in avoids a blank-line paragraph split.
+		expect(lines[fxIdx + 1]).toContain("x > 0");
 	});
 });

@@ -12,6 +12,8 @@ export class ToolResultBuilder<TDetails extends DetailsWithMeta> {
 	#details: TDetails;
 	#meta = outputMeta();
 	#content: ToolContent = [];
+	#isError = false;
+	#useless = false;
 
 	constructor(details?: TDetails) {
 		this.#details = details ?? ({} as TDetails);
@@ -67,6 +69,18 @@ export class ToolResultBuilder<TDetails extends DetailsWithMeta> {
 		return this;
 	}
 
+	/** Flag the result as a non-throwing failure (agent-loop surfaces it as a tool error). */
+	error(value = true): this {
+		this.#isError = value;
+		return this;
+	}
+
+	/** Marks the result contextually useless — compaction may elide it once consumed. */
+	useless(value = true): this {
+		this.#useless = value;
+		return this;
+	}
+
 	done(): AgentToolResult<TDetails> {
 		const meta = this.#meta.get();
 		if (meta) {
@@ -77,6 +91,8 @@ export class ToolResultBuilder<TDetails extends DetailsWithMeta> {
 		return {
 			content: this.#content,
 			details: hasDetails ? this.#details : undefined,
+			...(this.#isError ? { isError: true } : {}),
+			...(this.#useless && !this.#isError ? { useless: true } : {}),
 		};
 	}
 }

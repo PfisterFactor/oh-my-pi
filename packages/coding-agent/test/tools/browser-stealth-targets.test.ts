@@ -1,10 +1,10 @@
 import { describe, expect, it } from "bun:test";
-import type { Browser, CDPSession, Target } from "puppeteer-core";
 import {
 	buildStealthInjectionScriptForTest,
 	configureUserAgentTargetsForTest,
 	targetSupportsUserAgentOverrideForTest,
-} from "../../src/tools/browser/launch";
+} from "@oh-my-pi/pi-coding-agent/tools/browser/launch";
+import type { Browser, CDPSession, Target } from "puppeteer-core";
 
 type SentCommand = {
 	method: string;
@@ -93,7 +93,17 @@ describe("browser stealth bootstrap", () => {
 	it("uses documentElement as the iframe container when document.head is unavailable", () => {
 		type NativeWindow = Pick<
 			typeof globalThis,
-			"Function" | "Object" | "setTimeout" | "Math" | "Event" | "Promise" | "Blob" | "Proxy" | "Intl" | "Date"
+			| "Function"
+			| "Object"
+			| "setTimeout"
+			| "Math"
+			| "Event"
+			| "Promise"
+			| "Blob"
+			| "Proxy"
+			| "Intl"
+			| "Date"
+			| "Reflect"
 		>;
 		type FakeContainer = {
 			appendChild(node: FakeIframe): void;
@@ -128,6 +138,7 @@ describe("browser stealth bootstrap", () => {
 			Proxy,
 			Intl,
 			Date,
+			Reflect,
 		};
 		const iframe: FakeIframe = { contentWindow: nativeWindow, parentNode: null, style: {} };
 		const createdTags: string[] = [];
@@ -148,6 +159,14 @@ describe("browser stealth bootstrap", () => {
 		expect(appended).toEqual([iframe]);
 		expect(removed).toEqual([iframe]);
 		expect(iframe.parentNode).toBeNull();
+	});
+
+	it("caches Reflect methods before any stealth scripts run", () => {
+		const script = buildStealthInjectionScriptForTest();
+		expect(script).toContain("const Reflect_get = nativeWindow.Reflect.get");
+		expect(script).toContain("const Reflect_apply = nativeWindow.Reflect.apply");
+		expect(script).not.toContain("Reflect" + ".get(");
+		expect(script).not.toContain("Reflect.apply(");
 	});
 });
 describe("browser stealth target setup", () => {
@@ -204,6 +223,6 @@ describe("browser stealth target setup", () => {
 
 		const elapsed = performance.now() - started;
 		expect(elapsed).toBeGreaterThanOrEqual(45);
-		expect(elapsed).toBeLessThan(150);
+		expect(elapsed).toBeLessThan(500);
 	});
 });

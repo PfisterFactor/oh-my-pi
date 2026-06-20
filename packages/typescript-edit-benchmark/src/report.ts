@@ -172,23 +172,37 @@ export function generateReport(result: BenchmarkResult): string {
 		`| **Tool Input Chars** | ${formatNumber(summary.totalToolCalls.totalInputChars)} | ${formatNumber(Math.round(summary.avgToolCallsPerTask.totalInputChars))} |`,
 	);
 	lines.push("");
-	lines.push("### Tokens & Time");
+	lines.push("### Tokens & Time (Overall)");
 	lines.push("");
-	lines.push("| Metric | Total (best) | Avg/Task |");
-	lines.push("|--------|--------------|----------|");
+	lines.push("| Metric | Total (best) | Avg/Task | Median | P1 | P99 |");
+	lines.push("|--------|--------------|----------|--------|----|----|");
 	lines.push(
-		`| Input Tokens | ${formatNumber(summary.totalTokens.input)} | ${formatNumber(summary.avgTokensPerTask.input)} |`,
+		`| Input Tokens | ${formatNumber(summary.totalTokens.input)} | ${formatNumber(summary.avgTokensPerTask.input)} | ${formatNumber(summary.medianTokensPerTask.input)} | ${formatNumber(summary.p1TokensPerTask.input)} | ${formatNumber(summary.p99TokensPerTask.input)} |`,
 	);
 	lines.push(
-		`| Output Tokens | ${formatNumber(summary.totalTokens.output)} | ${formatNumber(summary.avgTokensPerTask.output)} |`,
+		`| Output Tokens | ${formatNumber(summary.totalTokens.output)} | ${formatNumber(summary.avgTokensPerTask.output)} | ${formatNumber(summary.medianTokensPerTask.output)} | ${formatNumber(summary.p1TokensPerTask.output)} | ${formatNumber(summary.p99TokensPerTask.output)} |`,
 	);
 	lines.push(
-		`| Total Tokens | ${formatNumber(summary.totalTokens.total)} | ${formatNumber(summary.avgTokensPerTask.total)} |`,
+		`| Total Tokens | ${formatNumber(summary.totalTokens.total)} | ${formatNumber(summary.avgTokensPerTask.total)} | ${formatNumber(summary.medianTokensPerTask.total)} | ${formatNumber(summary.p1TokensPerTask.total)} | ${formatNumber(summary.p99TokensPerTask.total)} |`,
 	);
 	lines.push(
-		`| Duration | ${formatDuration(summary.totalDuration)} | ${formatDuration(summary.avgDurationPerTask)} |`,
+		`| Duration | ${formatDuration(summary.totalDuration)} | ${formatDuration(summary.avgDurationPerTask)} | — | — | — |`,
 	);
-	lines.push(`| **Avg Indent Score** | — | **${formatScore(summary.avgIndentScore)}** |`);
+	lines.push(`| **Avg Indent Score** | — | **${formatScore(summary.avgIndentScore)}** | — | — | — |`);
+	lines.push("");
+	lines.push("### Tokens & Time (One-shot Successes)");
+	lines.push("");
+	lines.push("| Metric | Total | Avg/Task | Median | P1 | P99 |");
+	lines.push("|--------|-------|----------|--------|----|----|");
+	lines.push(
+		`| Input Tokens | ${formatNumber(summary.totalOneShotSuccessTokens.input)} | ${formatNumber(summary.avgOneShotSuccessTokensPerTask.input)} | ${formatNumber(summary.medianOneShotSuccessTokensPerTask.input)} | ${formatNumber(summary.p1OneShotSuccessTokensPerTask.input)} | ${formatNumber(summary.p99OneShotSuccessTokensPerTask.input)} |`,
+	);
+	lines.push(
+		`| Output Tokens | ${formatNumber(summary.totalOneShotSuccessTokens.output)} | ${formatNumber(summary.avgOneShotSuccessTokensPerTask.output)} | ${formatNumber(summary.medianOneShotSuccessTokensPerTask.output)} | ${formatNumber(summary.p1OneShotSuccessTokensPerTask.output)} | ${formatNumber(summary.p99OneShotSuccessTokensPerTask.output)} |`,
+	);
+	lines.push(
+		`| Total Tokens | ${formatNumber(summary.totalOneShotSuccessTokens.total)} | ${formatNumber(summary.avgOneShotSuccessTokensPerTask.total)} | ${formatNumber(summary.medianOneShotSuccessTokensPerTask.total)} | ${formatNumber(summary.p1OneShotSuccessTokensPerTask.total)} | ${formatNumber(summary.p99OneShotSuccessTokensPerTask.total)} |`,
+	);
 	lines.push("");
 
 	if (summary.hashlineEditSubtypes) {

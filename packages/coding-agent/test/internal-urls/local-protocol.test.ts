@@ -90,6 +90,29 @@ describe("LocalProtocolHandler", () => {
 		);
 	});
 
+	it("uses a stable short temp root for long Windows artifact paths", async () => {
+		const longArtifactsDir = path.join(os.tmpdir(), "a".repeat(220), "artifacts");
+		const expectedRoot = path.join(os.tmpdir(), "omp-local", "session_long");
+		const options = {
+			getArtifactsDir: () => longArtifactsDir,
+			getSessionId: () => "session:long",
+		};
+		const root = resolveLocalRoot(options, "win32");
+		const resolved = resolveLocalUrlToPath("local://memo.txt", options, "win32");
+
+		expect(root).toBe(expectedRoot);
+		expect(resolved).toBe(path.join(expectedRoot, "memo.txt"));
+
+		// The short root must survive moves of the artifact directory so
+		// `local://PLAN.md` and handoff files written pre-move stay reachable
+		// after `SessionManager.moveTo()` updates `getArtifactsDir()`.
+		const movedOptions = {
+			getArtifactsDir: () => path.join(os.tmpdir(), "b".repeat(220), "artifacts"),
+			getSessionId: () => "session:long",
+		};
+		expect(resolveLocalRoot(movedOptions, "win32")).toBe(expectedRoot);
+	});
+
 	it("blocks symlink escapes outside local root", async () => {
 		if (process.platform === "win32") return;
 
@@ -108,6 +131,67 @@ describe("LocalProtocolHandler", () => {
 			});
 			const router = InternalUrlRouter.instance();
 			await expect(router.resolve("local://linked/secret.txt")).rejects.toThrow("local:// URL escapes local root");
+		});
+	});
+
+	it("prefers caller-supplied context.localProtocolOptions over the installed override", async () => {
+		await withTempDir(async tempDir => {
+			const overrideArtifactsDir = path.join(tempDir, "override-artifacts");
+			const callerArtifactsDir = path.join(tempDir, "caller-artifacts");
+			await fs.mkdir(path.join(overrideArtifactsDir, "local"), { recursive: true });
+			await fs.mkdir(path.join(callerArtifactsDir, "local"), { recursive: true });
+			await Bun.write(path.join(overrideArtifactsDir, "local", "PLAN.md"), "# wrong session");
+			await Bun.write(path.join(callerArtifactsDir, "local", "PLAN.md"), "# caller session");
+
+			// Process-global override points at the WRONG session (simulates a
+			// stale override leaked from a prior subagent, or the multi-`main`
+			// AgentRegistry case in cmux/ACP where "first one wins" lookup
+			// picks a sibling session's artifacts dir — issue #1608).
+			LocalProtocolHandler.setOverride({
+				getArtifactsDir: () => overrideArtifactsDir,
+				getSessionId: () => "stale-session",
+			});
+
+			const router = InternalUrlRouter.instance();
+			const resource = await router.resolve("local://PLAN.md", {
+				localProtocolOptions: {
+					getArtifactsDir: () => callerArtifactsDir,
+					getSessionId: () => "caller-session",
+				},
+			});
+
+			const expectedSourcePath = await fs.realpath(path.join(callerArtifactsDir, "local", "PLAN.md"));
+
+			expect(resource.content).toBe("# caller session");
+			// `sourcePath` is canonicalized by the handler after symlink escape checks.
+			// On macOS this may turn `/var/...` into `/private/var/...`.
+			expect(resource.sourcePath).toBe(expectedSourcePath);
+		});
+	});
+
+	it("surfaces ENOENT against the caller's local root when the file is missing in that session", async () => {
+		await withTempDir(async tempDir => {
+			const overrideArtifactsDir = path.join(tempDir, "override-artifacts");
+			const callerArtifactsDir = path.join(tempDir, "caller-artifacts");
+			await fs.mkdir(path.join(overrideArtifactsDir, "local"), { recursive: true });
+			await fs.mkdir(path.join(callerArtifactsDir, "local"), { recursive: true });
+			// PLAN.md exists only in the override-pointed session.
+			await Bun.write(path.join(overrideArtifactsDir, "local", "PLAN.md"), "# wrong session");
+
+			LocalProtocolHandler.setOverride({
+				getArtifactsDir: () => overrideArtifactsDir,
+				getSessionId: () => "stale-session",
+			});
+
+			const router = InternalUrlRouter.instance();
+			await expect(
+				router.resolve("local://PLAN.md", {
+					localProtocolOptions: {
+						getArtifactsDir: () => callerArtifactsDir,
+						getSessionId: () => "caller-session",
+					},
+				}),
+			).rejects.toThrow("Local file not found: local://PLAN.md");
 		});
 	});
 });

@@ -79,7 +79,7 @@ describe("createTools", () => {
 		expect(names).toContain("find");
 		expect(names).toContain("lsp");
 		expect(names).toContain("task");
-		expect(names).toContain("todo_write");
+		expect(names).toContain("todo");
 		expect(names).toContain("web_search");
 		expect(names).toContain("resolve");
 		expect(names).not.toContain("fetch");
@@ -201,25 +201,26 @@ describe("createTools", () => {
 				"search.enabled": false,
 				"astGrep.enabled": false,
 				"astEdit.enabled": false,
-				"renderMermaid.enabled": false,
+				"bash.enabled": false,
 				"web_search.enabled": false,
 				"browser.enabled": false,
 				"inspect_image.enabled": false,
-				"calc.enabled": false,
 			}),
 		});
 		const tools = await createTools(session);
 		const names = tools.map(t => t.name);
 
+		expect(names).not.toContain("bash");
 		expect(names).not.toContain("find");
 		expect(names).not.toContain("search");
 		expect(names).not.toContain("ast_grep");
 		expect(names).not.toContain("ast_edit");
-		expect(names).not.toContain("render_mermaid");
 		expect(names).not.toContain("web_search");
 		expect(names).not.toContain("browser");
 		expect(names).not.toContain("inspect_image");
-		expect(names).not.toContain("calc");
+
+		const requestedTools = await createTools(session, ["bash", "read"]);
+		expect(requestedTools.map(t => t.name)).toEqual(["read", "resolve"]);
 	});
 
 	it("always includes resolve regardless of plan-mode setting", async () => {

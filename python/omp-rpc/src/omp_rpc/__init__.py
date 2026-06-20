@@ -16,7 +16,13 @@ from .client import (
     ProtocolErrorListener,
     UiRequestListener,
 )
-from .host_tools import HostTool, HostToolContext, HostToolResultPayload, HostToolResultValue, host_tool
+from .host_tools import (
+    HostTool,
+    HostToolContext,
+    HostToolResultPayload,
+    HostToolResultValue,
+    host_tool,
+)
 from .host_uris import (
     HostUri,
     HostUriContentType,
@@ -44,6 +50,7 @@ from .protocol import (
     CompactionSummaryMessage,
     CustomMessage,
     DeveloperMessage,
+    Effort,
     ExtensionError,
     ExtensionUiRequest,
     FileMentionMessage,
@@ -108,6 +115,7 @@ __all__ = [
     "CompactionSummaryMessage",
     "CustomMessage",
     "DeveloperMessage",
+    "Effort",
     "ExtensionError",
     "ExtensionErrorListener",
     "ExtensionUiRequest",

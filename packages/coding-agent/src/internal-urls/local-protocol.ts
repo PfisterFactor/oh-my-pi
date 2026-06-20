@@ -5,7 +5,7 @@ import { isEnoent } from "@oh-my-pi/pi-utils";
 import { AgentRegistry } from "../registry/agent-registry";
 import { parseInternalUrl } from "./parse";
 import { validateRelativePath } from "./skill-protocol";
-import type { InternalResource, InternalUrl, ProtocolHandler } from "./types";
+import type { InternalResource, InternalUrl, ProtocolHandler, ResolveContext, UrlCompletion } from "./types";
 
 export interface LocalProtocolOptions {
 	getArtifactsDir?: () => string | null;
@@ -25,6 +25,20 @@ function ensureWithinRoot(targetPath: string, rootPath: string): void {
 function toLocalValidationError(error: unknown): Error {
 	const message = error instanceof Error ? error.message : String(error);
 	return new Error(message.replace("skill://", "local://"));
+}
+const WINDOWS_LOCAL_ROOT_MAX_CHARS = 180;
+
+function safeSessionId(options: LocalProtocolOptions): string {
+	const raw = options.getSessionId?.() ?? "session";
+	const safe = raw.replace(/[^a-zA-Z0-9_.-]/g, "_");
+	return safe.length > 0 ? safe : "session";
+}
+
+function shortLocalRoot(options: LocalProtocolOptions): string {
+	// Derive the short root from the stable session id, never the artifact path,
+	// so `SessionManager.moveTo()` and the resume-after-move flow keep finding
+	// the same `local://` directory the session wrote pre-move.
+	return path.join(os.tmpdir(), "omp-local", safeSessionId(options));
 }
 
 function getContentType(filePath: string): InternalResource["contentType"] {
@@ -108,20 +122,28 @@ function extractRelativePath(url: InternalUrl): string {
 	return decoded;
 }
 
-export function resolveLocalRoot(options: LocalProtocolOptions): string {
+/** Resolve the session-scoped local:// root, shortening long Windows artifact paths before writes hit MAX_PATH. */
+export function resolveLocalRoot(options: LocalProtocolOptions, platform: NodeJS.Platform = process.platform): string {
 	const artifactsDir = options.getArtifactsDir?.();
 	if (artifactsDir) {
-		return path.resolve(artifactsDir, "local");
+		const candidate = path.resolve(artifactsDir, "local");
+		if (platform === "win32" && candidate.length >= WINDOWS_LOCAL_ROOT_MAX_CHARS) {
+			return shortLocalRoot(options);
+		}
+		return candidate;
 	}
 
-	const sessionId = options.getSessionId?.() ?? "session";
-	const safeSessionId = sessionId.replace(/[^a-zA-Z0-9_.-]/g, "_");
-	return path.join(os.tmpdir(), "omp-local", safeSessionId);
+	return path.join(os.tmpdir(), "omp-local", safeSessionId(options));
 }
 
-export function resolveLocalUrlToPath(input: string | InternalUrl, options: LocalProtocolOptions): string {
+/** Resolve a local:// URL to an on-disk path under the active session's local root. */
+export function resolveLocalUrlToPath(
+	input: string | InternalUrl,
+	options: LocalProtocolOptions,
+	platform: NodeJS.Platform = process.platform,
+): string {
 	const url = typeof input === "string" ? parseLocalUrl(input) : input;
-	const localRoot = path.resolve(resolveLocalRoot(options));
+	const localRoot = path.resolve(resolveLocalRoot(options, platform));
 	const relativePath = extractRelativePath(url);
 
 	if (!relativePath) {
@@ -131,6 +153,19 @@ export function resolveLocalUrlToPath(input: string | InternalUrl, options: Loca
 	const resolved = path.resolve(localRoot, relativePath);
 	ensureWithinRoot(resolved, localRoot);
 	return resolved;
+}
+
+/**
+ * On-disk roots the eval helpers (`read`/`write`/`append`) substitute for
+ * internal-URL schemes so e.g. `write("local://x.md")` lands where a later
+ * `read local://x.md` resolves — instead of a literal `local:/` directory under
+ * the cwd (a stdlib `pathlib.Path`/`path.resolve` collapses `local://` to
+ * `local:/`). Keyed by scheme without the `://`. Currently only `local`, but the
+ * shape is a map so additional file-backed schemes can be added without
+ * re-plumbing the worker boundary.
+ */
+export function buildEvalUrlRoots(options: LocalProtocolOptions): Record<string, string> {
+	return { local: resolveLocalRoot(options) };
 }
 
 /**
@@ -164,13 +199,25 @@ export class LocalProtocolHandler implements ProtocolHandler {
 	 * Returns the active local-protocol options.
 	 *
 	 * Resolution order:
-	 * 1. Explicit override installed via {@link setOverride} (used by subagents
-	 *    that share their parent's root and by SDK consumers with a custom
-	 *    artifacts/session id mapping).
-	 * 2. The main session in `AgentRegistry.global()`. Its `SessionManager`
-	 *    supplies both `getArtifactsDir` and `getSessionId`.
+	 * 1. **Caller-supplied** `context.localProtocolOptions` (the actual session
+	 *    that initiated the `read`/`find`/`search`/`router.resolve` call). This
+	 *    is what keeps `local://` reads pinned to the calling session in
+	 *    multi-session hosts (cmux/ACP, embedded SDK consumers) where every
+	 *    session registers as `kind: "main"` and "first one wins" would route
+	 *    to the wrong artifacts directory.
+	 * 2. Explicit process-global override installed via {@link setOverride}
+	 *    (used by SDK consumers with a custom artifacts/session-id mapping and
+	 *    by code paths that do not have a calling session, e.g. TUI hyperlink
+	 *    resolution).
+	 * 3. The first `main`-kind session in `AgentRegistry.global()`. Its
+	 *    `SessionManager` supplies both `getArtifactsDir` and `getSessionId`.
+	 *    Last-resort fallback — every caller that has a session reference
+	 *    SHOULD thread it through `context` so this branch is never taken in
+	 *    multi-session setups.
 	 */
-	static resolveOptions(): LocalProtocolOptions | undefined {
+	static resolveOptions(context?: ResolveContext): LocalProtocolOptions | undefined {
+		const fromContext = context?.localProtocolOptions;
+		if (fromContext) return fromContext;
 		const override = LocalProtocolHandler.#override;
 		if (override) return override;
 		const main = AgentRegistry.global()
@@ -184,8 +231,8 @@ export class LocalProtocolHandler implements ProtocolHandler {
 		};
 	}
 
-	async resolve(url: InternalUrl): Promise<InternalResource> {
-		const opts = LocalProtocolHandler.resolveOptions();
+	async resolve(url: InternalUrl, context?: ResolveContext): Promise<InternalResource> {
+		const opts = LocalProtocolHandler.resolveOptions(context);
 		if (!opts) {
 			throw new Error("No session - local:// unavailable");
 		}
@@ -245,5 +292,18 @@ export class LocalProtocolHandler implements ProtocolHandler {
 			sourcePath: realTargetPath,
 			notes: ["Use write path local://<file> to persist large intermediate artifacts across turns."],
 		};
+	}
+
+	async complete(_query?: string, context?: ResolveContext): Promise<UrlCompletion[]> {
+		const opts = LocalProtocolHandler.resolveOptions(context);
+		if (!opts) return [];
+		const localRoot = path.resolve(resolveLocalRoot(opts));
+		try {
+			const files = await listFilesRecursively(localRoot);
+			return files.map(value => ({ value }));
+		} catch (err) {
+			if (isEnoent(err)) return [];
+			throw err;
+		}
 	}
 }

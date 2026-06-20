@@ -16,19 +16,23 @@ The session is stored as an append-only entry log, but runtime behavior is tree-
 Key files:
 
 - `src/session/session-manager.ts` — tree data model, traversal, leaf movement, branch/session extraction
+- `src/session/session-context.ts` — `buildSessionContext` context reconstruction (resolved root→leaf LLM context, compaction/branch-summary replay)
 - `src/session/agent-session.ts` — `/tree` navigation flow, summarization, hook/event emission
 - `src/modes/components/tree-selector.ts` — interactive tree UI behavior and filtering
 - `src/modes/controllers/selector-controller.ts` — selector orchestration for `/tree` and `/branch`
-- `src/modes/controllers/input-controller.ts` — command routing (`/tree`, `/branch`, double-escape behavior)
+- `src/slash-commands/builtin-registry.ts` — command routing (`/tree`, `/branch`)
+- `src/modes/controllers/input-controller.ts` — double-escape behavior and `app.session.tree`/`app.session.fork` keybinding wiring
 - `src/session/messages.ts` — conversion of `branch_summary`, `compaction`, and `custom_message` entries into LLM context messages
 
 ## Tree data model in `SessionManager`
 
-Runtime indices:
+Runtime indices live in a `SessionEntryIndex` helper, held as `#index` on `SessionManager` and kept in lockstep with the journal array `#entries`:
 
-- `#byId: Map<string, SessionEntry>` — fast lookup for any entry
-- `#leafId: string | null` — current position in the tree
-- `#labelsById: Map<string, string>` — resolved labels by target entry id
+- `#entriesById: Map<string, SessionEntry>` — fast lookup for any entry
+- `#children: Map<string | null, SessionEntry[]>` — parent→children adjacency
+- `#labels: Map<string, string>` — resolved labels by target entry id
+- `#leaf: string | null` — current position in the tree
+- `#usage` — running usage totals
 
 Tree APIs:
 
@@ -38,7 +42,7 @@ Tree APIs:
   - entries with missing parents are treated as roots
   - children are sorted oldest→newest by timestamp
 - `getChildren(parentId)` returns direct children
-- `getLabel(id)` resolves current label from `labelsById`
+- `getLabel(id)` resolves current label from the index's `#labels` map
 
 `getTree()` is a runtime projection; persistence remains append-only JSONL entries.
 
@@ -100,13 +104,13 @@ User-facing `/branch` flow (`SelectorController.showUserMessageSelector` → `Ag
 
 - Builds root→leaf path via `getBranch(leafId)`; throws if missing.
 - Excludes existing `label` entries from copied path.
-- Rebuilds fresh label entries from resolved `labelsById` for entries that remain in path.
+- Rebuilds fresh label entries from the resolved label map (`labelsInEffect()`) for entries that remain in path.
 - Persistent mode: writes new JSONL file and switches manager to it; returns new file path.
 - In-memory mode: replaces in-memory entries; returns `undefined`.
 
 ## Context reconstruction and summary/custom integration
 
-`buildSessionContext()` (in `session-manager.ts`) resolves the active root→leaf path and builds effective LLM context state:
+`buildSessionContext()` (in `session-context.ts`, exposed via `SessionManager.buildSessionContext()`) resolves the active root→leaf path and builds effective LLM context state:
 
 - Tracks latest thinking/model/service-tier/mode/TTSR/MCP-selection state on path.
 - Handles latest compaction on path:
@@ -118,7 +122,7 @@ User-facing `/branch` flow (`SelectorController.showUserMessageSelector` → `Ag
 `session/messages.ts` then maps these message types for model input:
 
 - `branchSummary` and `compactionSummary` become user-role templated context messages
-- `custom`/`hookMessage` become user-role content messages
+- `custom`/`hookMessage` become developer-role content messages (via agent-core's `convertMessageToLlm`)
 
 So tree movement changes context by changing the active leaf path, not by mutating old entries.
 
@@ -127,13 +131,14 @@ So tree movement changes context by changing the active leaf path, not by mutati
 Label persistence:
 
 - `appendLabelChange(targetId, label?)` writes `label` entries on the current leaf chain.
-- `labelsById` is updated immediately (set or delete).
+- `#labels` (in `SessionEntryIndex`) is updated immediately (set or delete).
 - `getTree()` resolves current label onto each returned node.
 
 Tree selector behavior (`tree-selector.ts`):
 
 - Flattens tree for navigation, keeps active-path highlighting, and prioritizes displaying the active branch first.
 - Supports filter modes: `default`, `no-tools`, `user-only`, `labeled-only`, `all`.
+  - `default` suppresses `label`, `custom`, `model_change`, and `thinking_level_change`; it is not a complete "hide all internal entries" filter.
 - Supports free-text search over rendered semantic content.
 - `Shift+L` opens inline label editing and writes via `appendLabelChange`.
 
@@ -188,7 +193,7 @@ When a user approves a plan from plan mode (`InteractiveMode.#approvePlan`), the
 Trigger:
 
 - Plan approval reaches `#approvePlan(...)` with `options.title` populated from the plan-approval details.
-- This runs for every approval choice (`Approve and execute`, `Approve and compact context`, plain `Approve`); the synthetic `plan-approved` prompt is what otherwise bypasses the input-controller's title-generation path.
+- This runs for every approval choice (`Approve and execute`, `Approve and compact context`, `Approve and keep context`); the synthetic `plan-approved` prompt is what otherwise bypasses the input-controller's title-generation path.
 
 Naming source:
 
@@ -197,7 +202,7 @@ Naming source:
   - trims whitespace
   - capitalizes the first character
   - returns `""` for whitespace-only / separator-only input
-- The humanized name is applied with `sessionManager.setSessionName(name, "auto")`. Because `setSessionName` is a no-op when `titleSource === "user"`, the seeded name never overrides a name the user already chose (e.g. on the `preserveContext` path where the session continues with prior naming).
+- The humanized name is applied only when the current session has no name (`!sessionManager.getSessionName()`). It then calls `sessionManager.setSessionName(name, "auto")`, which also refuses to overwrite user-named sessions.
 - On successful apply, the terminal title (`setSessionTerminalTitle`) and the editor border color are refreshed to reflect the new name.
 
 Examples (from `humanizePlanTitle`):

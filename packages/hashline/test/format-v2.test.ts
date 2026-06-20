@@ -5,79 +5,101 @@ function applyPatch(text: string, diff: string): string {
 	return applyEdits(text, parsePatch(diff).edits).text;
 }
 
-describe("hashline format v2", () => {
-	it("emits literal and repeat body rows in textual order", () => {
+describe("hashline format v4", () => {
+	it("replaces a concrete range with literal body rows in textual order", () => {
 		const text = "a\nb\nc";
-		const diff = ["2 2", "+before", "&1..2", "+after"].join("\n");
+		const diff = ["SWAP 2.=2:", "+before", "+after"].join("\n");
 
-		expect(applyPatch(text, diff)).toBe("a\nbefore\na\nb\nafter\nc");
+		expect(applyPatch(text, diff)).toBe("a\nbefore\nafter\nc");
 	});
 
-	it("repeats a single source line with explicit A-A syntax", () => {
+	it("deletes a single source line", () => {
 		const text = "a\nb\nc";
-		const diff = ["2 2", "&3..3"].join("\n");
-
-		expect(applyPatch(text, diff)).toBe("a\nc\nc");
+		expect(applyPatch(text, "DEL 2")).toBe("a\nc");
 	});
 
-	it("keeps the file unchanged when a repeat covers the anchored range", () => {
+	it("deletes a concrete range", () => {
 		const text = "a\nb\nc\nd";
-		const diff = ["2 3", "&2..3"].join("\n");
-
-		expect(applyPatch(text, diff)).toBe(text);
+		expect(applyPatch(text, "DEL 2.=3")).toBe("a\nd");
 	});
 
-	it("deletes a concrete range via an empty hunk body", () => {
-		const text = "a\nb\nc\nd";
-		expect(applyPatch(text, "2 3")).toBe("a\nd");
-	});
-
-	it("empty body at a concrete range deletes the range (no blank-line insertion)", () => {
+	it("inserts before and after concrete anchors", () => {
 		const text = "a\nb\nc";
-		expect(applyPatch(text, "2 2")).toBe("a\nc");
+		const diff = ["INS.PRE 2:", "+before", "INS.POST 2:", "+after"].join("\n");
+		expect(applyPatch(text, diff)).toBe("a\nbefore\nb\nafter\nc");
 	});
 
-	it("empty body at BOF/EOF is a no-op (nothing inserted)", () => {
+	it("inserts at head and tail", () => {
 		const text = "a\nb";
-		expect(applyPatch(text, "BOF")).toBe(text);
-		expect(applyPatch(text, "EOF")).toBe(text);
+		expect(applyPatch(text, "INS.HEAD:\n+HEAD")).toBe("HEAD\na\nb");
+		expect(applyPatch(text, "INS.TAIL:\n+TAIL")).toBe("a\nb\nTAIL");
 	});
 
-	it("accepts `^A` repeat shorthand as `^A-A`", () => {
+	it("treats an empty replace hunk as a delete and still rejects empty inserts", () => {
 		const text = "a\nb\nc";
-		// `^A` mirrors `^A-A`; we use it to keep line 2 unchanged while
-		// also targeting it.
-		expect(applyPatch(text, "2 2\n&2")).toBe(text);
+		expect(applyPatch(text, "SWAP 2.=2:")).toBe("a\nc");
+		expect(() => parsePatch("INS.HEAD:")).toThrow(/needs at least one/);
 	});
 
-	it("auto-pipes bare body rows (legacy sigils flow through as literal text)", () => {
-		// `↑`/`↓` are no longer reserved sigils; bare body rows are
-		// auto-prefixed with `|` as plain literal text.
+	it("rejects body rows under delete", () => {
+		expect(() => parsePatch("DEL 2\n+replacement")).toThrow(/does not take body rows/);
+	});
+
+	it("auto-pipes bare body rows as literal text", () => {
 		const text = "a\nb\nc";
-		expect(applyPatch(text, "2 2\n↑x")).toBe("a\n↑x\nc");
-		expect(applyPatch(text, "2 2\n↓x")).toBe("a\n↓x\nc");
-		// And the warning is surfaced.
-		const { warnings } = parsePatch("2 2\n↑x");
+		expect(applyPatch(text, "SWAP 2.=2:\nraw")).toBe("a\nraw\nc");
+		const { warnings } = parsePatch("SWAP 2.=2:\nraw");
 		expect(warnings.some(w => /Auto-prefixed bare body row/.test(w))).toBe(true);
 	});
 
-	it("accepts `-A` and `-A..B` as standalone delete ops", () => {
-		// `-A..B` (and `-A` shorthand) on its own line is the canonical
-		// delete op in the new grammar.
-		const text = "a\nb\nc\nd\ne\nf\ng";
-		expect(applyPatch(text, "5 5")).toBe("a\nb\nc\nd\nf\ng");
-		expect(applyPatch(text, "5 7")).toBe("a\nb\nc\nd");
+	it("strips read-output line number prefix from auto-piped bare body rows", () => {
+		const text = "a\nb\nc";
+		// Without this fix, "3:text" becomes literal "3:text" in the file.
+		// With the fix, the "3:" prefix is stripped, yielding just "text".
+		const { edits, warnings } = parsePatch("SWAP 2.=2:\n3:replaced");
+		expect(applyEdits(text, edits).text).toBe("a\nreplaced\nc");
+		expect(warnings.some(w => /Auto-prefixed bare body row/.test(w))).toBe(true);
 	});
 
-	it("validates repeat ranges against file bounds", () => {
-		const edits = parsePatch("1 1\n&4..4").edits;
-
+	it("validates insert anchors against file bounds", () => {
+		const edits = parsePatch("INS.PRE 4:\n+x").edits;
 		expect(() => applyEdits("a\nb", edits)).toThrow(/Line 4 does not exist/);
 	});
 
-	it("does not flush a streaming pending empty block", () => {
-		const result = parsePatchStreaming("5 5\n");
+	it("ignores deleting the trailing blank sentinel of a newline-terminated file", () => {
+		// "a\nb\n" splits into ["a", "b", ""]; line 3 is the phantom sentinel.
+		const edits = parsePatch("DEL 3").edits;
+		expect(applyEdits("a\nb\n", edits).text).toBe("a\nb\n");
+	});
 
+	it("treats a delete range ending at the trailing sentinel as ending at the last real line", () => {
+		const edits = parsePatch("DEL 2.=3").edits;
+		expect(applyEdits("a\nb\n", edits).text).toBe("a\n");
+	});
+
+	it("treats a replace range ending at the trailing sentinel as ending at the last real line", () => {
+		const edits = parsePatch("SWAP 2.=3:\n+B").edits;
+		expect(applyEdits("a\nb\n", edits).text).toBe("a\nB\n");
+	});
+
+	it("still allows inserts anchored on the trailing blank sentinel", () => {
+		const edits = parsePatch("INS.POST 3:\n+tail").edits;
+		expect(applyEdits("a\nb\n", edits).text).toBe("a\nb\n\ntail");
+	});
+
+	it("still deletes a genuine empty last line of a non-newline-terminated file", () => {
+		// "a\nb" has no sentinel; line 2 is real content.
+		const edits = parsePatch("DEL 2").edits;
+		expect(applyEdits("a\nb", edits).text).toBe("a");
+	});
+
+	it("does not flush a trailing streaming pending empty replace hunk", () => {
+		const result = parsePatchStreaming("SWAP 5.=5:\n");
 		expect(result.edits).toEqual([]);
+	});
+
+	it("flushes a streaming empty replace hunk when another hunk starts", () => {
+		const result = parsePatchStreaming("SWAP 2.=2:\nINS.TAIL:\n");
+		expect(result.edits).toEqual([{ kind: "delete", anchor: { line: 2 }, lineNum: 1, index: 0 }]);
 	});
 });

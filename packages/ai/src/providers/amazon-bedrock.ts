@@ -7,10 +7,11 @@
  * Bun's native `HTTPS_PROXY` support.
  */
 
+import type { Effort } from "@oh-my-pi/pi-catalog/effort";
+import { mapEffortToAnthropicAdaptiveEffort, requireSupportedEffort } from "@oh-my-pi/pi-catalog/model-thinking";
+import { calculateCost } from "@oh-my-pi/pi-catalog/models";
 import { $env, $flag, extractHttpStatusFromError, fetchWithRetry } from "@oh-my-pi/pi-utils";
-import type { Effort } from "../model-thinking";
-import { mapEffortToAnthropicAdaptiveEffort, requireSupportedEffort } from "../model-thinking";
-import { calculateCost } from "../models";
+import { ProviderHttpError } from "../errors";
 import type {
 	Api,
 	AssistantMessage,
@@ -29,13 +30,19 @@ import type {
 } from "../types";
 import { normalizeToolCallId, resolveCacheRetention } from "../utils";
 import { AssistantMessageEventStream } from "../utils/event-stream";
-import { appendRawHttpRequestDumpFor400, type RawHttpRequestDump, withHttpStatus } from "../utils/http-inspector";
-import { parseStreamingJson } from "../utils/json-parse";
+import { appendRawHttpRequestDumpFor400, type RawHttpRequestDump } from "../utils/http-inspector";
+import { armPreResponseTimeout, getStreamFirstEventTimeoutMs } from "../utils/idle-iterator";
+import { parseStreamingJson, parseStreamingJsonThrottled } from "../utils/json-parse";
 import { toolWireSchema } from "../utils/schema/wire";
-import { resolveAwsCredentials } from "./aws-credentials";
+import { invalidateAwsCredentialCache, resolveAwsCredentials } from "./aws-credentials";
 import { decodeEventStream } from "./aws-eventstream";
 import { signRequest } from "./aws-sigv4";
 import { transformMessages } from "./transform-messages";
+
+/** Non-2xx response (or in-stream exception event) from the Bedrock runtime API. */
+export class BedrockApiError extends ProviderHttpError {
+	override readonly name = "BedrockApiError";
+}
 
 export type BedrockThinkingDisplay = "summarized" | "omitted";
 
@@ -57,11 +64,12 @@ export interface BedrockOptions extends StreamOptions {
 	 * - `"omitted"`: thinking content is suppressed; the encrypted signature still
 	 *   travels back for multi-turn continuity.
 	 *
-	 * Starting with Claude Opus 4.7 the Anthropic API default is `"omitted"`, which
-	 * leaves callers waiting on a silent stream during long reasoning runs (issue
-	 * #1373). We default to `"summarized"` so adaptive-thinking models that accept
-	 * the field keep producing visible thinking deltas. Older adaptive-thinking
-	 * models (Opus 4.6, Sonnet 4.6+) reject the field, so we omit it for them.
+	 * Starting with Claude Opus 4.7 and Claude Fable/Mythos 5 the Anthropic API
+	 * default is `"omitted"`, which leaves callers waiting on a silent stream during
+	 * long reasoning runs (issue #1373). We default to `"summarized"` so adaptive-
+	 * thinking models that accept the field keep producing visible thinking deltas.
+	 * Older adaptive-thinking models (Opus 4.6, Sonnet 4.6+) reject the field, so
+	 * we omit it for them.
 	 */
 	thinkingDisplay?: BedrockThinkingDisplay;
 }
@@ -72,7 +80,18 @@ function resolveBearerToken(options: BedrockOptions): string | undefined {
 	return options.bearerToken || apiKey || $env.AWS_BEARER_TOKEN_BEDROCK;
 }
 
-type Block = (TextContent | ThinkingContent | ToolCall) & { index?: number; partialJson?: string };
+function inferRegionFromBedrockArn(modelId: string): string | undefined {
+	const parts = modelId.split(":", 6);
+	if (parts[0] !== "arn" || parts[2] !== "bedrock") return undefined;
+	const region = parts[3];
+	return region || undefined;
+}
+
+type Block = (TextContent | ThinkingContent | ToolCall) & {
+	index?: number;
+	partialJson?: string;
+	lastParseLen?: number;
+};
 
 // ---------- Bedrock wire-format types ----------
 // Mirrors only what we actually consume from `ConverseStreamRequest` /
@@ -194,11 +213,19 @@ export const streamBedrock: StreamFunction<"bedrock-converse-stream"> = (
 
 		const blocks = output.content as Block[];
 		let rawRequestDump: RawHttpRequestDump | undefined;
-		const region = options.region || $env.AWS_REGION || $env.AWS_DEFAULT_REGION || "us-east-1";
+		const region =
+			options.region ||
+			inferRegionFromBedrockArn(model.id) ||
+			$env.AWS_REGION ||
+			$env.AWS_DEFAULT_REGION ||
+			"us-east-1";
 
 		try {
 			const cacheRetention = resolveCacheRetention(options.cacheRetention);
-			const toolConfig = convertToolConfig(context.tools, options.toolChoice);
+			const historyHasToolBlocks = context.messages.some(
+				m => m.role === "toolResult" || (m.role === "assistant" && m.content.some(b => b.type === "toolCall")),
+			);
+			const toolConfig = convertToolConfig(context.tools, options.toolChoice, historyHasToolBlocks);
 			let additionalModelRequestFields = buildAdditionalModelRequestFields(model, options);
 
 			// Bedrock rejects thinking + forced tool_choice ("any" or specific tool).
@@ -268,19 +295,41 @@ export const streamBedrock: StreamFunction<"bedrock-converse-stream"> = (
 				requestHeaders = { ...baseHeaders, ...signed };
 			}
 
-			const response = await fetchWithRetry(url, {
-				method: "POST",
-				headers: requestHeaders,
-				body,
-				signal: options.signal,
-			});
+			// Bun's native fetch ceiling is disabled below (`timeout: false`) so
+			// configurable watchdogs govern slow-prefill streams (issue #2422).
+			// Direct callers that bypass `register-builtins` (which installs the
+			// iterator-level first-event watchdog) still need a pre-response
+			// timer, otherwise a Bedrock/proxy that accepts the POST and never
+			// sends headers would hang forever.
+			const firstEventTimeoutMs = options.streamFirstEventTimeoutMs ?? getStreamFirstEventTimeoutMs();
+			// Clear the pre-response timer the instant headers arrive (below): an
+			// absolute `AbortSignal.timeout` would keep aborting the actively
+			// streaming body, not just a stalled time-to-first-byte (issue #2422).
+			const watchdog = armPreResponseTimeout(options.signal, firstEventTimeoutMs);
+			let response: Response;
+			try {
+				response = await fetchWithRetry(url, {
+					method: "POST",
+					headers: requestHeaders,
+					body,
+					signal: watchdog.signal,
+					fetch: options.fetch,
+					timeout: false,
+				});
+			} finally {
+				watchdog.clear();
+			}
 
 			if (!response.ok) {
+				if (!bearerToken && (response.status === 401 || response.status === 403)) {
+					// Stale cached credentials (e.g. rotated session keys in ~/.aws/credentials) —
+					// drop the cache entry so the next attempt re-resolves from scratch.
+					invalidateAwsCredentialCache({ profile: options.profile, region });
+				}
 				const errBody = await response.text().catch(() => "");
-				throw withHttpStatus(
-					new Error(`Bedrock HTTP ${response.status}: ${errBody.slice(0, 1000)}`),
-					response.status,
-				);
+				throw new BedrockApiError(`Bedrock HTTP ${response.status}: ${errBody.slice(0, 1000)}`, response.status, {
+					headers: response.headers,
+				});
 			}
 			if (!response.body) throw new Error("Bedrock response has no body");
 
@@ -293,9 +342,10 @@ export const streamBedrock: StreamFunction<"bedrock-converse-stream"> = (
 					const exceptionType = message.headers[":exception-type"] || "Exception";
 					const payload = safeParsePayload(message.payload) as { message?: string } | undefined;
 					const errorMessage = payload?.message || new TextDecoder().decode(message.payload);
-					const status = exceptionType === "validationException" ? 400 : 0;
-					const err = new Error(`${exceptionType}: ${errorMessage}`);
-					throw status ? withHttpStatus(err, status) : err;
+					const text = `${exceptionType}: ${errorMessage}`;
+					throw exceptionType === "validationException"
+						? new BedrockApiError(text, 400, { code: exceptionType })
+						: new Error(text);
 				}
 				if (messageType === "error") {
 					const code = message.headers[":error-code"] || "UnknownError";
@@ -334,6 +384,9 @@ export const streamBedrock: StreamFunction<"bedrock-converse-stream"> = (
 					case "messageStop": {
 						const ev = payload as MessageStopEvent;
 						output.stopReason = mapStopReason(ev.stopReason);
+						if (output.stopReason === "error") {
+							output.errorMessage = `Generation failed with stop reason: ${ev.stopReason ?? "unknown"}`;
+						}
 						break;
 					}
 					case "metadata": {
@@ -453,7 +506,11 @@ function handleContentBlockDelta(
 		}
 	} else if (delta?.toolUse && block?.type === "toolCall") {
 		block.partialJson = (block.partialJson || "") + (delta.toolUse.input || "");
-		block.arguments = parseStreamingJson(block.partialJson);
+		const throttled = parseStreamingJsonThrottled(block.partialJson, block.lastParseLen ?? 0);
+		if (throttled) {
+			block.arguments = throttled.value;
+			block.lastParseLen = throttled.parsedLen;
+		}
 		stream.push({ type: "toolcall_delta", contentIndex: index, delta: delta.toolUse.input || "", partial: output });
 	} else if (delta?.reasoningContent) {
 		let thinkingBlock = block;
@@ -517,6 +574,7 @@ function handleContentBlockStop(
 		case "toolCall":
 			block.arguments = parseStreamingJson(block.partialJson);
 			delete (block as Block).partialJson;
+			delete (block as Block).lastParseLen;
 			stream.push({ type: "toolcall_end", contentIndex: index, toolCall: block, partial: output });
 			break;
 	}
@@ -729,8 +787,9 @@ function convertMessages(
 function convertToolConfig(
 	tools: Tool[] | undefined,
 	toolChoice: BedrockOptions["toolChoice"],
+	historyHasToolBlocks: boolean,
 ): WireToolConfig | undefined {
-	if (!tools?.length || toolChoice === "none") return undefined;
+	if (!tools?.length) return undefined;
 
 	const bedrockTools: WireToolSpec[] = tools.map(tool => ({
 		toolSpec: {
@@ -739,6 +798,13 @@ function convertToolConfig(
 			inputSchema: { json: toolWireSchema(tool) },
 		},
 	}));
+
+	// Bedrock rejects requests whose history contains toolUse/toolResult blocks without a
+	// toolConfig. With prior tool use we must keep the tool specs and merely omit the choice
+	// (there is no "none" choice on Converse); dropping toolConfig entirely would 400.
+	if (toolChoice === "none") {
+		return historyHasToolBlocks ? { tools: bedrockTools } : undefined;
+	}
 
 	let bedrockToolChoice: WireToolChoice | undefined;
 	switch (toolChoice) {
@@ -782,12 +848,13 @@ function buildAdditionalModelRequestFields(
 	const mode = model.thinking?.mode;
 	if (mode === "anthropic-adaptive") {
 		const effort = mapEffortToAnthropicAdaptiveEffort(model, reasoning);
-		// Starting with Claude Opus 4.7, Anthropic switched the adaptive-thinking
-		// default to "omitted", which silently suppresses streamed reasoning and
-		// can read as a stalled stream during long reasoning runs (issue #1373).
-		// Opt back into "summarized" by default on models that accept the field.
+		// Starting with Claude Opus 4.7 and Claude Fable/Mythos 5, Anthropic switched
+		// the adaptive-thinking default to "omitted", which silently suppresses
+		// streamed reasoning and can read as a stalled stream during long reasoning
+		// runs (issue #1373). Opt back into "summarized" by default on models that
+		// accept the field.
 		const adaptive: { type: "adaptive"; display?: BedrockThinkingDisplay } = { type: "adaptive" };
-		if (supportsAdaptiveThinkingDisplay(model.id)) {
+		if (model.thinking?.supportsDisplay) {
 			adaptive.display = options.thinkingDisplay ?? "summarized";
 		}
 		return {
@@ -819,21 +886,6 @@ function buildAdditionalModelRequestFields(
 	}
 
 	return result;
-}
-
-/**
- * Adaptive thinking `display` is supported starting with Claude Opus 4.7.
- * Older adaptive-thinking models (Opus 4.6, Sonnet 4.6+) reject the field.
- * Bedrock model ids are prefixed with region/inference-profile slugs (e.g.
- * `eu.anthropic.claude-opus-4-7-...`); the regex matches the `claude-opus-X-Y`
- * fragment regardless of prefix.
- */
-function supportsAdaptiveThinkingDisplay(modelId: string): boolean {
-	const match = /claude-opus-(\d+)-(\d+)/.exec(modelId);
-	if (!match) return false;
-	const major = Number(match[1]);
-	const minor = Number(match[2]);
-	return major > 4 || (major === 4 && minor >= 7);
 }
 
 /**

@@ -1,15 +1,13 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "bun:test";
-import * as fs from "node:fs/promises";
-import * as os from "node:os";
-import * as path from "node:path";
-import { HistoryStorage } from "../src/session/history-storage";
+import { HistoryStorage } from "@oh-my-pi/pi-coding-agent/session/history-storage";
+import { TempDir } from "@oh-my-pi/pi-utils";
 
-let tempDir = "";
+let tempDir: TempDir | null = null;
 
 async function freshStorage(): Promise<HistoryStorage> {
-	tempDir = await fs.mkdtemp(path.join(os.tmpdir(), "omp-history-search-"));
+	tempDir = TempDir.createSync("@omp-history-search-");
 	HistoryStorage.resetInstance();
-	return HistoryStorage.open(path.join(tempDir, "history.db"));
+	return HistoryStorage.open(tempDir.join("history.db"));
 }
 
 async function seed(storage: HistoryStorage, prompts: string[]): Promise<void> {
@@ -27,8 +25,9 @@ afterEach(async () => {
 	HistoryStorage.resetInstance();
 	vi.useRealTimers();
 	if (tempDir) {
-		await fs.rm(tempDir, { recursive: true, force: true });
-		tempDir = "";
+		await Bun.sleep(0);
+		await tempDir.remove().catch(() => {});
+		tempDir = null;
 	}
 });
 
@@ -68,16 +67,16 @@ describe("HistoryStorage.search", () => {
 		expect(results.map(r => r.prompt)).toEqual(["commit and amend the patch"]);
 	});
 
-	it("returns FTS matches before substring-only fallback matches", async () => {
+	it("returns merged FTS and substring fallback matches by recency", async () => {
 		const storage = await freshStorage();
-		// Insert oldest -> newest. Substring-only match is the most recent;
-		// FTS prefix match is older. FTS results must still come first.
+		// Insert oldest -> newest. The newest row is substring-only; it must not
+		// be pushed behind older FTS prefix matches in Ctrl+R results.
 		await seed(storage, ["commit the changes", "precommit hook fix"]);
 
 		const results = storage.search("commit", 10);
 		expect(results.map(r => r.prompt)).toEqual([
-			"commit the changes", // FTS prefix match on token `commit`
 			"precommit hook fix", // substring-only (`commit` is infix of `precommit`)
+			"commit the changes", // FTS prefix match on token `commit`
 		]);
 	});
 
@@ -106,14 +105,13 @@ describe("HistoryStorage.search", () => {
 		expect(storage.search("  ", 10)).toEqual([]);
 	});
 
-	it("respects the limit when merging FTS and substring results", async () => {
+	it("respects the limit after globally sorting merged FTS and substring results", async () => {
 		const storage = await freshStorage();
 		await seed(storage, ["commit one", "commit two", "precommit three", "precommit four"]);
 
 		const results = storage.search("commit", 2);
 		expect(results).toHaveLength(2);
-		// Both FTS matches should fill the limit before substring fallback runs.
-		expect(results.map(r => r.prompt)).toEqual(["commit two", "commit one"]);
+		expect(results.map(r => r.prompt)).toEqual(["precommit four", "precommit three"]);
 	});
 
 	it("matches short tokens via the substring fallback", async () => {

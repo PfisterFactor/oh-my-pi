@@ -1,9 +1,11 @@
 import { describe, expect, it } from "bun:test";
 import { applyAnthropicUsageExtras } from "@oh-my-pi/pi-ai/providers/anthropic";
 import { parseChunkUsage } from "@oh-my-pi/pi-ai/providers/openai-completions";
+import { calculateOpenAIUsageAccounting } from "@oh-my-pi/pi-ai/providers/openai-shared";
 import type { Model, Usage } from "@oh-my-pi/pi-ai/types";
+import { buildModel } from "@oh-my-pi/pi-catalog/build";
 
-const OPENAI_MODEL: Model<"openai-completions"> = {
+const OPENAI_MODEL: Model<"openai-completions"> = buildModel({
 	id: "gpt-5",
 	name: "GPT-5",
 	api: "openai-completions",
@@ -14,7 +16,7 @@ const OPENAI_MODEL: Model<"openai-completions"> = {
 	cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
 	contextWindow: 200_000,
 	maxTokens: 8_192,
-};
+});
 
 function blankUsage(): Usage {
 	return {
@@ -92,6 +94,166 @@ describe("openai-completions parseChunkUsage", () => {
 		expect(usage.cacheRead).toBe(5_800);
 		expect(usage.cacheWrite).toBe(0);
 		expect(usage.totalTokens).toBe(6_250);
+	});
+
+	it("maps DeepSeek prompt_cache_hit_tokens + prompt_cache_miss_tokens correctly", () => {
+		// DeepSeek (https://api-docs.deepseek.com/api/create-chat-completion)
+		// exposes cache hit/miss at the top level where prompt_tokens = hit + miss.
+		// The miss portion IS the billed input.
+		const usage = parseChunkUsage(
+			{
+				prompt_tokens: 150,
+				completion_tokens: 200,
+				prompt_cache_hit_tokens: 100,
+				prompt_cache_miss_tokens: 50,
+			},
+			OPENAI_MODEL,
+			undefined,
+		);
+
+		// input = prompt_tokens - hit_tokens = 150 - 100 = 50 (miss = billed input)
+		expect(usage.input).toBe(50);
+		expect(usage.output).toBe(200);
+		expect(usage.cacheRead).toBe(100);
+		// DeepSeek does not expose cache creation data; cacheWrite must be 0
+		// to avoid downstream double-counting (input already equals miss).
+		expect(usage.cacheWrite).toBe(0);
+		expect(usage.totalTokens).toBe(350); // 50 + 200 + 100 + 0
+	});
+
+	it("handles DeepSeek with only cache hits (miss=0)", () => {
+		const usage = parseChunkUsage(
+			{
+				prompt_tokens: 100,
+				completion_tokens: 200,
+				prompt_cache_hit_tokens: 100,
+				prompt_cache_miss_tokens: 0,
+			},
+			OPENAI_MODEL,
+			undefined,
+		);
+
+		expect(usage.input).toBe(0);
+		expect(usage.cacheRead).toBe(100);
+		expect(usage.cacheWrite).toBe(0);
+		expect(usage.totalTokens).toBe(300);
+	});
+
+	it("handles DeepSeek with only cache misses (hit=0)", () => {
+		const usage = parseChunkUsage(
+			{
+				prompt_tokens: 100,
+				completion_tokens: 200,
+				prompt_cache_hit_tokens: 0,
+				prompt_cache_miss_tokens: 100,
+			},
+			OPENAI_MODEL,
+			undefined,
+		);
+
+		// input = prompt_tokens - hit_tokens = 100 - 0 = 100 (all billed)
+		expect(usage.input).toBe(100);
+		expect(usage.cacheRead).toBe(0);
+		expect(usage.cacheWrite).toBe(0);
+		expect(usage.totalTokens).toBe(300); // 100 + 200 + 0 + 0
+	});
+
+	it("does not confuse OpenRouter responses with DeepSeek format", () => {
+		// OpenRouter response where prompt_tokens_details exists but
+		// no top-level prompt_cache_* fields — must NOT trigger DeepSeek path.
+		const usage = parseChunkUsage(
+			{
+				prompt_tokens: 6_000,
+				completion_tokens: 250,
+				prompt_tokens_details: { cached_tokens: 200, cache_write_tokens: 5_000 },
+			},
+			OPENAI_MODEL,
+			undefined,
+		);
+
+		expect(usage.input).toBe(800); // 6000 - 200 - 5000
+		expect(usage.cacheRead).toBe(200);
+		expect(usage.cacheWrite).toBe(5_000);
+		expect(usage.totalTokens).toBe(6_250);
+	});
+
+	it("uses OpenRouter path when DeepSeek routes through OpenRouter with both field sets", () => {
+		// Hypothetical: DeepSeek model via OpenRouter where OpenRouter passes
+		// through native prompt_cache_* fields AND adds its own
+		// prompt_tokens_details.cache_write_tokens.
+		// Must NOT trigger DeepSeek path — cacheWrite came from OpenRouter,
+		// which bills it on top of prompt_tokens.
+		const usage = parseChunkUsage(
+			{
+				prompt_tokens: 6_000,
+				completion_tokens: 250,
+				prompt_cache_hit_tokens: 200,
+				prompt_cache_miss_tokens: 50,
+				prompt_tokens_details: { cached_tokens: 200, cache_write_tokens: 5_000 },
+			},
+			OPENAI_MODEL,
+			undefined,
+		);
+
+		// cacheWrite from OpenRouter (5000), not DeepSeek miss (50).
+		// input = 6000 - 200 - 5000 = 800 (OpenRouter formula).
+		expect(usage.input).toBe(800);
+		expect(usage.cacheRead).toBe(200);
+		expect(usage.cacheWrite).toBe(5_000);
+		expect(usage.totalTokens).toBe(6_250);
+	});
+});
+
+describe("shared OpenAI usage accounting", () => {
+	it("uses provider cache-write details ahead of native DeepSeek passthrough fields", () => {
+		const usage = calculateOpenAIUsageAccounting({
+			promptTokens: 6_000,
+			outputTokens: 250,
+			cachedTokens: 200,
+			reasoningTokens: 0,
+			cacheWriteOpenRouter: 5_000,
+			cacheWriteDeepSeek: 50,
+			hasDeepSeekCacheHitAndMiss: true,
+		});
+
+		expect(usage.input).toBe(800);
+		expect(usage.cacheRead).toBe(200);
+		expect(usage.cacheWrite).toBe(5_000);
+		expect(usage.totalTokens).toBe(6_250);
+	});
+
+	it("does not emit DeepSeek cache misses as cache writes", () => {
+		const usage = calculateOpenAIUsageAccounting({
+			promptTokens: 150,
+			outputTokens: 200,
+			cachedTokens: 100,
+			reasoningTokens: 0,
+			cacheWriteOpenRouter: undefined,
+			cacheWriteDeepSeek: 50,
+			hasDeepSeekCacheHitAndMiss: true,
+		});
+
+		expect(usage.input).toBe(50);
+		expect(usage.cacheRead).toBe(100);
+		expect(usage.cacheWrite).toBe(0);
+		expect(usage.totalTokens).toBe(350);
+	});
+
+	it("treats zero provider cache-write as present when native fields pass through", () => {
+		const usage = calculateOpenAIUsageAccounting({
+			promptTokens: 150,
+			outputTokens: 25,
+			cachedTokens: 100,
+			reasoningTokens: 0,
+			cacheWriteOpenRouter: 0,
+			cacheWriteDeepSeek: 50,
+			hasDeepSeekCacheHitAndMiss: true,
+		});
+
+		expect(usage.input).toBe(50);
+		expect(usage.cacheRead).toBe(100);
+		expect(usage.cacheWrite).toBe(0);
+		expect(usage.totalTokens).toBe(175);
 	});
 });
 

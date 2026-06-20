@@ -35,9 +35,11 @@ class ProtocolParsingTests(unittest.TestCase):
                     "contextWindow": 200000,
                     "maxTokens": 8192,
                     "thinking": {
-                        "minLevel": "minimal",
-                        "maxLevel": "high",
                         "mode": "effort",
+                        "efforts": ["minimal", "low", "medium", "high"],
+                        "defaultLevel": "medium",
+                        "effortMap": {"high": "xhigh"},
+                        "supportsDisplay": True,
                     },
                 },
                 "thinkingLevel": "medium",
@@ -85,6 +87,14 @@ class ProtocolParsingTests(unittest.TestCase):
         # Legacy bare-string systemPrompt is accepted and wrapped to a tuple.
         self.assertEqual(state.system_prompt, ("You are useful.",))
         self.assertEqual(state.dump_tools[0].name, "read")
+        assert state.model is not None and state.model.thinking is not None
+        self.assertEqual(
+            state.model.thinking.efforts, ("minimal", "low", "medium", "high")
+        )
+        self.assertEqual(state.model.thinking.mode, "effort")
+        self.assertEqual(state.model.thinking.default_level, "medium")
+        self.assertEqual(state.model.thinking.effort_map, {"high": "xhigh"})
+        self.assertTrue(state.model.thinking.supports_display)
 
     def test_parse_agent_end_notification(self) -> None:
         notification = parse_notification(
@@ -184,6 +194,26 @@ class ProtocolParsingTests(unittest.TestCase):
                 }
             )
 
+    def test_parse_model_info_rejects_unknown_effort(self) -> None:
+        with self.assertRaises(ValueError):
+            parse_session_state(
+                {
+                    "sessionId": "session-123",
+                    "steeringMode": "one-at-a-time",
+                    "followUpMode": "one-at-a-time",
+                    "interruptMode": "immediate",
+                    "model": {
+                        "id": "m",
+                        "name": "M",
+                        "api": "anthropic-messages",
+                        "provider": "anthropic",
+                        "baseUrl": "https://api.anthropic.com",
+                        "reasoning": True,
+                        "thinking": {"mode": "effort", "efforts": ["extreme"]},
+                    },
+                }
+            )
+
     def test_parse_session_state_accepts_system_prompt_array(self) -> None:
         state = parse_session_state(
             {
@@ -207,7 +237,9 @@ class ProtocolParsingTests(unittest.TestCase):
         )
         self.assertEqual(state.system_prompt, ())
 
-    def test_parse_session_state_rejects_non_string_in_system_prompt_array(self) -> None:
+    def test_parse_session_state_rejects_non_string_in_system_prompt_array(
+        self,
+    ) -> None:
         with self.assertRaises(ValueError):
             parse_session_state(
                 {
@@ -233,7 +265,9 @@ class ProtocolParsingTests(unittest.TestCase):
 
     def test_parse_extension_ui_request_rejects_invalid_method(self) -> None:
         with self.assertRaises(ValueError):
-            parse_notification({"type": "extension_ui_request", "id": "ui-1", "method": "launch"})
+            parse_notification(
+                {"type": "extension_ui_request", "id": "ui-1", "method": "launch"}
+            )
 
     def test_parse_message_update_rejects_invalid_assistant_done_reason(self) -> None:
         with self.assertRaises(ValueError):

@@ -9,7 +9,7 @@ import * as fs from "node:fs";
 import * as path from "node:path";
 import { formatHashlineHeader, InMemorySnapshotStore } from "@oh-my-pi/hashline";
 import type { AgentMessage, ResolvedThinkingLevel, ThinkingLevel } from "@oh-my-pi/pi-agent-core";
-import type { Model } from "@oh-my-pi/pi-ai";
+import type { Model, ToolExample } from "@oh-my-pi/pi-ai";
 import { formatSessionDumpText, RpcClient } from "@oh-my-pi/pi-coding-agent";
 import { prompt } from "@oh-my-pi/pi-utils";
 import { diffLines } from "diff";
@@ -37,7 +37,7 @@ type ConversationDumpSessionState = {
 	systemPrompt?: string[];
 	model?: Model;
 	thinkingLevel?: ThinkingLevel | undefined;
-	dumpTools?: Array<{ name: string; description: string; parameters: unknown }>;
+	dumpTools?: Array<{ name: string; description: string; parameters: unknown; examples?: readonly ToolExample[] }>;
 };
 
 /** Common interface for both RPC and in-process clients */
@@ -103,7 +103,7 @@ type ConversationDumpSnapshot = {
 	systemPrompt?: string[];
 	model?: Model;
 	thinkingLevel?: ThinkingLevel | undefined;
-	dumpTools?: Array<{ name: string; description: string; parameters: unknown }>;
+	dumpTools?: Array<{ name: string; description: string; parameters: unknown; examples?: readonly ToolExample[] }>;
 };
 
 function sanitizeDumpPathSegment(value: string): string {
@@ -605,7 +605,7 @@ function buildGuidedHashlinePatch(file: string, actual: string, expected: string
 	if (ops.length === 0) return null;
 	const normalizedActual = actual.replace(/\r\n?/g, "\n");
 	const snapshots = new InMemorySnapshotStore();
-	const tag = snapshots.recordContiguous(file, 1, normalizedActual.split("\n"), { fullText: normalizedActual });
+	const tag = snapshots.record(file, normalizedActual);
 	const header = formatHashlineHeader(file, tag);
 	return `${header}\n${ops.join("\n")}`;
 }
@@ -780,10 +780,16 @@ export interface ToolCallStats {
 	totalInputChars: number;
 }
 
+interface PendingEditCall {
+	args: unknown;
+	rawBlock?: string;
+}
+
 export interface EditFailure {
 	toolCallId: string;
 	args: unknown;
 	error: string;
+	rawBlock?: string;
 	category?: EditFailureCategory;
 }
 
@@ -869,10 +875,28 @@ export interface BenchmarkSummary {
 	flakyTasks: number;
 	/** Tasks where every executed non-ghost run succeeded. */
 	consistentlyPassingTasks: number;
+	/** Tasks whose first run succeeded. */
+	successfulOneShotTasks: number;
+	/** Tokens summed over the first run of each successfully one-shot task. */
+	totalOneShotSuccessTokens: TokenStats;
+	/** Average tokens per successfully one-shot task. */
+	avgOneShotSuccessTokensPerTask: TokenStats;
+	/** Median tokens across successfully one-shot tasks. */
+	medianOneShotSuccessTokensPerTask: TokenStats;
+	/** 1st-percentile tokens across successfully one-shot tasks. */
+	p1OneShotSuccessTokensPerTask: TokenStats;
+	/** 99th-percentile tokens across successfully one-shot tasks. */
+	p99OneShotSuccessTokensPerTask: TokenStats;
 	/** Tokens summed over the best run of each task. */
 	totalTokens: TokenStats;
 	/** Average tokens per task (sum of best runs / number of tasks). */
 	avgTokensPerTask: TokenStats;
+	/** Median tokens across best runs (per-task distribution). */
+	medianTokensPerTask: TokenStats;
+	/** 1st-percentile tokens across best runs (per-task distribution). */
+	p1TokensPerTask: TokenStats;
+	/** 99th-percentile tokens across best runs (per-task distribution). */
+	p99TokensPerTask: TokenStats;
 	/** Duration summed over best runs. */
 	totalDuration: number;
 	/** Average duration of the best run per task. */
@@ -1190,9 +1214,16 @@ async function runSingleTask(
 					});
 					break;
 				}
-				const pendingEdits = new Map<string, unknown>();
-
+				const pendingEdits = new Map<string, PendingEditCall>();
+				const rawToolBlocks = new Map<string, string>();
 				for (const event of events) {
+					if (event.type === "message_end") {
+						for (const raw of extractAssistantToolRawBlocks(event)) {
+							rawToolBlocks.set(raw.id, raw.rawBlock);
+							const pending = pendingEdits.get(raw.id);
+							if (pending) pending.rawBlock = raw.rawBlock;
+						}
+					}
 					if (event.type === "tool_execution_start") {
 						const e = event as { toolName?: string; toolCallId?: string; args?: unknown };
 						const toolName = e.toolName;
@@ -1200,7 +1231,8 @@ async function runSingleTask(
 							toolStats.read++;
 						} else if (isEditTool(toolName)) {
 							toolStats.edit++;
-							if (e.toolCallId) pendingEdits.set(e.toolCallId, e.args);
+							if (e.toolCallId)
+								pendingEdits.set(e.toolCallId, { args: e.args, rawBlock: rawToolBlocks.get(e.toolCallId) });
 						} else if (toolName === "write") {
 							toolStats.write++;
 						}
@@ -1212,7 +1244,8 @@ async function runSingleTask(
 					} else if (event.type === "tool_execution_end") {
 						const e = event as { toolName?: string; toolCallId?: string; isError?: boolean; result?: unknown };
 						if (isEditTool(e.toolName) && e.toolCallId && pendingEdits.has(e.toolCallId)) {
-							const args = pendingEdits.get(e.toolCallId) ?? null;
+							const pendingEdit = pendingEdits.get(e.toolCallId) ?? { args: null };
+							const args = pendingEdit.args;
 							pendingEdits.delete(e.toolCallId);
 							if (config.editVariant === "hashline" && args) {
 								const counts = countHashlineEditSubtypes(args);
@@ -1232,6 +1265,7 @@ async function runSingleTask(
 									toolCallId: e.toolCallId,
 									args,
 									error,
+									rawBlock: pendingEdit.rawBlock,
 									category: categorizeEditFailure(error, args),
 								});
 							} else {
@@ -1402,6 +1436,27 @@ function extractToolErrorMessage(result: unknown): string {
 	} catch {
 		return "Unknown error";
 	}
+}
+
+function extractAssistantToolRawBlocks(event: {
+	type: string;
+	[key: string]: unknown;
+}): Array<{ id: string; rawBlock: string }> {
+	const message = event.message;
+	if (message === null || typeof message !== "object") return [];
+	const role = (message as { role?: unknown }).role;
+	if (role !== "assistant") return [];
+	const content = (message as { content?: unknown }).content;
+	if (!Array.isArray(content)) return [];
+	const rawBlocks: Array<{ id: string; rawBlock: string }> = [];
+	for (const block of content) {
+		if (block === null || typeof block !== "object") continue;
+		const typedBlock = block as { type?: unknown; id?: unknown; rawBlock?: unknown };
+		if (typedBlock.type !== "toolCall") continue;
+		if (typeof typedBlock.id !== "string" || typeof typedBlock.rawBlock !== "string") continue;
+		rawBlocks.push({ id: typedBlock.id, rawBlock: typedBlock.rawBlock });
+	}
+	return rawBlocks;
 }
 
 function shuffle<T>(items: T[]): T[] {
@@ -1775,6 +1830,42 @@ async function runConcurrentBenchmarkRun(
 	}
 }
 
+/**
+ * Linear-interpolated percentile (NumPy "linear" / type-7) over an ascending-sorted
+ * sample. `p` is a percentage in [0, 100]. Returns 0 for an empty sample.
+ */
+export function percentile(sortedAscending: readonly number[], p: number): number {
+	const n = sortedAscending.length;
+	if (n === 0) return 0;
+	if (n === 1) return sortedAscending[0]!;
+	const rank = (p / 100) * (n - 1);
+	const lo = Math.floor(rank);
+	const loVal = sortedAscending[lo]!;
+	const hi = Math.ceil(rank);
+	if (lo === hi) return loVal;
+	return loVal + (sortedAscending[hi]! - loVal) * (rank - lo);
+}
+
+/** Median / 1st / 99th percentile token stats over a set of runs (one sample per run). */
+export interface TokenDistribution {
+	median: TokenStats;
+	p1: TokenStats;
+	p99: TokenStats;
+}
+
+/** Compute the per-run token distribution (median, p1, p99) across the given runs. */
+export function summarizeTokenDistribution(runs: readonly TaskRunResult[]): TokenDistribution {
+	const input = runs.map(r => r.tokens.input).sort((a, b) => a - b);
+	const output = runs.map(r => r.tokens.output).sort((a, b) => a - b);
+	const total = runs.map(r => r.tokens.total).sort((a, b) => a - b);
+	const at = (p: number): TokenStats => ({
+		input: Math.round(percentile(input, p)),
+		output: Math.round(percentile(output, p)),
+		total: Math.round(percentile(total, p)),
+	});
+	return { median: at(50), p1: at(1), p99: at(99) };
+}
+
 export function buildBenchmarkResult(params: {
 	tasks: EditTask[];
 	config: BenchmarkConfig;
@@ -1835,6 +1926,7 @@ export function buildBenchmarkResult(params: {
 		output: bestRuns.reduce((sum, r) => sum + r.tokens.output, 0),
 		total: bestRuns.reduce((sum, r) => sum + r.tokens.total, 0),
 	};
+	const tokenDistribution = summarizeTokenDistribution(bestRuns);
 	const totalDuration = bestRuns.reduce((sum, r) => sum + r.duration, 0);
 	const totalToolCalls: ToolCallStats = {
 		read: bestRuns.reduce((sum, r) => sum + r.toolCalls.read, 0),
@@ -1863,8 +1955,31 @@ export function buildBenchmarkResult(params: {
 			? bestWithMutationIntent.filter(r => r.mutationIntentMatched).length / bestWithMutationIntent.length
 			: undefined;
 
+	const oneShotSuccessRuns = taskResults
+		.map(t => t.runs.find(r => r.runIndex === 0))
+		.filter((r): r is TaskRunResult => Boolean(r?.success));
+	const successfulOneShotTasks = oneShotSuccessRuns.length;
+	const oneShotDenom = successfulOneShotTasks || 1;
+
+	const totalOneShotSuccessTokens: TokenStats = {
+		input: oneShotSuccessRuns.reduce((sum, r) => sum + r.tokens.input, 0),
+		output: oneShotSuccessRuns.reduce((sum, r) => sum + r.tokens.output, 0),
+		total: oneShotSuccessRuns.reduce((sum, r) => sum + r.tokens.total, 0),
+	};
+	const oneShotTokenDistribution = summarizeTokenDistribution(oneShotSuccessRuns);
+
 	const taskDenom = tasksWithBestRun || 1;
 	const summary: BenchmarkSummary = {
+		successfulOneShotTasks,
+		totalOneShotSuccessTokens,
+		avgOneShotSuccessTokensPerTask: {
+			input: Math.round(totalOneShotSuccessTokens.input / oneShotDenom),
+			output: Math.round(totalOneShotSuccessTokens.output / oneShotDenom),
+			total: Math.round(totalOneShotSuccessTokens.total / oneShotDenom),
+		},
+		medianOneShotSuccessTokensPerTask: oneShotTokenDistribution.median,
+		p1OneShotSuccessTokensPerTask: oneShotTokenDistribution.p1,
+		p99OneShotSuccessTokensPerTask: oneShotTokenDistribution.p99,
 		totalTasks,
 		totalRuns,
 		successfulRuns,
@@ -1878,6 +1993,9 @@ export function buildBenchmarkResult(params: {
 			output: Math.round(totalTokens.output / taskDenom),
 			total: Math.round(totalTokens.total / taskDenom),
 		},
+		medianTokensPerTask: tokenDistribution.median,
+		p1TokensPerTask: tokenDistribution.p1,
+		p99TokensPerTask: tokenDistribution.p99,
 		totalDuration,
 		avgDurationPerTask: Math.round(totalDuration / taskDenom),
 		avgIndentScore,

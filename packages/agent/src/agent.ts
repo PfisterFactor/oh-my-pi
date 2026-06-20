@@ -3,12 +3,13 @@
  */
 import { isPromise } from "node:util/types";
 import {
+	type ApiKey,
 	type AssistantMessage,
 	type AssistantMessageEvent,
+	type Context,
 	type CursorExecHandlers,
 	type CursorToolResultHandler,
 	type Effort,
-	getBundledModel,
 	type ImageContent,
 	type Message,
 	type Model,
@@ -21,9 +22,12 @@ import {
 	type ToolChoice,
 	type ToolResultMessage,
 } from "@oh-my-pi/pi-ai";
-import { agentLoop, agentLoopContinue } from "./agent-loop";
+import type { Dialect } from "@oh-my-pi/pi-ai/dialect";
+import type { HarmonyAuditEvent } from "@oh-my-pi/pi-ai/utils/harmony-leak";
+import { getBundledModel } from "@oh-my-pi/pi-catalog/models";
+import { logger } from "@oh-my-pi/pi-utils";
+import { abortReasonText, agentLoop, agentLoopContinue } from "./agent-loop";
 import type { AppendOnlyContextManager } from "./append-only-context";
-import type { HarmonyAuditEvent } from "./harmony-leak";
 import type {
 	AgentContext,
 	AgentEvent,
@@ -32,9 +36,12 @@ import type {
 	AgentState,
 	AgentTool,
 	AgentToolContext,
+	AsideMessage,
 	StreamFn,
 	ToolCallContext,
+	ToolChoiceDirective,
 } from "./types";
+import { isSoftToolRequirement } from "./types";
 import { EventLoopKeepalive } from "./utils/yield";
 
 /**
@@ -42,6 +49,12 @@ import { EventLoopKeepalive } from "./utils/yield";
  */
 function defaultConvertToLlm(messages: AgentMessage[]): Message[] {
 	return messages.filter((m): m is Message => m.role === "user" || m.role === "assistant" || m.role === "toolResult");
+}
+
+const ANTHROPIC_OUTPUT_BLOCKED_PREFIX = "Output blocked by conten";
+
+function isAnthropicOutputBlockedError(message: string): boolean {
+	return message.includes(ANTHROPIC_OUTPUT_BLOCKED_PREFIX);
 }
 
 function refreshToolChoiceForActiveTools(
@@ -86,6 +99,12 @@ export interface AgentOptions {
 	transformContext?: (messages: AgentMessage[], signal?: AbortSignal) => Promise<AgentMessage[]>;
 
 	/**
+	 * Optional transform applied after provider context assembly and before
+	 * telemetry capture/provider send.
+	 */
+	transformProviderContext?: (context: Context, model: Model) => Context;
+
+	/**
 	 * Steering mode: "all" = send all steering messages at once, "one-at-a-time" = one per turn
 	 */
 	steeringMode?: "all" | "one-at-a-time";
@@ -114,6 +133,8 @@ export interface AgentOptions {
 	 * Custom stream function (for proxy backends, etc.). Default uses streamSimple.
 	 */
 	streamFn?: StreamFn;
+	/** Absolute wall-clock deadline in Unix epoch milliseconds. */
+	deadline?: number;
 
 	/**
 	 * Optional session identifier forwarded to LLM providers.
@@ -121,15 +142,20 @@ export interface AgentOptions {
 	 */
 	sessionId?: string;
 	/**
+	 * Optional prompt cache key forwarded to LLM providers.
+	 * When omitted, providers may fall back to sessionId.
+	 */
+	promptCacheKey?: string;
+	/**
 	 * Shared provider state map for session-scoped transport/session caches.
 	 */
 	providerSessionState?: Map<string, ProviderSessionState>;
 
 	/**
-	 * Resolves an API key dynamically for each LLM call.
-	 * Useful for expiring tokens (e.g., GitHub Copilot OAuth).
+	 * Resolves an API key or resolver dynamically for each LLM call.
+	 * Useful for expiring tokens and model-scoped credential routing.
 	 */
-	getApiKey?: (provider: string) => Promise<string | undefined> | string | undefined;
+	getApiKey?: (model: Model) => Promise<ApiKey | undefined> | ApiKey | undefined;
 
 	/**
 	 * Inspect or replace provider payloads before they are sent.
@@ -199,8 +225,23 @@ export interface AgentOptions {
 
 	/** Enable intent tracing schema injection/stripping in the harness. */
 	intentTracing?: boolean;
-	/** Dynamic tool choice override, resolved per LLM call. */
-	getToolChoice?: () => ToolChoice | undefined;
+	/**
+	 * Strip tool descriptions from provider-bound tool specs (top-level + nested
+	 * schema annotations). Use when the full catalog is rendered into the system
+	 * prompt so descriptions are not duplicated on the wire. Native tool calling only.
+	 */
+	pruneToolDescriptions?: boolean;
+	/** Owned tool-calling dialect. Undefined keeps provider-native tool calling. */
+	dialect?: Dialect;
+	/**
+	 * When owned tool calling is active and the model fabricates a tool result
+	 * mid-turn: `true` (default) aborts the provider request immediately; `false`
+	 * drains the request and discards the fabricated continuation. Forwarded to
+	 * the loop's {@link AgentLoopConfig.abortOnFabricatedToolResult}.
+	 */
+	abortOnFabricatedToolResult?: boolean;
+	/** Dynamic tool-choice directive (hard {@link ToolChoice} or {@link SoftToolRequirement}), resolved once per turn. */
+	getToolChoice?: () => ToolChoiceDirective | undefined;
 
 	/**
 	 * Cursor exec handlers for local tool execution.
@@ -223,6 +264,13 @@ export interface AgentOptions {
 	 * message are emitted. See {@link AgentLoopConfig.afterToolCall} for full semantics.
 	 */
 	afterToolCall?: AgentLoopConfig["afterToolCall"];
+
+	/**
+	 * Called once an assistant message is finalized, before it reaches the
+	 * context, the UI, or tool dispatch. May mutate the message in place (text +
+	 * tool-call arguments). See {@link AgentLoopConfig.transformAssistantMessage}.
+	 */
+	transformAssistantMessage?: AgentLoopConfig["transformAssistantMessage"];
 
 	/**
 	 * Opt-in OpenTelemetry instrumentation. Passing `{}` enables the loop's
@@ -252,6 +300,7 @@ export class Agent {
 		systemPrompt: [],
 		model: getBundledModel("google", "gemini-2.5-flash-lite-preview-06-17"),
 		thinkingLevel: undefined,
+		disableReasoning: false,
 		tools: [],
 		messages: [],
 		isStreaming: false,
@@ -264,12 +313,15 @@ export class Agent {
 	#abortController?: AbortController;
 	#convertToLlm: (messages: AgentMessage[]) => Message[] | Promise<Message[]>;
 	#transformContext?: (messages: AgentMessage[], signal?: AbortSignal) => Promise<AgentMessage[]>;
+	#transformProviderContext?: (context: Context, model: Model) => Context;
 	#steeringQueue: AgentMessage[] = [];
 	#followUpQueue: AgentMessage[] = [];
 	#steeringMode: "all" | "one-at-a-time";
 	#followUpMode: "all" | "one-at-a-time";
 	#interruptMode: "immediate" | "wait";
 	#sessionId?: string;
+	#deadline?: number;
+	#promptCacheKey?: string;
 	#metadata?: Record<string, unknown>;
 	#metadataResolver?: (provider: string) => Record<string, unknown> | undefined;
 	#providerSessionState?: Map<string, ProviderSessionState>;
@@ -292,13 +344,18 @@ export class Agent {
 	#preferWebsockets?: boolean;
 	#transformToolCallArguments?: (args: Record<string, unknown>, toolName: string) => Record<string, unknown>;
 	#intentTracing: boolean;
-	#getToolChoice?: () => ToolChoice | undefined;
+	#pruneToolDescriptions: boolean;
+	#dialect?: Dialect;
+	#abortOnFabricatedToolResult?: boolean;
+	#getToolChoice?: () => ToolChoiceDirective | undefined;
 	#onPayload?: SimpleStreamOptions["onPayload"];
 	#onResponse?: SimpleStreamOptions["onResponse"];
 	#onSseEvent?: SimpleStreamOptions["onSseEvent"];
 	#onAssistantMessageEvent?: (message: AssistantMessage, event: AssistantMessageEvent) => void;
 	#onHarmonyLeak?: (event: HarmonyAuditEvent) => void | Promise<void>;
 	#onBeforeYield?: () => Promise<void> | void;
+	#onTurnEnd?: (messages: AgentMessage[], signal?: AbortSignal) => Promise<void> | void;
+	#asideMessageProvider?: () => AsideMessage[] | Promise<AsideMessage[]>;
 	#telemetry?: AgentLoopConfig["telemetry"];
 	#appendOnlyContext?: AppendOnlyContextManager;
 
@@ -306,7 +363,7 @@ export class Agent {
 	#cursorToolResultBuffer: CursorToolResultEntry[] = [];
 
 	streamFn: StreamFn;
-	getApiKey?: (provider: string) => Promise<string | undefined> | string | undefined;
+	getApiKey?: (model: Model) => Promise<ApiKey | undefined> | ApiKey | undefined;
 	/**
 	 * Hook invoked after tool arguments are validated and before execution.
 	 * Reassign at any time to swap the implementation (e.g. on extension reload).
@@ -317,9 +374,17 @@ export class Agent {
 	 * message emission. Reassign at any time to swap the implementation.
 	 */
 	afterToolCall?: AgentLoopConfig["afterToolCall"];
+	/**
+	 * Hook invoked once an assistant message is finalized, before context append,
+	 * UI emission, and tool dispatch. Reassign at any time to swap the implementation.
+	 */
+	transformAssistantMessage?: AgentLoopConfig["transformAssistantMessage"];
 
 	constructor(opts: AgentOptions = {}) {
 		this.#state = { ...this.#state, ...opts.initialState };
+		if (opts.initialState?.messages) this.#state.messages = opts.initialState.messages.slice();
+		if (opts.initialState?.pendingToolCalls)
+			this.#state.pendingToolCalls = new Set(opts.initialState.pendingToolCalls);
 		this.#convertToLlm = opts.convertToLlm || defaultConvertToLlm;
 		this.#transformContext = opts.transformContext;
 		this.#steeringMode = opts.steeringMode || "one-at-a-time";
@@ -327,6 +392,8 @@ export class Agent {
 		this.#interruptMode = opts.interruptMode || "immediate";
 		this.streamFn = opts.streamFn || streamSimple;
 		this.#sessionId = opts.sessionId;
+		this.#deadline = opts.deadline;
+		this.#promptCacheKey = opts.promptCacheKey;
 		this.#providerSessionState = opts.providerSessionState;
 		this.#thinkingBudgets = opts.thinkingBudgets;
 		this.#temperature = opts.temperature;
@@ -349,13 +416,18 @@ export class Agent {
 		this.#preferWebsockets = opts.preferWebsockets;
 		this.#transformToolCallArguments = opts.transformToolCallArguments;
 		this.#intentTracing = opts.intentTracing === true;
+		this.#pruneToolDescriptions = opts.pruneToolDescriptions === true;
+		this.#dialect = opts.dialect;
+		this.#abortOnFabricatedToolResult = opts.abortOnFabricatedToolResult;
 		this.#getToolChoice = opts.getToolChoice;
 		this.#onAssistantMessageEvent = opts.onAssistantMessageEvent;
 		this.#onHarmonyLeak = opts.onHarmonyLeak;
 		this.beforeToolCall = opts.beforeToolCall;
 		this.afterToolCall = opts.afterToolCall;
+		this.transformAssistantMessage = opts.transformAssistantMessage;
 		this.#telemetry = opts.telemetry;
 		this.#appendOnlyContext = opts.appendOnlyContext;
+		this.#transformProviderContext = opts.transformProviderContext;
 	}
 
 	/**
@@ -371,6 +443,20 @@ export class Agent {
 	 */
 	set sessionId(value: string | undefined) {
 		this.#sessionId = value;
+	}
+
+	/**
+	 * Get the prompt cache key forwarded to providers.
+	 */
+	get promptCacheKey(): string | undefined {
+		return this.#promptCacheKey;
+	}
+
+	/**
+	 * Set the prompt cache key forwarded to providers.
+	 */
+	set promptCacheKey(value: string | undefined) {
+		this.#promptCacheKey = value;
 	}
 
 	/**
@@ -581,6 +667,18 @@ export class Agent {
 	setOnBeforeYield(fn: (() => Promise<void> | void) | undefined): void {
 		this.#onBeforeYield = fn;
 	}
+	setOnTurnEnd(fn: ((messages: AgentMessage[], signal?: AbortSignal) => Promise<void> | void) | undefined): void {
+		this.#onTurnEnd = fn;
+	}
+
+	/**
+	 * Provide a source of non-interrupting "aside" messages (e.g. background-job
+	 * completions, late LSP diagnostics) drained at each step boundary. Never
+	 * aborts in-flight tools. See `AgentLoopConfig.getAsideMessages`.
+	 */
+	setAsideMessageProvider(fn: (() => AsideMessage[] | Promise<AsideMessage[]>) | undefined): void {
+		this.#asideMessageProvider = fn;
+	}
 
 	emitExternalEvent(event: AgentEvent) {
 		switch (event.type) {
@@ -592,26 +690,20 @@ export class Agent {
 				this.#state.streamMessage = null;
 				this.appendMessage(event.message);
 				break;
-			case "tool_execution_start": {
-				const pending = new Set(this.#state.pendingToolCalls);
-				pending.add(event.toolCallId);
-				this.#state.pendingToolCalls = pending;
+			case "tool_execution_start":
+				this.#state.pendingToolCalls.add(event.toolCallId);
 				break;
-			}
-			case "tool_execution_end": {
-				const pending = new Set(this.#state.pendingToolCalls);
-				pending.delete(event.toolCallId);
-				this.#state.pendingToolCalls = pending;
+			case "tool_execution_end":
+				this.#state.pendingToolCalls.delete(event.toolCallId);
 				break;
-			}
 		}
 
 		this.#emit(event);
 	}
 
 	// State mutators
-	setSystemPrompt(v: string[]) {
-		this.#state.systemPrompt = v;
+	setSystemPrompt(v: string[] | string) {
+		this.#state.systemPrompt = typeof v === "string" ? [v] : v;
 	}
 
 	setModel(m: Model) {
@@ -620,6 +712,10 @@ export class Agent {
 
 	setThinkingLevel(l: Effort | undefined) {
 		this.#state.thinkingLevel = l;
+	}
+
+	setDisableReasoning(disabled: boolean) {
+		this.#state.disableReasoning = disabled;
 	}
 
 	setSteeringMode(mode: "all" | "one-at-a-time") {
@@ -651,22 +747,25 @@ export class Agent {
 	}
 
 	replaceMessages(ms: AgentMessage[]) {
+		// New array assignment is intentional: caller-owned `ms` may be mutated
+		// after handoff; snapshot it so external mutations cannot leak in.
 		this.#state.messages = ms.slice();
 	}
 
+	replaceQueues(steering: AgentMessage[], followUp: AgentMessage[]) {
+		this.#steeringQueue = steering.slice();
+		this.#followUpQueue = followUp.slice();
+	}
+
 	appendMessage(m: AgentMessage) {
-		this.#state.messages = [...this.#state.messages, m];
+		this.#state.messages.push(m);
 	}
 
 	popMessage(): AgentMessage | undefined {
-		const messages = this.#state.messages.slice(0, -1);
-		const removed = this.#state.messages.at(-1);
-		this.#state.messages = messages;
-
+		const removed = this.#state.messages.pop();
 		if (removed && this.#state.streamMessage === removed) {
 			this.#state.streamMessage = null;
 		}
-
 		return removed;
 	}
 
@@ -701,6 +800,24 @@ export class Agent {
 
 	hasQueuedMessages(): boolean {
 		return this.#steeringQueue.length > 0 || this.#followUpQueue.length > 0;
+	}
+
+	/** Non-consuming view of the pending steering queue (insertion order, newest
+	 *  last). The session layer derives its queued-message display/count from
+	 *  this live view instead of a mirror, so the agent-core queue stays the
+	 *  single source of truth. */
+	peekSteeringQueue(): readonly AgentMessage[] {
+		return this.#steeringQueue;
+	}
+
+	/** Non-consuming view of the pending follow-up queue. See
+	 *  {@link peekSteeringQueue}. */
+	peekFollowUpQueue(): readonly AgentMessage[] {
+		return this.#followUpQueue;
+	}
+
+	get isAborting(): boolean {
+		return this.#abortController?.signal.aborted === true && this.#state.isStreaming;
 	}
 
 	#dequeueSteeringMessages(): AgentMessage[] {
@@ -748,11 +865,11 @@ export class Agent {
 	}
 
 	clearMessages() {
-		this.#state.messages = [];
+		this.#state.messages.length = 0;
 	}
 
-	abort() {
-		this.#abortController?.abort();
+	abort(reason?: unknown) {
+		this.#abortController?.abort(reason);
 	}
 
 	waitForIdle(): Promise<void> {
@@ -760,10 +877,10 @@ export class Agent {
 	}
 
 	reset() {
-		this.#state.messages = [];
+		this.#state.messages.length = 0;
 		this.#state.isStreaming = false;
 		this.#state.streamMessage = null;
-		this.#state.pendingToolCalls = new Set<string>();
+		this.#state.pendingToolCalls.clear();
 		this.#state.error = undefined;
 		this.#steeringQueue = [];
 		this.#followUpQueue = [];
@@ -902,12 +1019,21 @@ export class Agent {
 					}
 				: undefined;
 
-		const getToolChoice = () =>
-			this.#getToolChoice?.() ?? refreshToolChoiceForActiveTools(options?.toolChoice, this.#state.tools);
+		const getToolChoice = (): ToolChoiceDirective | undefined => {
+			const queued = this.#getToolChoice?.();
+			if (queued !== undefined) {
+				if (isSoftToolRequirement(queued)) {
+					return (this.#state.tools ?? []).some(tool => tool.name === queued.toolName) ? queued : undefined;
+				}
+				return refreshToolChoiceForActiveTools(queued, this.#state.tools);
+			}
+			return refreshToolChoiceForActiveTools(options?.toolChoice, this.#state.tools);
+		};
 
 		const config: AgentLoopConfig = {
 			model,
 			reasoning,
+			disableReasoning: this.#state.disableReasoning,
 			temperature: this.#temperature,
 			topP: this.#topP,
 			topK: this.#topK,
@@ -918,6 +1044,8 @@ export class Agent {
 			hideThinkingSummary: this.#hideThinkingSummary,
 			interruptMode: this.#interruptMode,
 			sessionId: this.#sessionId,
+			deadline: this.#deadline,
+			promptCacheKey: this.#promptCacheKey,
 			metadata: this.#metadataResolver ? undefined : this.#metadata,
 			metadataResolver: this.#metadataResolver,
 			providerSessionState: this.#providerSessionState,
@@ -926,6 +1054,7 @@ export class Agent {
 			kimiApiFormat: this.#kimiApiFormat,
 			preferWebsockets: this.#preferWebsockets,
 			convertToLlm: this.#convertToLlm,
+			transformProviderContext: this.#transformProviderContext,
 			transformContext: this.#transformContext,
 			onPayload: this.#onPayload,
 			onResponse: this.#onResponse,
@@ -943,13 +1072,21 @@ export class Agent {
 			cursorOnToolResult,
 			transformToolCallArguments: this.#transformToolCallArguments,
 			intentTracing: this.#intentTracing,
+			pruneToolDescriptions: this.#pruneToolDescriptions,
+			dialect: this.#dialect,
+			abortOnFabricatedToolResult: this.#abortOnFabricatedToolResult,
 			appendOnlyContext: this.#appendOnlyContext,
 			beforeToolCall: this.beforeToolCall ? (ctx, signal) => this.beforeToolCall?.(ctx, signal) : undefined,
 			afterToolCall: this.afterToolCall ? (ctx, signal) => this.afterToolCall?.(ctx, signal) : undefined,
+			transformAssistantMessage: this.transformAssistantMessage
+				? (message, signal) => this.transformAssistantMessage?.(message, signal)
+				: undefined,
 			onAssistantMessageEvent: this.#onAssistantMessageEvent,
 			onHarmonyLeak: this.#onHarmonyLeak,
+			onTurnEnd: (messages, signal) => this.#onTurnEnd?.(messages, signal),
 			getToolChoice,
 			getReasoning: () => this.#state.thinkingLevel,
+			getDisableReasoning: () => this.#state.disableReasoning,
 			getSteeringMessages: async () => {
 				if (skipInitialSteeringPoll) {
 					skipInitialSteeringPoll = false;
@@ -957,7 +1094,9 @@ export class Agent {
 				}
 				return this.#dequeueSteeringMessages();
 			},
+			hasSteeringMessages: () => this.#steeringQueue.length > 0,
 			getFollowUpMessages: async () => this.#dequeueFollowUpMessages(),
+			getAsideMessages: async () => (await this.#asideMessageProvider?.()) ?? [],
 			onBeforeYield: () => this.#onBeforeYield?.(),
 			telemetry: this.#telemetry,
 		};
@@ -994,19 +1133,13 @@ export class Agent {
 						this.appendMessage(event.message);
 						break;
 
-					case "tool_execution_start": {
-						const s = new Set(this.#state.pendingToolCalls);
-						s.add(event.toolCallId);
-						this.#state.pendingToolCalls = s;
+					case "tool_execution_start":
+						this.#state.pendingToolCalls.add(event.toolCallId);
 						break;
-					}
 
-					case "tool_execution_end": {
-						const s = new Set(this.#state.pendingToolCalls);
-						s.delete(event.toolCallId);
-						this.#state.pendingToolCalls = s;
+					case "tool_execution_end":
+						this.#state.pendingToolCalls.delete(event.toolCallId);
 						break;
-					}
 
 					case "turn_end":
 						if (event.message.role === "assistant" && (event.message as any).errorMessage) {
@@ -1040,33 +1173,58 @@ export class Agent {
 					}
 				}
 			}
-		} catch (err: any) {
-			const errorMsg: AgentMessage = {
-				role: "assistant",
-				content: [{ type: "text", text: "" }],
-				api: model.api,
-				provider: model.provider,
-				model: model.id,
-				usage: {
-					input: 0,
-					output: 0,
-					cacheRead: 0,
-					cacheWrite: 0,
-					totalTokens: 0,
-					cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
-				},
-				stopReason: this.#abortController?.signal.aborted ? "aborted" : "error",
-				errorMessage: err?.message || String(err),
-				timestamp: Date.now(),
-			} as AgentMessage;
+		} catch (err) {
+			const stoppedForAbort = this.#abortController?.signal.aborted === true;
+			const errorMessage = stoppedForAbort
+				? abortReasonText(this.#abortController?.signal)
+				: err instanceof Error
+					? err.message
+					: String(err);
+			const shouldEmitVisibleOutputBlockedError = !stoppedForAbort && isAnthropicOutputBlockedError(errorMessage);
+			const assistantPartial = partial?.role === "assistant" ? partial : undefined;
+			const hadAssistantStart = assistantPartial !== undefined;
+			const errorMsg: AssistantMessage =
+				shouldEmitVisibleOutputBlockedError && assistantPartial
+					? { ...assistantPartial, stopReason: "error", errorMessage }
+					: {
+							role: "assistant",
+							content: [{ type: "text", text: "" }],
+							api: model.api,
+							provider: model.provider,
+							model: model.id,
+							usage: {
+								input: 0,
+								output: 0,
+								cacheRead: 0,
+								cacheWrite: 0,
+								totalTokens: 0,
+								cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+							},
+							stopReason: stoppedForAbort ? "aborted" : "error",
+							errorMessage,
+							timestamp: Date.now(),
+						};
 
-			this.appendMessage(errorMsg);
-			this.#state.error = err?.message || String(err);
-			this.#emit({ type: "agent_end", messages: [errorMsg] });
+			if (shouldEmitVisibleOutputBlockedError) {
+				if (!hadAssistantStart) {
+					this.#state.streamMessage = errorMsg;
+					this.#emit({ type: "message_start", message: errorMsg });
+				}
+				this.#state.streamMessage = null;
+				this.appendMessage(errorMsg);
+				this.#state.error = errorMessage;
+				this.#emit({ type: "message_end", message: errorMsg });
+				this.#emit({ type: "turn_end", message: errorMsg, toolResults: [] });
+				this.#emit({ type: "agent_end", messages: [errorMsg] });
+			} else {
+				this.appendMessage(errorMsg);
+				this.#state.error = errorMessage;
+				this.#emit({ type: "agent_end", messages: [errorMsg] });
+			}
 		} finally {
 			this.#state.isStreaming = false;
 			this.#state.streamMessage = null;
-			this.#state.pendingToolCalls = new Set<string>();
+			this.#state.pendingToolCalls.clear();
 			this.#abortController = undefined;
 			this.#resolveRunningPrompt?.();
 			this.#runningPrompt = undefined;
@@ -1080,18 +1238,22 @@ export class Agent {
 				const result = listener(e) as unknown;
 				if (isPromise(result)) {
 					result.catch(err => {
-						console.error("Agent listener rejected:", err instanceof Error ? err.message : err);
+						logger.warn("Agent listener rejected", {
+							error: err instanceof Error ? err.message : String(err),
+						});
 					});
 				}
 			} catch (err) {
-				console.error("Agent listener threw:", err instanceof Error ? err.message : err);
+				logger.warn("Agent listener threw", {
+					error: err instanceof Error ? err.message : String(err),
+				});
 			}
 		}
 	}
 
 	/** Calculate total text length from an assistant message's content blocks */
 	#getAssistantTextLength(message: AgentMessage | null): number {
-		if (!message || message.role !== "assistant" || !Array.isArray(message.content)) {
+		if (message?.role !== "assistant" || !Array.isArray(message.content)) {
 			return 0;
 		}
 		let length = 0;

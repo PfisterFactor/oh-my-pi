@@ -1,17 +1,32 @@
 #!/usr/bin/env bun
 
+import { createRequire } from "node:module";
 import * as path from "node:path";
 
 const packageDir = path.join(import.meta.dir, "..");
+const repoRoot = path.join(packageDir, "..", "..");
 const outputPath = path.join(packageDir, "dist", "omp");
+
+// Transformers.js is an optional, native-heavy dependency that is never bundled
+// into the binary; the tiny-model worker `bun install`s it into a runtime cache
+// on first use. The `catalog:` spec cannot be resolved from inside the compiled
+// bunfs (issue #1763), so embed the concrete installed version here for the
+// worker to pin its runtime install against.
+const transformersVersion = (
+	createRequire(import.meta.url)("@huggingface/transformers/package.json") as { version: string }
+).version;
 
 function shouldAdhocSignDarwinBinary(): boolean {
 	return process.platform === "darwin";
 }
 
-async function runCommand(command: string[], env: NodeJS.ProcessEnv = Bun.env): Promise<void> {
+async function runCommand(
+	command: string[],
+	env: NodeJS.ProcessEnv = Bun.env,
+	cwd: string = packageDir,
+): Promise<void> {
 	const proc = Bun.spawn(command, {
-		cwd: packageDir,
+		cwd,
 		env,
 		stdout: "inherit",
 		stderr: "inherit",
@@ -23,9 +38,13 @@ async function runCommand(command: string[], env: NodeJS.ProcessEnv = Bun.env): 
 }
 
 async function main(): Promise<void> {
-	await runCommand(["bun", "--cwd=../stats", "scripts/generate-client-bundle.ts", "--generate"]);
+	// Generate inside the try so the finally always restores the empty checked-in
+	// placeholders (stats client archive, docs index) even on failure.
 	try {
+		await runCommand(["bun", "--cwd=../stats", "scripts/generate-client-bundle.ts", "--generate"]);
+		await runCommand(["bun", "scripts/generate-docs-index.ts", "--generate"]);
 		await runCommand(["bun", "--cwd=../natives", "run", "embed:native"]);
+		await runCommand(["bun", "scripts/embed-mupdf-wasm.ts", "--generate"]);
 		try {
 			const buildEnv = shouldAdhocSignDarwinBinary() ? { ...Bun.env, BUN_NO_CODESIGN_MACHO_BINARY: "1" } : Bun.env;
 			await runCommand(
@@ -40,37 +59,36 @@ async function main(): Promise<void> {
 					"--keep-names",
 					"--define",
 					'process.env.PI_COMPILED="true"',
+					"--define",
+					`process.env.PI_TINY_TRANSFORMERS_VERSION=${JSON.stringify(transformersVersion)}`,
 					"--external",
-					"mupdf",
+					"fastembed",
+					"--external",
+					"onnxruntime-node",
 					"--root",
-					"../..",
-					"./src/cli.ts",
-					// Worker entrypoints. Bun's `--compile` discovers the literal in
-					// `new Worker("…", …)` at each spawn site, but only actually
-					// emits the worker into the bunfs root when it is listed here as
-					// an explicit additional entry. Paths are relative to this
-					// script's cwd (packages/coding-agent) and the `--root` above
-					// (../..) makes them appear inside the binary at
-					// `/$bunfs/root/packages/<pkg>/src/<worker>.js`, which is
-					// exactly what the literals at the spawn sites resolve to.
-					"../stats/src/sync-worker.ts",
-					"./src/tools/browser/tab-worker-entry.ts",
-					"./src/eval/js/worker-entry.ts",
-					// Legacy pi-* extension compat shims served by `legacy-pi-compat.ts`.
-					// Both are reached only via the computed `TYPEBOX_SHIM_PATH` /
-					// `LEGACY_PI_AI_SHIM_PATH` constants (which `--compile`'s static
-					// analyzer cannot trace), so each shim must be listed here to land
-					// in bunfs alongside the workers above. The bunfs entry path is
-					// `--root`-relative with a `.js` extension, e.g.
-					// `/$bunfs/root/packages/coding-agent/src/extensibility/typebox.js`,
-					// which is what the `isCompiledBinary()` branch in
-					// `legacy-pi-compat.ts` resolves to at runtime.
-					"./src/extensibility/typebox.ts",
-					"./src/extensibility/legacy-pi-ai-shim.ts",
+					".",
+					"./packages/coding-agent/src/cli.ts",
+					// Legacy pi-* extension compat entrypoints served by
+					// `legacy-pi-compat.ts`. These are reached via computed bunfs paths
+					// (which `--compile`'s static analyzer cannot trace), so each must be
+					// listed here to land in bunfs at
+					// `/$bunfs/root/packages/<pkg>/<entry>.js`. The coding-agent's own
+					// `./src/index.ts` is intentionally NOT listed: bun --compile silently
+					// breaks the CLI entry when the same package's barrel appears as an
+					// extra entrypoint (issue #1474), so legacy `pi-coding-agent` imports
+					// resolve through `legacy-pi-coding-agent-shim.ts` instead.
+					"./packages/agent/src/index.ts",
+					"./packages/natives/native/index.js",
+					"./packages/tui/src/index.ts",
+					"./packages/utils/src/index.ts",
+					"./packages/coding-agent/src/extensibility/typebox.ts",
+					"./packages/coding-agent/src/extensibility/legacy-pi-ai-shim.ts",
+					"./packages/coding-agent/src/extensibility/legacy-pi-coding-agent-shim.ts",
 					"--outfile",
-					"dist/omp",
+					"packages/coding-agent/dist/omp",
 				],
 				buildEnv,
+				repoRoot,
 			);
 
 			// Bun 1.3.12 emits a truncated Mach-O signature on darwin builds.
@@ -78,10 +96,12 @@ async function main(): Promise<void> {
 				await runCommand(["codesign", "--force", "--sign", "-", outputPath]);
 			}
 		} finally {
+			await runCommand(["bun", "scripts/embed-mupdf-wasm.ts", "--reset"]);
 			await runCommand(["bun", "--cwd=../natives", "run", "embed:native", "--reset"]);
 		}
 	} finally {
 		await runCommand(["bun", "--cwd=../stats", "scripts/generate-client-bundle.ts", "--reset"]);
+		await runCommand(["bun", "scripts/generate-docs-index.ts", "--reset"]);
 	}
 }
 

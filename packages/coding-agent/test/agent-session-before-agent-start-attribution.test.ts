@@ -1,9 +1,10 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "bun:test";
 import * as path from "node:path";
 import { Agent, type AgentMessage } from "@oh-my-pi/pi-agent-core";
-import { getBundledModel, type Message } from "@oh-my-pi/pi-ai";
+import type { Message } from "@oh-my-pi/pi-ai";
 import { inferCopilotInitiator } from "@oh-my-pi/pi-ai/providers/github-copilot-headers";
 import { createMockModel } from "@oh-my-pi/pi-ai/providers/mock";
+import { getBundledModel } from "@oh-my-pi/pi-catalog/models";
 import { ModelRegistry } from "@oh-my-pi/pi-coding-agent/config/model-registry";
 import { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
 import type { ExtensionRunner } from "@oh-my-pi/pi-coding-agent/extensibility/extensions";
@@ -106,7 +107,7 @@ describe("AgentSession before_agent_start attribution fallback", () => {
 		expect(emitBeforeAgentStart).toHaveBeenCalledTimes(1);
 		const injectedMessage = findBeforeStartInjection(session.messages);
 		expect(injectedMessage).toBeDefined();
-		if (!injectedMessage || injectedMessage.role !== "custom") {
+		if (injectedMessage?.role !== "custom") {
 			throw new Error("Expected injected custom message in session state");
 		}
 
@@ -128,7 +129,7 @@ describe("AgentSession before_agent_start attribution fallback", () => {
 		expect(emitBeforeAgentStart).toHaveBeenCalledTimes(1);
 		const injectedMessage = findBeforeStartInjection(session.messages);
 		expect(injectedMessage).toBeDefined();
-		if (!injectedMessage || injectedMessage.role !== "custom") {
+		if (injectedMessage?.role !== "custom") {
 			throw new Error("Expected injected custom message in session state");
 		}
 
@@ -152,7 +153,7 @@ describe("AgentSession before_agent_start attribution fallback", () => {
 		const promptMessage = findPromptMessage(session.messages, promptText);
 		expect(promptMessage).toBeDefined();
 		expect(promptMessage?.role).toBe("user");
-		if (!promptMessage || promptMessage.role !== "user") {
+		if (promptMessage?.role !== "user") {
 			throw new Error("Expected delegated prompt to remain a user-role message");
 		}
 		expect(promptMessage.attribution).toBe("agent");

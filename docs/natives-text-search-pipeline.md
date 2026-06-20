@@ -32,6 +32,7 @@ Terminology follows `docs/natives-architecture.md`:
 | `glob(options, onMatch?)`                                                       | `glob`                                           | `glob.rs`      |
 | `invalidateFsScanCache(path?)`                                                  | `invalidateFsScanCache`                          | `fs_cache.rs`  |
 | `astGrep(options)`                                                              | `astGrep`                                        | `ast.rs`       |
+| `astMatch(options)`                                                             | `astMatch`                                       | `ast.rs`       |
 | `astEdit(options)`                                                              | `astEdit`                                        | `ast.rs`       |
 | `wrapTextWithAnsi(text, width, tabWidth)`                                       | `wrapTextWithAnsi`                               | `text.rs`      |
 | `truncateToWidth(text, maxWidth, ellipsis, pad, tabWidth)`                      | `truncateToWidth`                                | `text.rs`      |
@@ -77,9 +78,8 @@ Terminology follows `docs/natives-architecture.md`:
 - Output modes:
   - `content` -> one `GrepMatch` per hit.
   - `count` and `filesWithMatches` map to count-style entries (`lineNumber=0`, `line=""`, `matchCount` set).
-- Limits:
-  - Global `offset` and `maxCount` apply across files.
-  - Parallel path is used only when `maxCount` is unset and `offset == 0`; otherwise sequential path preserves deterministic global offset/limit semantics.
+  - `offset` and `maxCount` are applied during aggregation across sorted file results.
+  - Directory searches use parallel filesystem walking/searching, then aggregate per-file results to preserve global offset/limit semantics in the returned result and callback stream.
 
 ### Result shaping back to JS
 
@@ -101,6 +101,7 @@ Terminology follows `docs/natives-architecture.md`:
 
 - Invalid repetition-like braces are escaped (`{`/`}` -> `\{`/`\}`) when they cannot form `{N}`, `{N,}`, `{N,M}`.
 - This prevents common literal-template fragments (for example `${platform}`) from failing as malformed repetition.
+- After brace sanitization, a compile error reporting an unclosed/unopened group triggers one retry with unescaped parentheses escaped, so literal snippets like `fetchAnthropicProvider(` still search instead of erroring.
 - Remaining invalid regex syntax still returns a regex error.
 
 ## 2) File discovery (`glob`) and fuzzy path search (`fuzzyFind`)
@@ -145,11 +146,12 @@ Terminology follows `docs/natives-architecture.md`:
 - auto-prefixes simple recursive patterns with `**/` when `recursive=true`,
 - auto-closes unbalanced `{...` alternation groups before compile.
 
-## 3) AST search/edit (`astGrep`, `astEdit`)
+## 3) AST search/match/edit (`astGrep`, `astMatch`, `astEdit`)
 
 `ast.rs` exposes syntax-aware code search and rewrite operations.
 
 - `astGrep(options)` returns matches with byte/line/column coordinates and optional metavariable bindings.
+- `astMatch(options)` runs the same patterns against an in-memory `source` string instead of files; `lang` is required (there is no path to infer it from), and the result keeps matches, `totalMatches`, `limitReached`, and parse errors but omits the file-count fields.
 - `astEdit(options)` returns replacement changes, per-file counts, searched/touched file counts, parse errors, and whether edits were applied.
 - `dryRun` defaults to true for edit options in the generated documentation.
 - Options include language override, path/glob/selector, strictness, limits, parse-error policy, `signal`, and `timeoutMs`.
@@ -158,11 +160,15 @@ These exports are direct native APIs used by tooling; they are not mediated by a
 
 ## 4) Shared scan/cache lifecycle (`fs_cache`)
 
-`fs_cache` stores scan results as normalized relative entries (`path`, `fileType`, optional `mtime`) keyed by:
+`fs_cache` stores scan results as normalized relative entries (`path`, `fileType`, optional `mtime` and regular-file `size`) keyed by:
 
 - canonical search root,
 - `include_hidden`,
-- `use_gitignore`.
+- `use_gitignore`,
+- `skip_node_modules`,
+- scan detail (`Minimal` vs `Full`).
+
+`follow_links` affects a fresh scan but is not currently part of the cache key.
 
 ### Cache state transitions
 
@@ -193,7 +199,7 @@ These are pure, in-memory utilities.
 - `text.rs` owns terminal-cell semantics:
   - ANSI sequence parsing,
   - grapheme-aware width and slicing,
-  - wrap/truncate/sanitize behavior,
+  - wrap/truncate/slice behavior,
   - explicit tab-width parameter on width-sensitive APIs.
 - `grep.rs` line truncation (`maxColumns`) is separate:
   - simple character-boundary truncation of matched lines with `...`,
@@ -242,9 +248,10 @@ Text functions generally return deterministic transformed output; errors are lim
 | Flow                         | Filesystem access | Shared cache         | Notes                                         |
 | ---------------------------- | ----------------- | -------------------- | --------------------------------------------- |
 | `search` / `hasMatch`        | No                | No                   | regex on provided bytes/string only           |
-| `text` module functions      | No                | No                   | ANSI/width/sanitization only                  |
+| `text` module functions      | No                | No                   | ANSI/width utilities only                     |
 | `highlight` module functions | No                | No                   | syntax + ANSI coloring only                   |
 | `countTokens`                | No                | No                   | tokenization only                             |
+| `astMatch`                   | No                | No                   | in-memory syntax-aware match (no disk)        |
 | `astGrep` / `astEdit`        | Yes               | No                   | syntax-aware file search/edit                 |
 | `glob`                       | Yes               | Optional             | directory scans + glob filtering              |
 | `fuzzyFind`                  | Yes               | Optional             | directory scans + fuzzy scoring               |

@@ -70,6 +70,7 @@ const CP_KP_EQUALS: i32 = 57415;
 const MOD_SHIFT: u32 = 1;
 const MOD_ALT: u32 = 2;
 const MOD_CTRL: u32 = 4;
+const MOD_SUPER: u32 = 8;
 const MOD_NUM_LOCK: u32 = 128;
 
 /// Event types from Kitty keyboard protocol (flag 2).
@@ -200,8 +201,6 @@ static LEGACY_SEQUENCES: phf::Map<&'static [u8], &'static str> = phf_map! {
 	b"\x1b[[A" => "f1", b"\x1b[[B" => "f2", b"\x1b[[C" => "f3", b"\x1b[[D" => "f4", b"\x1b[[E" => "f5",
 	b"\x1b[15~" => "f5", b"\x1b[17~" => "f6", b"\x1b[18~" => "f7", b"\x1b[19~" => "f8",
 	b"\x1b[20~" => "f9", b"\x1b[21~" => "f10", b"\x1b[23~" => "f11", b"\x1b[24~" => "f12",
-	// Alt+arrow (legacy)
-	b"\x1bb" => "alt+left", b"\x1bf" => "alt+right", b"\x1bp" => "alt+up", b"\x1bn" => "alt+down",
 };
 
 /// Pre-allocated single ASCII printable characters (33-126)
@@ -459,6 +458,10 @@ fn parse_key_id(key_id: &str) -> Option<ParsedKeyId<'_>> {
 				modifier |= MOD_SHIFT;
 				continue;
 			},
+			b's' | b'S' if p.eq_ignore_ascii_case("super") => {
+				modifier |= MOD_SUPER;
+				continue;
+			},
 			b'a' | b'A' if p.eq_ignore_ascii_case("alt") => {
 				modifier |= MOD_ALT;
 				continue;
@@ -603,13 +606,11 @@ fn matches_key_inner(bytes: &[u8], key_id: &str, kitty_protocol_active: bool) ->
 			if let Some(text_codepoint) = keypad_operator_text_codepoint(parsed_codepoint) {
 				parsed_codepoint = text_codepoint;
 				parsed_base = None;
-			} else if p.modifier & MOD_NUM_LOCK != 0 {
-				if actual_mod == 0
-					&& let Some(text_codepoint) = keypad_num_lock_text_codepoint(parsed_codepoint)
-				{
+			} else if actual_mod == 0 {
+				if let Some(text_codepoint) = keypad_num_lock_text_codepoint(parsed_codepoint) {
 					parsed_codepoint = text_codepoint;
 					parsed_base = None;
-				} else {
+				} else if p.modifier & MOD_NUM_LOCK != 0 {
 					if let Some(mapped) = map_keypad_nav(parsed_codepoint) {
 						parsed_codepoint = mapped;
 					}
@@ -701,9 +702,9 @@ fn matches_key_inner(bytes: &[u8], key_id: &str, kitty_protocol_active: bool) ->
 	}
 
 	if key.eq_ignore_ascii_case("enter") || key.eq_ignore_ascii_case("return") {
-		// alt+enter is commonly ESC + CR even when kitty disambiguation is on (Enter is
-		// an exception).
-		if modifier == MOD_ALT && bytes == b"\x1b\r" {
+		// alt+enter is commonly ESC + CR/LF even when kitty disambiguation is on
+		// (Enter is an exception).
+		if modifier == MOD_ALT && (bytes == b"\x1b\r" || bytes == b"\x1b\n") {
 			return true;
 		}
 
@@ -799,7 +800,7 @@ fn matches_key_inner(bytes: &[u8], key_id: &str, kitty_protocol_active: bool) ->
 
 	if key.eq_ignore_ascii_case("up") {
 		if modifier == MOD_ALT {
-			return bytes == b"\x1bp" || kitty_matches(ARROW_UP, MOD_ALT);
+			return kitty_matches(ARROW_UP, MOD_ALT);
 		}
 		if modifier == 0 {
 			return matches_legacy_key(bytes, "up") || kitty_matches(ARROW_UP, 0);
@@ -810,7 +811,7 @@ fn matches_key_inner(bytes: &[u8], key_id: &str, kitty_protocol_active: bool) ->
 
 	if key.eq_ignore_ascii_case("down") {
 		if modifier == MOD_ALT {
-			return bytes == b"\x1bn" || kitty_matches(ARROW_DOWN, MOD_ALT);
+			return kitty_matches(ARROW_DOWN, MOD_ALT);
 		}
 		if modifier == 0 {
 			return matches_legacy_key(bytes, "down") || kitty_matches(ARROW_DOWN, 0);
@@ -823,7 +824,6 @@ fn matches_key_inner(bytes: &[u8], key_id: &str, kitty_protocol_active: bool) ->
 		if modifier == MOD_ALT {
 			return bytes == b"\x1b[1;3D"
 				|| (!kitty_protocol_active && bytes == b"\x1bB")
-				|| bytes == b"\x1bb"
 				|| kitty_matches(ARROW_LEFT, MOD_ALT);
 		}
 		if modifier == MOD_CTRL {
@@ -842,7 +842,6 @@ fn matches_key_inner(bytes: &[u8], key_id: &str, kitty_protocol_active: bool) ->
 		if modifier == MOD_ALT {
 			return bytes == b"\x1b[1;3C"
 				|| (!kitty_protocol_active && bytes == b"\x1bF")
-				|| bytes == b"\x1bf"
 				|| kitty_matches(ARROW_RIGHT, MOD_ALT);
 		}
 		if modifier == MOD_CTRL {
@@ -883,14 +882,15 @@ fn matches_key_inner(bytes: &[u8], key_id: &str, kitty_protocol_active: bool) ->
 		let codepoint = ch as i32;
 		let is_letter = ch.is_ascii_lowercase();
 
-		// ctrl+alt+letter in legacy mode
-		// Legacy: ctrl+alt+letter is ESC followed by the control character.
-		// If that legacy form does not match, continue so CSI-u and
+		// Legacy ctrl+alt+letter is ESC followed by the control character.
+		// tmux extkeys/CSI-u and Kitty mixed modes can still pass these legacy Meta
+		// pairs through, so accept them even when enhanced keyboard reporting is
+		// active. If that legacy form does not match, continue so CSI-u and
 		// modifyOtherKeys sequences from tmux can still be recognized.
 		// Legacy ESC+ctrl-char would also match Alt+Enter/Alt+Backspace/etc;
 		// skip the legacy fast-path for those bytes and let kitty/modifyOtherKeys
 		// disambiguate.
-		if modifier == (MOD_CTRL | MOD_ALT) && !kitty_protocol_active && is_letter {
+		if modifier == (MOD_CTRL | MOD_ALT) && is_letter {
 			let ctrl_char = raw_ctrl_char(ch);
 			if bytes.len() == 2
 				&& bytes[0] == 0x1b
@@ -901,14 +901,22 @@ fn matches_key_inner(bytes: &[u8], key_id: &str, kitty_protocol_active: bool) ->
 			}
 		}
 
-		// alt+letter in legacy mode
-		if modifier == MOD_ALT && !kitty_protocol_active && is_letter {
-			return bytes.len() == 2 && bytes[0] == 0x1b && bytes[1] == ch;
+		// alt+letter can remain ESC+letter inside tmux/Kitty mixed modes. If that
+		// legacy form does not match, fall through so CSI-u and modifyOtherKeys
+		// encodings still match.
+		if modifier == MOD_ALT && is_letter && bytes.len() == 2 && bytes[0] == 0x1b && bytes[1] == ch
+		{
+			return true;
 		}
 
-		// alt+shift+letter in legacy mode (ESC + UPPERCASE letter)
-		if modifier == (MOD_ALT | MOD_SHIFT) && !kitty_protocol_active && is_letter {
-			return bytes.len() == 2 && bytes[0] == 0x1b && bytes[1] == ch.to_ascii_uppercase();
+		// alt+shift+letter can remain ESC+UPPERCASE inside tmux/Kitty mixed modes.
+		if modifier == (MOD_ALT | MOD_SHIFT)
+			&& is_letter
+			&& bytes.len() == 2
+			&& bytes[0] == 0x1b
+			&& bytes[1] == ch.to_ascii_uppercase()
+		{
+			return true;
 		}
 
 		// ctrl+key
@@ -1031,6 +1039,15 @@ fn parse_key_inner(bytes: &[u8], kitty_protocol_active: bool) -> Option<Cow<'sta
 		return None;
 	}
 
+	// Two-byte ESC sequences are legacy Meta/Alt keypresses. Handle them before
+	// the legacy table so ESC+p from Ghostty/tmux is parsed as Alt+P rather than
+	// the historical ESC+p Alt+Up compatibility alias.
+	if bytes.len() == 2
+		&& let Some(key) = parse_esc_pair(bytes[1], kitty_protocol_active)
+	{
+		return Some(key);
+	}
+
 	// O(1) lookup in perfect hash map for legacy sequences
 	if let Some(&key_id) = LEGACY_SEQUENCES.get(bytes) {
 		return Some(Cow::Borrowed(key_id));
@@ -1068,12 +1085,6 @@ fn parse_key_inner(bytes: &[u8], kitty_protocol_active: bool) -> Option<Cow<'sta
 		return Some(Cow::Owned(format!("alt+{inner_key}")));
 	}
 
-	// Two-byte ESC sequences (legacy ALT prefix, with exceptions even in kitty
-	// mode)
-	if bytes.len() == 2 {
-		return parse_esc_pair(bytes[1], kitty_protocol_active);
-	}
-
 	// Fixed CSI / SS3 sequences not covered by LEGACY_SEQUENCES
 	match bytes {
 		b"\x1b[Z" => Some(Cow::Borrowed("shift+tab")),
@@ -1108,26 +1119,29 @@ fn parse_esc_pair(code: u8, kitty_protocol_active: bool) -> Option<Cow<'static, 
 	// terminals.
 	match code {
 		0x7f | 0x08 => return Some(Cow::Borrowed("alt+backspace")),
-		b'\r' => return Some(Cow::Borrowed("alt+enter")),
+		b'\r' | b'\n' => return Some(Cow::Borrowed("alt+enter")),
 		b'\t' => return Some(Cow::Borrowed("alt+tab")),
 		_ => {},
 	}
 
-	// Legacy ALT-prefix parsing only when kitty protocol isn't expected to
-	// disambiguate.
+	// Historical cursor-key aliases used by some legacy terminals. Keep them in
+	// legacy mode only; in mixed modes (tmux extkeys/CSI-u, Kitty, etc.) ESC+B/F
+	// are real Alt+Shift+B/F keypresses.
 	if !kitty_protocol_active {
 		match code {
 			b' ' => return Some(Cow::Borrowed("alt+space")),
 			b'B' => return Some(Cow::Borrowed("alt+left")),
 			b'F' => return Some(Cow::Borrowed("alt+right")),
-			1..=26 => return Some(Cow::Borrowed(CTRL_ALT_LETTERS[(code - 1) as usize])),
-			b'a'..=b'z' => return Some(Cow::Borrowed(ALT_LETTERS[(code - b'a') as usize])),
-			b'A'..=b'Z' => return Some(Cow::Borrowed(ALT_SHIFT_LETTERS[(code - b'A') as usize])),
 			_ => {},
 		}
 	}
 
-	None
+	match code {
+		1..=26 => Some(Cow::Borrowed(CTRL_ALT_LETTERS[(code - 1) as usize])),
+		b'a'..=b'z' => Some(Cow::Borrowed(ALT_LETTERS[(code - b'a') as usize])),
+		b'A'..=b'Z' => Some(Cow::Borrowed(ALT_SHIFT_LETTERS[(code - b'A') as usize])),
+		_ => None,
+	}
 }
 
 // =============================================================================
@@ -1367,7 +1381,7 @@ fn parse_functional(bytes: &[u8]) -> Option<ParsedKittySequence> {
 
 fn format_kitty_key(parsed: &ParsedKittySequence) -> Option<Cow<'static, str>> {
 	let effective_mod = parsed.modifier & !LOCK_MASK;
-	if effective_mod & !(MOD_SHIFT | MOD_CTRL | MOD_ALT) != 0 {
+	if effective_mod & !(MOD_SHIFT | MOD_CTRL | MOD_ALT | MOD_SUPER) != 0 {
 		return None;
 	}
 	let effective_codepoint =
@@ -1392,8 +1406,7 @@ fn format_kitty_key(parsed: &ParsedKittySequence) -> Option<Cow<'static, str>> {
 		{
 			return Some(Cow::Borrowed(key_name));
 		}
-		if parsed.modifier & MOD_NUM_LOCK != 0
-			&& let Some(text_codepoint) = keypad_num_lock_text_codepoint(parsed.codepoint)
+		if let Some(text_codepoint) = keypad_num_lock_text_codepoint(parsed.codepoint)
 			&& let Some(key_name) = format_key_name(text_codepoint)
 		{
 			return Some(Cow::Borrowed(key_name));
@@ -1469,6 +1482,9 @@ fn format_with_mods(mods: u32, key_name: &str) -> String {
 	if mods & MOD_ALT != 0 {
 		result.push_str("alt+");
 	}
+	if mods & MOD_SUPER != 0 {
+		result.push_str("super+");
+	}
 	result.push_str(key_name);
 	result
 }
@@ -1520,6 +1536,45 @@ mod tests {
 	}
 
 	#[test]
+	fn esc_pair_alt_letters_mixed_mode() {
+		// tmux 3.6 with `extended-keys-format csi-u` can enable enhanced keyboard
+		// handling while still forwarding Alt+letter as the legacy ESC+letter form.
+		for active in [false, true] {
+			assert_eq!(parse_key_inner(b"\x1bp", active).as_deref(), Some("alt+p"));
+			assert_eq!(parse_key_inner(b"\x1bh", active).as_deref(), Some("alt+h"));
+			assert_eq!(parse_key_inner(b"\x1bP", active).as_deref(), Some("alt+shift+p"));
+			assert_eq!(parse_key_inner(b"\x1b\x10", active).as_deref(), Some("ctrl+alt+p"));
+			assert!(matches_key_inner(b"\x1bp", "alt+p", active));
+			assert!(matches_key_inner(b"\x1bh", "alt+h", active));
+			assert!(matches_key_inner(b"\x1bP", "alt+shift+p", active));
+			assert!(matches_key_inner(b"\x1b\x10", "ctrl+alt+p", active));
+			assert!(!matches_key_inner(b"\x1bp", "alt+up", active));
+			assert!(!matches_key_inner(b"\x1bn", "alt+down", active));
+			assert!(!matches_key_inner(b"\x1bb", "alt+left", active));
+			assert!(!matches_key_inner(b"\x1bf", "alt+right", active));
+		}
+		assert!(matches_key_inner(b"\x1b[1;3A", "alt+up", true));
+		assert!(matches_key_inner(b"\x1b[112;3u", "alt+p", true));
+		assert!(matches_key_inner(b"\x1b[27;3;112~", "alt+p", false));
+		for active in [false, true] {
+			assert_eq!(parse_key_inner(b"\x1b\n", active).as_deref(), Some("alt+enter"));
+			assert!(matches_key_inner(b"\x1b\n", "alt+enter", active));
+		}
+	}
+
+	#[test]
+	fn uppercase_meta_b_f_stay_legacy_arrow_aliases_only_without_kitty() {
+		assert_eq!(parse_key_inner(b"\x1bB", false).as_deref(), Some("alt+left"));
+		assert_eq!(parse_key_inner(b"\x1bF", false).as_deref(), Some("alt+right"));
+		assert_eq!(parse_key_inner(b"\x1bB", true).as_deref(), Some("alt+shift+b"));
+		assert_eq!(parse_key_inner(b"\x1bF", true).as_deref(), Some("alt+shift+f"));
+		assert!(matches_key_inner(b"\x1bB", "alt+left", false));
+		assert!(matches_key_inner(b"\x1bF", "alt+right", false));
+		assert!(!matches_key_inner(b"\x1bB", "alt+left", true));
+		assert!(!matches_key_inner(b"\x1bF", "alt+right", true));
+	}
+
+	#[test]
 	fn esc_prefix_csi_only() {
 		// Only CSI and SS3 inner sequences parse as Alt; other double-ESC does not
 		assert_eq!(parse_key_inner(b"\x1b\x1bX", true).as_deref(), None);
@@ -1535,7 +1590,11 @@ mod tests {
 
 	#[test]
 	fn parse_key_ignores_kitty_sequences_with_unsupported_modifiers() {
-		assert_eq!(parse_key_inner(b"\x1b[99;9u", true).as_deref(), None);
+		// Hyper (16) and meta (32) are kitty modifier bits we do not surface
+		// because nothing in the editor binds them. Wire mod 17 = mask 16 = hyper.
+		assert_eq!(parse_key_inner(b"\x1b[99;17u", true).as_deref(), None);
+		// Wire mod 33 = mask 32 = meta.
+		assert_eq!(parse_key_inner(b"\x1b[99;33u", true).as_deref(), None);
 	}
 
 	#[test]
@@ -1546,10 +1605,15 @@ mod tests {
 	}
 
 	#[test]
-	fn num_lock_keypad_digits_stay_text() {
-		assert_eq!(parse_key_inner(b"\x1b[57400;129u", true).as_deref(), Some("1"));
-		assert!(matches_key_inner(b"\x1b[57400;129u", "1", true));
-		assert!(!matches_key_inner(b"\x1b[57400;129u", "end", true));
+	fn keypad_digits_stay_text_with_or_without_num_lock_modifier() {
+		for bytes in [b"\x1b[57400u".as_slice(), b"\x1b[57400;129u".as_slice()] {
+			assert_eq!(parse_key_inner(bytes, true).as_deref(), Some("1"));
+			assert!(matches_key_inner(bytes, "1", true));
+			assert!(!matches_key_inner(bytes, "end", true));
+		}
+		assert_eq!(parse_key_inner(b"\x1b[57404u", true).as_deref(), Some("5"));
+		assert!(matches_key_inner(b"\x1b[57404u", "5", true));
+		assert!(!matches_key_inner(b"\x1b[57404u", "clear", true));
 	}
 
 	#[test]
@@ -1624,5 +1688,34 @@ mod tests {
 		// CSI-u / modifyOtherKeys forms still resolve ctrl+alt+<colliding>.
 		assert!(matches_key_inner(b"\x1b[109;7u", "ctrl+alt+m", true));
 		assert!(matches_key_inner(b"\x1b[27;7;109~", "ctrl+alt+m", false));
+	}
+
+	#[test]
+	fn super_alt_backspace_matches_ghostty_default() {
+		// Issue #2064: Ghostty on macOS reports Option+Backspace as kitty
+		// modifier 11 (wire) = 10 (mask) = super(8)|alt(2). Before super
+		// support landed, the matcher rejected this entirely.
+		assert!(matches_key_inner(b"\x1b[127;11u", "super+alt+backspace", true));
+		assert!(matches_key_inner(b"\x1b[127;11u", "alt+super+backspace", true));
+		assert_eq!(parse_key_inner(b"\x1b[127;11u", true).as_deref(), Some("alt+super+backspace"));
+		// Plain alt+backspace must still NOT match — the modifier really is super|alt.
+		assert!(!matches_key_inner(b"\x1b[127;11u", "alt+backspace", true));
+		// And plain backspace (mod 0) must still not match a super+alt-modified press.
+		assert!(!matches_key_inner(b"\x1b[127;11u", "backspace", true));
+		// Release events stay ignored: super+alt+backspace release must not match a
+		// press.
+		assert!(!matches_key_inner(b"\x1b[127;11:3u", "super+alt+backspace", true));
+		assert_eq!(parse_key_inner(b"\x1b[127;11:3u", true).as_deref(), None);
+	}
+
+	#[test]
+	fn super_modifier_parses_for_arbitrary_keys() {
+		// Cmd+letter on macOS under kitty flag=1+: super(8)+'a'(97) → wire mod 9.
+		assert!(matches_key_inner(b"\x1b[97;9u", "super+a", true));
+		assert_eq!(parse_key_inner(b"\x1b[97;9u", true).as_deref(), Some("super+a"));
+		// Cmd+Shift+letter: super(8)|shift(1) = 9 mask, wire 10.
+		assert!(matches_key_inner(b"\x1b[97;10u", "super+shift+a", true));
+		assert!(matches_key_inner(b"\x1b[97;10u", "shift+super+a", true));
+		assert_eq!(parse_key_inner(b"\x1b[97;10u", true).as_deref(), Some("shift+super+a"));
 	}
 }

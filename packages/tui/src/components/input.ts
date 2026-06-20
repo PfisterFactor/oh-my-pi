@@ -1,4 +1,4 @@
-import { BracketedPasteHandler } from "../bracketed-paste";
+import { BracketedPasteHandler, decodeReencodedPasteControls } from "../bracketed-paste";
 import { getKeybindings } from "../keybindings";
 import { extractPrintableText } from "../keys";
 import { KillRing } from "../kill-ring";
@@ -27,6 +27,9 @@ interface InputState {
 export class Input implements Component, Focusable {
 	#value: string = "";
 	#cursor: number = 0; // Cursor position in the value
+	#useTerminalCursor = false;
+	/** Rendered before the editable area; set to "" for chrome-less embedding. */
+	prompt = "> ";
 	onSubmit?: (value: string) => void;
 	onEscape?: () => void;
 
@@ -49,7 +52,16 @@ export class Input implements Component, Focusable {
 
 	setValue(value: string): void {
 		this.#value = value;
-		this.#cursor = Math.min(this.#cursor, value.length);
+		// Callers seed or replace the value wholesale; typing continues at the end.
+		this.#cursor = value.length;
+	}
+
+	setUseTerminalCursor(useTerminalCursor: boolean): void {
+		this.#useTerminalCursor = useTerminalCursor;
+	}
+
+	getUseTerminalCursor(): boolean {
+		return this.#useTerminalCursor;
 	}
 
 	handleInput(data: string): void {
@@ -176,6 +188,12 @@ export class Input implements Component, Focusable {
 		if (printableText) {
 			this.#insertCharacter(printableText);
 		}
+	}
+
+	/** Apply terminal paste semantics to text from non-bracketed paste transports
+	 *  (e.g. kitty's OSC 5522 enhanced clipboard read). Mirrors `Editor.pasteText`. */
+	pasteText(text: string): void {
+		this.#handlePaste(text);
 	}
 
 	#insertCharacter(text: string): void {
@@ -357,8 +375,12 @@ export class Input implements Component, Focusable {
 		this.#lastAction = null;
 		this.#pushUndo();
 
-		// Clean the pasted text — remove newlines and carriage returns, normalize
-		// tabs, AND normalize Unicode to NFC.
+		// Clean the pasted text — decode tmux's re-encoded control bytes (both
+		// extended-keys formats, e.g. Ctrl+J → "\n") back to literal bytes so the escape
+		// tail does not leak in, remove newlines/carriage returns, expand tabs, NFC-normalize,
+		// then strip any remaining control bytes. The decoder can synthesize Ctrl+A..Ctrl+Z
+		// (0x01..0x1A) from a paste, and a single-line value must hold none of them — newlines
+		// are already gone and tabs are already spaces by the time the C0/DEL strip runs.
 		//
 		// NFC normalization rationale: macOS Finder drag-drops file paths in NFD
 		// (Conjoining Jamo, U+1100..U+11FF). `Bun.stringWidth` counts each
@@ -369,9 +391,11 @@ export class Input implements Component, Focusable {
 		// as cursor drift past the visible filename — N×~1.5 cells for a path
 		// with N Korean syllables. NFC normalization at paste time stores the
 		// value in the same form everything else in the codebase assumes.
-		const cleanText = replaceTabs(pastedText.replace(/\r\n/g, "").replace(/\r/g, "").replace(/\n/g, "")).normalize(
-			"NFC",
-		);
+		const cleanText = replaceTabs(
+			decodeReencodedPasteControls(pastedText).replace(/\r\n/g, "").replace(/\r/g, "").replace(/\n/g, ""),
+		)
+			.normalize("NFC")
+			.replace(/[\x00-\x1F\x7F]/g, "");
 
 		// Insert at cursor position
 		this.#value = this.#value.slice(0, this.#cursor) + cleanText + this.#value.slice(this.#cursor);
@@ -382,10 +406,10 @@ export class Input implements Component, Focusable {
 		// No cached state to invalidate currently
 	}
 
-	render(width: number): string[] {
+	render(width: number): readonly string[] {
 		// Calculate visible window
-		const prompt = "> ";
-		const availableWidth = width - prompt.length;
+		const prompt = this.prompt;
+		const availableWidth = width - visibleWidth(prompt);
 
 		if (availableWidth <= 0) {
 			return [prompt];
@@ -422,23 +446,21 @@ export class Input implements Component, Focusable {
 		let cursorDisplay = prefixText.length;
 		cursorDisplay = Math.max(0, Math.min(cursorDisplay, visibleText.length));
 
-		// Build line with fake cursor
-		// Insert cursor character at cursor position
+		// Build the visible line and insert the cursor marker at the buffer cursor.
 		const graphemes = [...segmenter.segment(visibleText.slice(cursorDisplay))];
 		const cursorGrapheme = graphemes[0];
 
 		const beforeCursor = visibleText.slice(0, cursorDisplay);
-		const atCursor = cursorGrapheme?.segment ?? " ";
+		const atCursor = cursorGrapheme?.segment ?? "";
 		const afterCursor = visibleText.slice(cursorDisplay + atCursor.length);
 
-		// Hardware cursor marker (zero-width, emitted before fake cursor for IME positioning)
+		// Hardware cursor marker (zero-width, emitted before the cursor cell for IME positioning)
 		const marker = this.focused ? CURSOR_MARKER : "";
-		// Use inverse video to show cursor
-		const cursorChar = `\x1b[7m${atCursor}\x1b[27m`; // ESC[7m = reverse video, ESC[27m = normal
+		const cursorChar = this.#useTerminalCursor ? atCursor : `\x1b[7m${atCursor || " "}\x1b[27m`;
 
 		// Clamp only the trailing text (measured in terminal cells), keeping the cursor marker intact.
 		const beforeWidth = visibleWidth(beforeCursor);
-		const cursorWidth = visibleWidth(atCursor);
+		const cursorWidth = this.#useTerminalCursor ? visibleWidth(atCursor) : visibleWidth(atCursor || " ");
 		const remainingAfterWidth = Math.max(0, availableWidth - beforeWidth - cursorWidth);
 		const clampedAfterCursor = sliceWithWidth(afterCursor, 0, remainingAfterWidth, true).text;
 		const renderedNoMarker = beforeCursor + cursorChar + clampedAfterCursor;

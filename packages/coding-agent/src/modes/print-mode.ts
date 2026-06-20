@@ -9,6 +9,7 @@ import type { AssistantMessage, ImageContent } from "@oh-my-pi/pi-ai";
 import { logger, sanitizeText } from "@oh-my-pi/pi-utils";
 import type { AgentSession } from "../session/agent-session";
 import { isSilentAbort } from "../session/messages";
+import { flushTelemetryExport } from "../telemetry-export";
 import { initializeExtensions } from "./runtime-init";
 
 /**
@@ -23,6 +24,8 @@ export interface PrintModeOptions {
 	initialMessage?: string;
 	/** Images to attach to the initial message */
 	initialImages?: ImageContent[];
+	/** If true, include thinking blocks in text output */
+	printThoughts?: boolean;
 }
 
 /**
@@ -30,7 +33,7 @@ export interface PrintModeOptions {
  * Sends prompts to the agent and outputs the result.
  */
 export async function runPrintMode(session: AgentSession, options: PrintModeOptions): Promise<void> {
-	const { mode, messages = [], initialMessage, initialImages } = options;
+	const { mode, messages = [], initialMessage, initialImages, printThoughts } = options;
 
 	// Emit session header for JSON mode
 	if (mode === "json") {
@@ -83,6 +86,10 @@ export async function runPrintMode(session: AgentSession, options: PrintModeOpti
 				!isSilentAbort(assistantMsg.errorMessage)
 			) {
 				const errorLine = sanitizeText(assistantMsg.errorMessage || `Request ${assistantMsg.stopReason}`);
+				// Flush before this hard exit — it bypasses the awaited postmortem.quit()
+				// in main(), and the postmortem `exit` handler can't await, so the error
+				// spans would otherwise stay buffered in the batch processor and drop.
+				await flushTelemetryExport();
 				const flushed = process.stderr.write(`${errorLine}\n`);
 				if (flushed) {
 					process.exit(1);
@@ -103,6 +110,8 @@ export async function runPrintMode(session: AgentSession, options: PrintModeOpti
 			for (const content of assistantMsg.content) {
 				if (content.type === "text") {
 					process.stdout.write(`${sanitizeText(content.text)}\n`);
+				} else if (printThoughts && content.type === "thinking" && content.thinking.trim().length > 0) {
+					process.stdout.write(`${sanitizeText(content.thinking)}\n`);
 				}
 			}
 		}

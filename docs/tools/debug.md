@@ -19,6 +19,8 @@
   - `packages/coding-agent/src/debug/profiler.ts` — CPU/heap profiling helpers
   - `packages/coding-agent/src/debug/report-bundle.ts` — `.tar.gz` report bundling, log source, cache cleanup
   - `packages/coding-agent/src/debug/system-info.ts` — system snapshot collection and env redaction
+  - `packages/coding-agent/src/debug/terminal-info.ts` — terminal state collection/formatting
+  - `packages/coding-agent/src/debug/protocol-probe.ts` — terminal protocol probe panel and sample image
 
 ## Inputs
 
@@ -44,8 +46,8 @@
 | `port` | `number` | No | Remote attach port. If no adapter is forced, attach prefers `debugpy` when `port` is present. |
 | `host` | `string` | No | Remote attach host for `attach`. |
 | `levels` | `number` | No | Max stack frames for `stack_trace`. |
-| `memory_reference` | `string` | No | Memory reference/address for `disassemble`, `read_memory`, `write_memory`. `disassemble` also accepts it via `instruction_reference` fallback logic in `resolveDisassemblyReference()`. |
-| `instruction_reference` | `string` | No | Instruction breakpoint reference; required for instruction breakpoint actions. |
+| `memory_reference` | `string` | No | Memory reference/address for `disassemble`, `read_memory`, `write_memory`. `disassemble` uses this when provided; otherwise it falls back to the current stopped location's instruction-pointer reference if the adapter supplied one. |
+| `instruction_reference` | `string` | No | Instruction breakpoint reference; required for instruction breakpoint actions. Not used by `disassemble`. |
 | `instruction_count` | `number` | No | Required for `disassemble`. |
 | `instruction_offset` | `number` | No | Instruction offset for `disassemble`. |
 | `count` | `number` | No | Byte count for `read_memory`. Required there. |
@@ -70,7 +72,7 @@
 - `set_data_breakpoint` / `remove_data_breakpoint`: `data_id`
 - `evaluate`: `expression`
 - `variables`: `variable_ref` or `scope_id`
-- `disassemble`: capability `supportsDisassembleRequest`, plus `instruction_count`
+- `disassemble`: capability `supportsDisassembleRequest`, plus `instruction_count`, and either `memory_reference` or a current stopped location with `instructionPointerReference`
 - `read_memory`: capability `supportsReadMemoryRequest`, plus `memory_reference` and `count`
 - `write_memory`: capability `supportsWriteMemoryRequest`, plus `memory_reference` and `data`
 - `modules`: capability `supportsModulesRequest`
@@ -78,7 +80,7 @@
 - `custom_request`: `command`
 
 ### Interactive selector values
-`packages/coding-agent/src/debug/index.ts` also exposes a fixed UI-only selector with values `open-artifacts`, `performance`, `work`, `dump`, `memory`, `logs`, `system`, `raw-sse`, `transcript`, `clear-cache`. These are not model-callable through `debugSchema`; they are local TUI menu routes.
+`packages/coding-agent/src/debug/index.ts` also exposes a fixed UI-only selector with values `open-artifacts`, `performance`, `work`, `dump`, `memory`, `logs`, `system`, `terminal`, `protocols`, `raw-sse`, `transcript`, `clear-cache`. These are not model-callable through `debugSchema`; they are local TUI menu routes.
 
 ## Outputs
 The agent tool returns a standard `toolResult()` payload from `packages/coding-agent/src/tools/debug.ts`:
@@ -108,6 +110,7 @@ The agent tool returns a standard `toolResult()` payload from `packages/coding-a
 Streaming/UI behavior:
 - The tool renderer merges call and result (`mergeCallAndResult: true`) and renders inline.
 - `debug.ts` itself does not emit progress updates through `_onUpdate`; result delivery is single-shot.
+- Approval is action-sensitive: read-only actions (`output`, `threads`, `stack_trace`, `scopes`, `variables`, `disassemble`, `read_memory`, `loaded_sources`, `modules`, `sessions`) request read approval; all other actions request exec approval.
 - The interactive selector is UI-driven instead of model-driven. It swaps TUI components, appends status lines to the chat pane, opens files in external viewers, or writes archives/temp files.
 
 Side-channel artifacts outside the model tool result:
@@ -140,6 +143,8 @@ Side-channel artifacts outside the model tool result:
    - `logs`: build a `DebugLogSource` and mount `DebugLogViewerComponent`
    - `raw-sse`: resolve a `RawSseDebugBuffer` from the session and mount `RawSseViewerComponent`
    - `system`: call `collectSystemInfo()` and render `formatSystemInfo()` into the chat pane
+   - `terminal`: `collectTerminalState()` + `formatTerminalState()` rendered into the chat pane
+   - `protocols`: fires a test desktop notification (unless suppressed), then mounts `ProtocolProbeComponent` with a sample image
    - `open-artifacts`: open the current session artifact directory if it exists
    - `transcript`: delegates to `ctx.handleDebugTranscriptCommand()`
    - `clear-cache`: show confirmation, then remove artifact directories older than 30 days with `clearArtifactCache()`
@@ -168,7 +173,7 @@ Side-channel artifacts outside the model tool result:
   - `threads` — fetches current threads.
   - `scopes` — frame scopes for an explicit `frame_id` or the current stopped frame.
   - `variables` — variables for `variable_ref` or `scope_id`.
-  - `disassemble` — require `supportsDisassembleRequest`; disassembles around a memory reference.
+  - `disassemble` — require `supportsDisassembleRequest`; disassembles around `memory_reference`, or around the current stopped instruction pointer when no memory reference is supplied.
   - `read_memory` — require `supportsReadMemoryRequest`; returns address, base64 data, unreadable-byte count.
   - `write_memory` — require `supportsWriteMemoryRequest`; writes base64 data and reports bytes written.
   - `modules` — require `supportsModulesRequest`; optional pagination via `start_module` / `module_count`.
@@ -185,6 +190,8 @@ Side-channel artifacts outside the model tool result:
   - `dump` — report bundle without profiler artifacts.
   - `work` — standalone work-profile flamegraph export/open.
   - `system` — formatted OS/arch/CPU/memory/version/cwd/shell/terminal dump.
+  - `terminal` — formatted terminal subprotocol/geometry/scrollback state dump.
+  - `protocols` — terminal protocol test: desktop-notification side effect plus a probe panel sampling special protocols.
   - `open-artifacts` / `transcript` / `clear-cache` — artifact directory open, transcript export, artifact-cache pruning.
 
 ## Side Effects
@@ -194,7 +201,7 @@ Side-channel artifacts outside the model tool result:
   - Work-profile export writes `/tmp/work-profile-<timestamp>.svg`.
   - Log source reads daily log files from the logs dir.
   - Artifact-cache cleanup removes session artifact directories older than the cutoff.
-  - `resolveRawSseDebugBuffer()` may attach a non-enumerable `rawSseDebugBuffer` property to the owner object.
+  - `resolveRawSseDebugBuffer()` reuses an explicit `rawSseDebugBuffer` property on the owner when present, otherwise caches a buffer under a private `Symbol("debug.rawSseBuffer")` key (silently skipped when the owner is non-extensible).
 - Network
   - Socket-mode adapters bind/connect local sockets.
   - Remote attach may connect through the adapter to a remote debug port.
@@ -202,7 +209,7 @@ Side-channel artifacts outside the model tool result:
   - Spawns debugger adapters (`gdb`, `lldb-dap`, `python -m debugpy.adapter`, `dlv`, and others from `defaults.json`) detached.
   - Reverse DAP `runInTerminal` requests spawn the debuggee detached via `ptree.spawn()`.
   - `getWorkProfile(30)` comes from `@oh-my-pi/pi-natives`.
-  - CPU profiling uses `node:inspector/promises`; heap snapshots use `Bun.generateHeapSnapshot("v8")`; raw/log viewers sanitize text via `@oh-my-pi/pi-natives`.
+  - CPU profiling uses `node:inspector/promises`; heap snapshots use `Bun.generateHeapSnapshot("v8")`; raw/log viewers sanitize text via `sanitizeText()` from `@oh-my-pi/pi-utils`.
   - `openPath()` launches the OS default file/browser handler for artifact dirs and SVGs.
   - Log/raw-SSE viewers can call `copyToClipboard()`.
 - Session state (transcript, memory, jobs, checkpoints, registries)
@@ -225,7 +232,7 @@ Side-channel artifacts outside the model tool result:
 - Single active session: enforced by `#ensureLaunchSlot()` in `packages/coding-agent/src/dap/session.ts`.
 - Idle session cleanup: `IDLE_TIMEOUT_MS = 10 * 60 * 1000`, checked every `CLEANUP_INTERVAL_MS = 30 * 1000`.
 - Adapter liveness heartbeat: `HEARTBEAT_INTERVAL_MS = 5 * 1000`.
-- Output capture cap: `MAX_OUTPUT_BYTES = 128 * 1024`; older text is trimmed in ~1 KiB slices and `outputTruncated` is recorded.
+- Output capture cap: `MAX_OUTPUT_BYTES = 128 * 1024`; whole chunks are dropped from the front (then the front chunk is byte-sliced so exactly the cap remains) and `outputTruncated` is recorded.
 - Initial stop capture timeout after launch/attach: `STOP_CAPTURE_TIMEOUT_MS = 5_000`.
 - Socket-mode adapter readiness timeout: `10_000` ms in `waitForCondition()` and TCP connect timeout logic in `packages/coding-agent/src/dap/client.ts`.
 - Raw SSE buffer caps in `packages/coding-agent/src/debug/raw-sse-buffer.ts`:
@@ -249,12 +256,14 @@ Side-channel artifacts outside the model tool result:
   - `attach requires pid or port`
   - `set_breakpoint requires file+line or function`
   - `variables requires variable_ref or scope_id`
+  - `instruction_count is required for disassemble`
+  - `disassemble requires memory_reference unless the current stop location has an instruction pointer reference`
   - `memory_reference is required for read_memory`
   - `count is required for read_memory`
   - `data is required for write_memory`
   - `command is required for custom_request`
 - Adapter selection failure throws `No debugger adapter available. Installed adapters: ...`.
-- Capability-gated actions throw from `requireCapability(...)`, e.g. `Active adapter does not support memory reads.`
+- Capability-gated actions throw from `requireCapability(...)`, e.g. `Current adapter does not support memory reads`.
 - No-session and state errors come from `DapSessionManager`, e.g. `No active debug session. Launch or attach first.`, `No active stack frame. Run stack_trace first or supply frame_id.`, `Debugger reported no threads.`
 - Launching a second live session throws `Debug session <id> is still active. Terminate it before launching another.`
 - DAP transport/request failures surface as thrown errors from `DapClient`:
@@ -280,7 +289,7 @@ Side-channel artifacts outside the model tool result:
 - Session summaries expose `needsConfigurationDone`; this is derived from adapter capabilities and whether `configurationDone` has been sent.
 - Source breakpoint file paths are normalized with `path.resolve()` before caching and sending to the adapter.
 - `evaluate` defaults to `repl`, so the tool can forward raw debugger commands when the adapter supports them.
-- `disassemble` resolves its target from `memory_reference` first, then `instruction_reference`; it throws if neither is present.
+- `disassemble` resolves its target from `memory_reference` first, then the current stopped session's `instructionPointerReference`; it throws if neither is present.
 - `RawSseDebugBuffer.recordEvent()` increments `totalEvents` before bounded retention. A snapshot can therefore show fewer retained records than total observed events.
 - Raw SSE buffer listener failures are swallowed so viewer bugs do not break capture.
 - `createDebugLogSource()` walks daily log files newest-first, but `loadOlderLogs()` reverses each requested slice before concatenation so older chunks prepend in chronological order.

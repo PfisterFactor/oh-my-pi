@@ -6,16 +6,16 @@ A persistent per-install UUID that identifies a single oh-my-pi installation acr
 
 Exported from `@oh-my-pi/pi-utils` (`packages/utils/src/dirs.ts`):
 
-| Symbol | Purpose |
-| --- | --- |
-| `getInstallId(): string` | Returns the install ID, generating and persisting one on first call. Result is cached in-process for the lifetime of the runtime. |
-| `__resetInstallIdCacheForTests(): void` | Clears the in-process cache. Test-only — MUST NOT be called from production code. |
+| Symbol                                  | Purpose                                                                                                                           |
+| --------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------- |
+| `getInstallId(): string`                | Returns the install ID, generating and persisting one on first call. Result is cached in-process for the lifetime of the runtime. |
+| `__resetInstallIdCacheForTests(): void` | Clears the in-process cache. Test-only — MUST NOT be called from production code.                                                 |
 
-The returned value is a canonical lowercase RFC 4122 UUID matching `^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$`.
+Generated IDs are lowercase RFC 4122 UUIDs. Existing persisted values are accepted case-insensitively when they match `^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$` with the regex `i` flag, and are returned exactly as stored.
 
 ## Storage
 
-- Path: `<config-root>/install-id` — i.e. `~/.omp/install-id` by default, respecting `PI_CONFIG_DIR` via `getConfigRootDir()`.
+- Path: `<base-config-root>/install-id` — i.e. `~/.omp/install-id` by default, respecting `PI_CONFIG_DIR`. Resolved against the base config root (`getBaseConfigRoot()`) regardless of the active profile, so every profile on a host shares one install ID (install identity is per-install, not per-profile).
 - Format: a single UUID line (trailing `\n`).
 - Permissions: file is created with mode `0o600`.
 - Lifecycle: independent of `~/.omp/agent/`. Wiping agent state (sessions, settings, DB) does NOT regenerate the install ID; only deleting the `install-id` file itself does.

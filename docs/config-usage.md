@@ -7,6 +7,7 @@ This document describes how the coding-agent resolves configuration today: which
 Primary implementation:
 
 - `packages/coding-agent/src/config.ts`
+- `packages/coding-agent/src/config/config-file.ts` (re-exported from `config.ts`)
 - `packages/coding-agent/src/config/settings.ts`
 - `packages/coding-agent/src/config/settings-schema.ts`
 - `packages/coding-agent/src/discovery/builtin.ts`
@@ -72,6 +73,14 @@ Project-level bases:
 
 `CONFIG_DIR_NAME` is `.omp` (`packages/utils/src/dirs.ts`).
 
+## Profiles
+
+A named profile (`omp --profile <name>`, the `--alias` shortcut, or `OMP_PROFILE` / `PI_PROFILE`) relocates the OMP user base. When a profile is active, every OMP-native user-level path written here as `~/.omp/agent/...` resolves to `~/.omp/profiles/<name>/agent/...` instead.
+
+The relocation is uniform across the native provider (`builtin.ts`) and the generic `config.ts` helpers, so it covers slash commands, rules, prompts, instructions, hooks, tools, extensions, settings, skills, and MCP, plus the top-level `SYSTEM.md` / `RULES.md` / `AGENTS.md` files and runtime state (sessions, blobs, `agent.db`). A profile sees only its own OMP config, never the default profile's `~/.omp/agent`.
+
+The other source bases are not profile-scoped and load identically under every profile: the external-tool bases (`~/.claude`, `~/.codex`, `~/.gemini`) belong to those tools, and the project-level bases (`<cwd>/.omp`, `<cwd>/.claude`, ...) are keyed to the working directory. Throughout this document, read `~/.omp/agent` as shorthand for the active profile's agent directory.
+
 ## Important constraint
 
 The generic helpers in `src/config.ts` do **not** include `.pi` in source discovery order.
@@ -108,7 +117,7 @@ Use this when project config should be inherited from ancestor directories (mono
 
 ---
 
-## 3) File config wrapper (`ConfigFile<T>` in `src/config.ts`)
+## 3) File config wrapper (`ConfigFile<T>` in `src/config/config-file.ts`, re-exported from `src/config.ts`)
 
 `ConfigFile<T>` is the schema-validated loader for single config files.
 
@@ -137,13 +146,14 @@ Legacy migration still supported:
 The runtime settings model is layered:
 
 1. Global settings: `~/.omp/agent/config.yml`
-2. Project settings: discovered via settings capability (`settings.json` from providers)
-3. Runtime overrides: in-memory, non-persistent
-4. Schema defaults: from `SETTINGS_SCHEMA`
+2. Project settings: discovered via settings capability (`settings.json` and `config.yml` from providers)
+3. CLI config overlays: `omp --config <path>` / repeated `--config` files, loaded as `config.yml`-style YAML for this process only
+4. Runtime overrides: in-memory, non-persistent
+5. Schema defaults: from `SETTINGS_SCHEMA`
 
-Effective read path:
+Effective precedence:
 
-`defaults <- global <- project <- overrides`
+`defaults <- global <- project <- CLI config overlays <- overrides`
 
 Write behavior:
 
@@ -217,7 +227,7 @@ Native provider (`id: native`) reads native config from:
 
 - Slash commands, rules, prompts, instructions, hooks, tools, extensions, extension modules, and settings use a project/user root only when the root directory exists and is non-empty.
 - Skills scan `<ancestor>/.omp/skills` for each ancestor from the current working directory up to the repo root/home boundary, plus `~/.omp/agent/skills`, without requiring the root `.omp` directory itself to be non-empty.
-- `SYSTEM.md` and `AGENTS.md` read user-level files directly and use nearest-ancestor project `.omp` lookup for project files, but the project `.omp` directory must be non-empty.
+- `SYSTEM.md` and `AGENTS.md` read user-level files directly and use nearest-ancestor project `.omp` lookup for project files, but the project `.omp` directory must be non-empty. See [`docs/system-prompt-customization.md`](./system-prompt-customization.md) for the full `SYSTEM.md` / `APPEND_SYSTEM.md` contract (replace vs. append, templating).
 
 ### Scope-specific loading
 
@@ -230,7 +240,7 @@ Native provider (`id: native`) reads native config from:
 - Tools: `tools/*.{json,md,ts,js,sh,bash,py}` and `tools/<name>/index.ts`
 - Extension modules: discovered under `extensions/` (+ legacy `settings.json.extensions` string array)
 - Extensions: `extensions/<name>/gemini-extension.json`
-- Settings capability: `settings.json`
+- Settings capability: `settings.json`, then `config.yml`
 
 ### Nearest-project lookup nuance
 
@@ -240,8 +250,22 @@ Native provider (`id: native`) reads native config from:
 
 ## Settings subsystem
 
-- `Settings.init()` loads global `config.yml` + discovered project `settings.json` capability items.
+- `Settings.init()` loads global `config.yml` + discovered project settings capability items.
 - Only capability items with `level === "project"` are merged into project layer.
+
+### Session title prompt override
+
+Create `TITLE_SYSTEM.md` in the same config locations as `SYSTEM.md` / `APPEND_SYSTEM.md`:
+
+```text
+# ~/.omp/agent/TITLE_SYSTEM.md
+Generate a session name using lowercase `<type>:<primary-objective>`.
+```
+
+- Missing `TITLE_SYSTEM.md` keeps the bundled title prompts.
+- Discovery uses the same project-then-user config directory pattern as `SYSTEM.md`: project `.omp/TITLE_SYSTEM.md` first, then user `~/.omp/agent/TITLE_SYSTEM.md` and the other supported config bases.
+- The override replaces only the automatic session-title generation system prompt; normal `SYSTEM.md` / `APPEND_SYSTEM.md` prompt customization is unaffected.
+- The online path forces the `set_title` tool call when the title model honors a forced `tool_choice`. Tool-choice-less providers (chat-completions hosts without `tool_choice` support, Claude Fable/Mythos) instead receive a marker-based prompt and emit the title wrapped in `<title>...</title>`, which is parsed leniently (a plain sentence or a truncated/unclosed tag still works). A `TITLE_SYSTEM.md` override is reused in both modes; in marker mode the wrap-in-`<title>` instruction is appended after it. The local tiny-title path keeps the `<title>...</title>` prefill/stop wrapper and uses this file as its system turn.
 
 ## Skills subsystem
 
@@ -285,7 +309,7 @@ Settings capability items are not deduplicated; `Settings.#loadProjectSettings()
 
 - `ConfigFile` JSON -> YAML migration for YAML-targeted files.
 - Settings migration from `settings.json` and `agent.db` to `config.yml`.
-- Settings key migrations (`queueMode`, `ask.timeout`, flat `theme`, `task.isolation.enabled`, `statusLine.plan_mode`).
+- Settings key migrations include `queueMode`, `ask.timeout`, flat `theme`, `task.isolation.enabled`, legacy `task.isolation.mode` values, removed edit modes, `statusLine.plan_mode`, `memories.enabled`, and hindsight scoping/name fields.
 - Legacy setting names `skills.enablePiUser` / `skills.enablePiProject` are still active gates for native skill source.
 
 If these compatibility paths are removed in code, update this document immediately; several runtime behaviors still depend on them today.

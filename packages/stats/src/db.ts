@@ -1,6 +1,8 @@
 import { Database } from "bun:sqlite";
 import * as fs from "node:fs/promises";
-import { type GeneratedProvider, getBundledModel, type Usage } from "@oh-my-pi/pi-ai";
+import type { Usage } from "@oh-my-pi/pi-ai";
+import type { GeneratedProvider } from "@oh-my-pi/pi-catalog/models";
+import { getBundledModel } from "@oh-my-pi/pi-catalog/models";
 import { getConfigRootDir, getStatsDbPath } from "@oh-my-pi/pi-utils";
 import type {
 	AggregatedStats,
@@ -36,7 +38,7 @@ let db: Database | null = null;
 
 const BACKFILL_COMPLETE = "complete";
 const BACKFILL_PENDING = "pending";
-const USER_MESSAGES_BACKFILL_KEY = "user_messages_v5";
+const USER_MESSAGES_BACKFILL_KEY = "user_messages_v6";
 const USER_MESSAGE_LINKS_REPAIR_KEY = "user_message_links_v1";
 const PRIORITY_PREMIUM_REQUESTS_BACKFILL_KEY = "premium_requests_priority_v1";
 function shouldResetBackfill(value: string | undefined): boolean {
@@ -52,10 +54,13 @@ export async function initDb(): Promise<Database> {
 	await fs.mkdir(getConfigRootDir(), { recursive: true });
 
 	db = new Database(getStatsDbPath());
-	db.exec("PRAGMA journal_mode = WAL");
+	// Install the busy handler BEFORE any lock-taking statement. See
+	// https://github.com/can1357/oh-my-pi/issues/2421.
+	db.run("PRAGMA busy_timeout = 5000");
+	db.run("PRAGMA journal_mode = WAL");
 
 	// Create tables
-	db.exec(`
+	db.run(`
 		CREATE TABLE IF NOT EXISTS messages (
 			id INTEGER PRIMARY KEY AUTOINCREMENT,
 			session_file TEXT NOT NULL,
@@ -127,9 +132,9 @@ export async function initDb(): Promise<Database> {
 
 	const messageColumns = db.prepare("PRAGMA table_info(messages)").all() as { name: string }[];
 	if (!messageColumns.some(column => column.name === "premium_requests")) {
-		db.exec("ALTER TABLE messages ADD COLUMN premium_requests REAL NOT NULL DEFAULT 0");
+		db.run("ALTER TABLE messages ADD COLUMN premium_requests REAL NOT NULL DEFAULT 0");
 	}
-	db.exec("UPDATE messages SET premium_requests = 0 WHERE premium_requests IS NULL");
+	db.run("UPDATE messages SET premium_requests = 0 WHERE premium_requests IS NULL");
 	// Each behavior-metric bump invalidates previously-ingested rows. We detect
 	// the stale schema by column name and drop the table; `IF NOT EXISTS` above
 	// already produced the new schema, but we want a clean wipe + re-ingest.
@@ -154,8 +159,8 @@ export async function initDb(): Promise<Database> {
 	const hasV4Columns = userMessageColumns.some(column => column.name === "negation");
 	const hasOldUserMessages = userMessageColumns.length > 0;
 	if (hasStaleColumn || (hasOldUserMessages && !hasV4Columns)) {
-		db.exec("DROP TABLE user_messages");
-		db.exec(`
+		db.run("DROP TABLE user_messages");
+		db.run(`
 			CREATE TABLE user_messages (
 				id INTEGER PRIMARY KEY AUTOINCREMENT,
 				session_file TEXT NOT NULL,
@@ -771,6 +776,8 @@ export function getCostTimeSeries(days = 90, cutoff?: number | null): CostTimeSe
  *   left those metrics matching nothing in real prose.
  * - v5: renamed `yelling_sentences` column to `yelling` to match the other
  *   single-word signal columns (profanity, anguish, negation, ...).
+ * - v6: dropped `git` from the profanity word list - it collided with the
+ *   version-control tool name, so existing rows over-counted profanity.
  *
  * Existing `messages` rows are unaffected - `INSERT OR IGNORE` keeps them.
  */
@@ -780,8 +787,8 @@ function backfillUserMessages(database: Database): void {
 		| undefined;
 	if (!shouldResetBackfill(row?.value)) return;
 
-	database.exec("DELETE FROM user_messages");
-	database.exec("DELETE FROM file_offsets");
+	database.run("DELETE FROM user_messages");
+	database.run("DELETE FROM file_offsets");
 	database
 		.prepare("INSERT OR REPLACE INTO meta (key, value) VALUES (?, ?)")
 		.run(USER_MESSAGES_BACKFILL_KEY, BACKFILL_PENDING);
@@ -801,7 +808,7 @@ function repairUserMessageLinks(database: Database): void {
 		| undefined;
 	if (!shouldResetBackfill(row?.value)) return;
 
-	database.exec("DELETE FROM file_offsets");
+	database.run("DELETE FROM file_offsets");
 	database
 		.prepare("INSERT OR REPLACE INTO meta (key, value) VALUES (?, ?)")
 		.run(USER_MESSAGE_LINKS_REPAIR_KEY, BACKFILL_PENDING);
@@ -823,7 +830,7 @@ function backfillPriorityPremiumRequests(database: Database): void {
 		| undefined;
 	if (!shouldResetBackfill(row?.value)) return;
 
-	database.exec("DELETE FROM file_offsets");
+	database.run("DELETE FROM file_offsets");
 	database
 		.prepare("INSERT OR REPLACE INTO meta (key, value) VALUES (?, ?)")
 		.run(PRIORITY_PREMIUM_REQUESTS_BACKFILL_KEY, BACKFILL_PENDING);

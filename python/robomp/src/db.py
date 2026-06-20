@@ -19,9 +19,11 @@ IssueState = Literal[
     "new",
     "reproducing",
     "fixing",
+    "reviewing",
     "opened",
     "merged",
     "closed",
+    "needs_info",
     "abandoned",
 ]
 
@@ -49,6 +51,9 @@ CREATE TABLE IF NOT EXISTS events (
 CREATE INDEX IF NOT EXISTS events_state_received
   ON events(state, received_at);
 
+CREATE INDEX IF NOT EXISTS events_issue_state
+  ON events(issue_key, state);
+
 CREATE TABLE IF NOT EXISTS issues (
   key            TEXT PRIMARY KEY,
   repo           TEXT NOT NULL,
@@ -71,6 +76,20 @@ CREATE TABLE IF NOT EXISTS tool_calls (
   ts            TEXT NOT NULL
 );
 CREATE INDEX IF NOT EXISTS tool_calls_issue ON tool_calls(issue_key, ts);
+
+CREATE TABLE IF NOT EXISTS pr_review_comments (
+  id          INTEGER PRIMARY KEY AUTOINCREMENT,
+  issue_key   TEXT NOT NULL,
+  path        TEXT NOT NULL,
+  line        INTEGER NOT NULL,
+  side        TEXT NOT NULL DEFAULT 'RIGHT',
+  start_line  INTEGER,
+  start_side  TEXT,
+  body        TEXT NOT NULL,
+  created_at  TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_pr_review_comments_key
+  ON pr_review_comments(issue_key);
 
 CREATE TABLE IF NOT EXISTS submissions (
   delivery_id   TEXT PRIMARY KEY,
@@ -99,6 +118,11 @@ CREATE INDEX IF NOT EXISTS pending_closures_state_close_at
 
 def _utcnow() -> str:
     return datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%S.%fZ")
+
+
+def _utc_after(seconds: float) -> str:
+    """UTC timestamp `seconds` in the future, same sortable format as `_utcnow`."""
+    return (datetime.now(UTC) + timedelta(seconds=max(seconds, 0.0))).strftime("%Y-%m-%dT%H:%M:%S.%fZ")
 
 
 def iso_seconds_ago(seconds: float) -> str:
@@ -130,6 +154,19 @@ class IssueRow:
     state: IssueState
     updated_at: str
     classification: str | None = None
+
+
+@dataclass(slots=True, frozen=True)
+class StagedReviewComment:
+    id: int
+    issue_key: str
+    path: str
+    line: int
+    side: str
+    body: str
+    created_at: str
+    start_line: int | None = None
+    start_side: str | None = None
 
 
 def _event_row_from_db_row(row: sqlite3.Row) -> EventRow:
@@ -210,6 +247,8 @@ class Database:
         event_cols = {row[1] for row in self._conn.execute("PRAGMA table_info(events)").fetchall()}
         if "model" not in event_cols:
             self._conn.execute("ALTER TABLE events ADD COLUMN model TEXT")
+        if "available_at" not in event_cols:
+            self._conn.execute("ALTER TABLE events ADD COLUMN available_at TEXT")
 
     def close(self) -> None:
         with self._lock:
@@ -265,21 +304,33 @@ class Database:
             return cur.rowcount > 0
 
     def claim_next_event(self) -> EventRow | None:
-        """Atomically dequeue one queued event into running state."""
+        """Atomically dequeue one unblocked queued event into running state."""
         with self._txn() as conn:
+            now = _utcnow()
             row = conn.execute(
                 """
-                SELECT delivery_id, event_type, repo, issue_key, payload_json, received_at,
-                       state, attempts, last_error
-                FROM events
-                WHERE state = 'queued'
-                ORDER BY received_at
+                SELECT queued.delivery_id, queued.event_type, queued.repo, queued.issue_key,
+                       queued.payload_json, queued.received_at, queued.state, queued.attempts,
+                       queued.last_error
+                FROM events AS queued
+                WHERE queued.state = 'queued'
+                  AND (queued.available_at IS NULL OR queued.available_at <= ?)
+                  AND (
+                    queued.issue_key IS NULL
+                    OR NOT EXISTS (
+                      SELECT 1
+                      FROM events AS running
+                      WHERE running.state = 'running'
+                        AND running.issue_key = queued.issue_key
+                    )
+                  )
+                ORDER BY queued.received_at
                 LIMIT 1
-                """
+                """,
+                (now,),
             ).fetchone()
             if row is None:
                 return None
-            now = _utcnow()
             conn.execute(
                 "UPDATE events SET state='running', attempts=attempts+1, started_at=? WHERE delivery_id=?",
                 (now, row["delivery_id"]),
@@ -319,7 +370,7 @@ class Database:
         """Recover events that were running at shutdown."""
         with self._lock:
             cur = self._conn.execute(
-                "UPDATE events SET state='queued' WHERE state='running'",
+                "UPDATE events SET state='queued', available_at=NULL WHERE state='running'",
             )
             return cur.rowcount
 
@@ -572,7 +623,7 @@ class Database:
         with self._lock:
             if from_states is None:
                 cur = self._conn.execute(
-                    "UPDATE events SET state='queued' WHERE delivery_id=?",
+                    "UPDATE events SET state='queued', available_at=NULL WHERE delivery_id=?",
                     (delivery_id,),
                 )
             elif not from_states:
@@ -580,9 +631,27 @@ class Database:
             else:
                 placeholders = ",".join("?" for _ in from_states)
                 cur = self._conn.execute(
-                    f"UPDATE events SET state='queued' WHERE delivery_id=? AND state IN ({placeholders})",
+                    f"UPDATE events SET state='queued', available_at=NULL WHERE delivery_id=? AND state IN ({placeholders})",
                     (delivery_id, *from_states),
                 )
+            return cur.rowcount > 0
+
+    def schedule_retry(self, delivery_id: str, *, delay_seconds: float, error: str | None = None) -> bool:
+        """Re-queue a delivery for a future retry with backoff.
+
+        Flips state back to 'queued' but stamps `available_at` so
+        `claim_next_event` skips the row until the backoff elapses. `attempts`
+        is left untouched (it was already incremented at claim) so the retry
+        budget keeps counting down; `last_error` retains the failure reason for
+        the dashboard. Only transitions a 'running'/'failed' row; returns
+        whether a row changed.
+        """
+        with self._lock:
+            cur = self._conn.execute(
+                "UPDATE events SET state='queued', last_error=?, available_at=?, finished_at=NULL "
+                "WHERE delivery_id=? AND state IN ('running','failed')",
+                (error, _utc_after(delay_seconds), delivery_id),
+            )
             return cur.rowcount > 0
 
     # ---- issues ----
@@ -777,6 +846,93 @@ class Database:
                 ),
             )
             return int(cur.lastrowid or 0)
+
+    def has_successful_tool_call(self, issue_key: str, tool: str) -> bool:
+        with self._lock:
+            row = self._conn.execute(
+                """
+                SELECT 1
+                FROM tool_calls
+                WHERE issue_key=? AND tool=? AND error IS NULL
+                ORDER BY id DESC
+                LIMIT 1
+                """,
+                (issue_key, tool),
+            ).fetchone()
+        return row is not None
+
+    # ---- PR review comment staging ----
+    def stage_review_comment(
+        self,
+        *,
+        issue_key: str,
+        path: str,
+        line: int,
+        body: str,
+        side: str = "RIGHT",
+        start_line: int | None = None,
+        start_side: str | None = None,
+    ) -> StagedReviewComment:
+        with self._lock:
+            cur = self._conn.execute(
+                """
+                INSERT INTO pr_review_comments
+                  (issue_key, path, line, side, start_line, start_side, body, created_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (issue_key, path, line, side, start_line, start_side, body, _utcnow()),
+            )
+            row = self._conn.execute(
+                """
+                SELECT id, issue_key, path, line, side, start_line, start_side, body, created_at
+                FROM pr_review_comments
+                WHERE id=?
+                """,
+                (int(cur.lastrowid or 0),),
+            ).fetchone()
+        assert row is not None
+        return StagedReviewComment(
+            id=int(row["id"]),
+            issue_key=row["issue_key"],
+            path=row["path"],
+            line=int(row["line"]),
+            side=row["side"],
+            body=row["body"],
+            created_at=row["created_at"],
+            start_line=int(row["start_line"]) if row["start_line"] is not None else None,
+            start_side=row["start_side"],
+        )
+
+    def list_staged_review_comments(self, issue_key: str) -> list[StagedReviewComment]:
+        with self._lock:
+            rows = self._conn.execute(
+                """
+                SELECT id, issue_key, path, line, side, start_line, start_side, body, created_at
+                FROM pr_review_comments
+                WHERE issue_key=?
+                ORDER BY id
+                """,
+                (issue_key,),
+            ).fetchall()
+        return [
+            StagedReviewComment(
+                id=int(row["id"]),
+                issue_key=row["issue_key"],
+                path=row["path"],
+                line=int(row["line"]),
+                side=row["side"],
+                body=row["body"],
+                created_at=row["created_at"],
+                start_line=int(row["start_line"]) if row["start_line"] is not None else None,
+                start_side=row["start_side"],
+            )
+            for row in rows
+        ]
+
+    def clear_staged_review_comments(self, issue_key: str) -> int:
+        with self._lock:
+            cur = self._conn.execute("DELETE FROM pr_review_comments WHERE issue_key=?", (issue_key,))
+            return int(cur.rowcount or 0)
 
     # ---- submissions (per-user rate limiting) ----
     def admit_submission(

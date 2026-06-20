@@ -24,11 +24,11 @@ Does not cover:
 - [`../src/session/agent-session.ts`](../packages/coding-agent/src/session/agent-session.ts)
 - [`packages/agent/src/compaction/compaction.ts`](../packages/agent/src/compaction/compaction.ts)
 - [`../src/session/session-manager.ts`](../packages/coding-agent/src/session/session-manager.ts)
-- [`../src/extensibility/slash-commands.ts`](../packages/coding-agent/src/extensibility/slash-commands.ts)
+- [`../src/slash-commands/builtin-registry.ts`](../packages/coding-agent/src/slash-commands/builtin-registry.ts)
 
 ## Trigger path
 
-1. `/handoff` is declared in builtin slash command metadata (`slash-commands.ts`) with optional inline hint: `[focus instructions]`.
+1. `/handoff` is declared in builtin slash command metadata (`slash-commands/builtin-registry.ts`) with optional inline hint: `[focus instructions]`.
 2. In interactive input handling (`InputController`), submit text matching `/handoff` or `/handoff ...` is intercepted before normal prompt submission.
 3. The editor is cleared and `handleHandoffCommand(customInstructions?)` is called.
 4. `CommandController.handleHandoffCommand` performs a preflight guard using current entries:
@@ -54,7 +54,7 @@ The same minimum-content guard exists again inside `AgentSession.handoff()` and 
   - the live tool array (`agent.state.tools`),
   - optional focus instructions,
   - coding-agent message conversion (`convertToLlm`),
-  - provider metadata and `initiatorOverride: "agent"`.
+  - provider metadata, current thinking level, and `initiatorOverride: "agent"`.
 
 `generateHandoff(...)` lives in `packages/agent/src/compaction/compaction.ts` next to summarization. It renders `packages/agent/src/compaction/prompts/handoff-document.md` via `renderHandoffPrompt(...)` with optional `additionalFocus`.
 
@@ -62,10 +62,10 @@ The same minimum-content guard exists again inside `AgentSession.handoff()` and 
 
 `generateHandoff(...)` converts the existing `AgentMessage[]` history to real LLM `Message[]` history, then appends one trailing agent-attributed `user` message containing the rendered handoff prompt.
 
-The request uses `completeSimple(...)` directly:
+The request uses `instrumentedCompleteSimple(...)` (the OTEL-instrumented `completeSimple` oneshot wrapper) directly:
 
 ```ts
-await completeSimple(
+await instrumentedCompleteSimple(
   model,
   {
     systemPrompt,
@@ -75,11 +75,12 @@ await completeSimple(
   {
     apiKey,
     signal,
-    reasoning: Effort.High,
+    reasoning: resolveCompactionEffort(model, options.thinkingLevel),
     toolChoice: "none",
     initiatorOverride,
     metadata,
   },
+  { telemetry, oneshotKind: "handoff" },
 );
 ```
 
@@ -113,8 +114,8 @@ If text was generated and not aborted:
 3. Start a brand-new session with `parentSession` pointing at the previous session file when one exists.
 4. Reset in-memory agent state (`agent.reset()`).
 5. Rebind `agent.sessionId` to the new session id.
-6. Rekey/reset hindsight state for the new session.
-7. Clear queued context arrays (`#steeringMessages`, `#followUpMessages`, `#pendingNextTurnMessages`) and any scheduled hidden next-turn generation.
+6. Rekey/reset Hindsight and Mnemopi memory session tracking for the new session.
+7. Clear the queued next-turn context array (`#pendingNextTurnMessages`) and the scheduled hidden next-turn generation (`#scheduledHiddenNextTurnGeneration`). The agent's steering and follow-up queues are already cleared by `agent.reset()` in step 4.
 8. Reset todo reminder counter.
 
 ### 5) Handoff-context injection
@@ -132,7 +133,13 @@ The above is a handoff document from a previous session. Use this context to con
 Insertion call:
 
 ```ts
-this.sessionManager.appendCustomMessageEntry("handoff", handoffContent, true, undefined, "agent");
+this.sessionManager.appendCustomMessageEntry(
+  "handoff",
+  handoffContent,
+  true,
+  undefined,
+  "agent",
+);
 ```
 
 Semantics:
@@ -184,7 +191,7 @@ Auto-triggered handoffs can additionally write a timestamped `handoff-*.md` arti
 - On exception:
   - if message is `"Handoff cancelled"` or error name is `AbortError`: `showError("Handoff cancelled")`
   - otherwise: `showError("Handoff failed: <message>")`
-- Stops the loader, restores the previous Escape handler, and requests render at end.
+- Stops the loader, clears the status container, and requests render at end.
 
 Manual `/handoff` no longer streams the generated document into chat. A cancellable loader remains visible while the oneshot request runs, and the chat is rebuilt after generation completes.
 
@@ -201,7 +208,7 @@ When this abort path is used, the abort signal is passed to `completeSimple(...)
 
 ### Interactive `/handoff` path
 
-The command controller installs a temporary Escape handler for `/handoff` while the loader is visible. Pressing Escape calls `session.abortHandoff()`, which aborts the `completeSimple(...)` request through `#handoffAbortController`.
+`InputController`'s global `editor.onEscape` handler dispatches on live session state instead of swapping handlers: while `isGeneratingHandoff` is true, pressing Escape calls `session.abortHandoff()`, which aborts the `completeSimple(...)` request through `#handoffAbortController`.
 
 ## Aborted vs failed handoff
 
@@ -233,7 +240,7 @@ High-level state flow:
 1. Interactive slash command intercepted.
 2. Preflight message-count guard.
 3. `#handoffAbortController` created (`isGeneratingHandoff = true`).
-4. `generateHandoff(...)` issues one `completeSimple(...)` request with live system prompt, tools, message history, and trailing handoff prompt.
+4. `generateHandoff(...)` issues one `instrumentedCompleteSimple(...)` request with live system prompt, tools, message history, current thinking level, and trailing handoff prompt.
 5. Assistant response text blocks are joined; tool-call blocks are discarded.
 6. If missing text → return `undefined`; if aborted → cancellation error path.
 7. If present:

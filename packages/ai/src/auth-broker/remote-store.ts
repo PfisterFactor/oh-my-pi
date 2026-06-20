@@ -17,9 +17,9 @@ import {
 	REMOTE_REFRESH_SENTINEL,
 	type StoredAuthCredential,
 } from "../auth-storage";
+import type { OAuthCredentials } from "../registry/oauth/types";
 import type { Provider } from "../types";
 import type { UsageReport } from "../usage";
-import type { OAuthCredentials } from "../utils/oauth/types";
 import { type AuthBrokerClient, AuthBrokerStreamUnsupportedError } from "./client";
 import type { RefresherSchedule, SnapshotEntry, SnapshotResponse, SnapshotStreamEvent } from "./types";
 
@@ -73,11 +73,17 @@ export interface RemoteAuthCredentialStoreOptions {
 	 * to long-poll permanently when the broker returns 404. Default `true`.
 	 */
 	streamSnapshots?: boolean;
+	/**
+	 * Called after broker-sourced full snapshots are applied. The constructor's
+	 * initial snapshot intentionally does not trigger this hook.
+	 */
+	onSnapshot?: (snapshot: SnapshotResponse, generation: number) => void;
 }
 
 export class RemoteAuthCredentialStore implements AuthCredentialStore {
 	readonly #client: AuthBrokerClient;
 	readonly #streamSnapshots: boolean;
+	readonly #onSnapshot?: (snapshot: SnapshotResponse, generation: number) => void;
 	#snapshot: SnapshotResponse = emptySnapshot();
 	#snapshotReceivedAt = Date.now();
 	#generation = 0;
@@ -100,6 +106,7 @@ export class RemoteAuthCredentialStore implements AuthCredentialStore {
 		this.#client = opts.client;
 		this.#streamSnapshots = opts.streamSnapshots ?? true;
 		this.#applySnapshot(opts.initialSnapshot ?? emptySnapshot(), opts.initialSnapshot?.generation ?? 0);
+		this.#onSnapshot = opts.onSnapshot;
 		void this.#runBackground();
 	}
 
@@ -115,6 +122,13 @@ export class RemoteAuthCredentialStore implements AuthCredentialStore {
 		this.#snapshot = snapshot;
 		this.#generation = generation;
 		this.#snapshotReceivedAt = Date.now();
+		const onSnapshot = this.#onSnapshot;
+		if (!onSnapshot) return;
+		try {
+			onSnapshot(snapshot, generation);
+		} catch (error) {
+			logger.debug("auth-broker snapshot callback failed", { error: String(error) });
+		}
 	}
 
 	async #runBackground(): Promise<void> {
@@ -261,6 +275,15 @@ export class RemoteAuthCredentialStore implements AuthCredentialStore {
 		});
 	}
 
+	async deleteAuthCredentialRemote(id: number, disabledCause: string): Promise<boolean> {
+		const found = this.#snapshot.credentials.some(entry => entry.id === id);
+		if (!found) return false;
+		await this.#client.disableCredential(id, disabledCause);
+		this.#removeCredentialById(id);
+		this.#maybeRefreshSnapshot("delete credential");
+		return true;
+	}
+
 	tryDisableAuthCredentialIfMatches(id: number, _expectedData: string, disabledCause: string): boolean {
 		const found = this.#snapshot.credentials.find(entry => entry.id === id);
 		if (!found) return false;
@@ -281,7 +304,7 @@ export class RemoteAuthCredentialStore implements AuthCredentialStore {
 
 	async prepareForRequest(credentialId: number, opts: { signal?: AbortSignal } = {}): Promise<boolean> {
 		const entry = this.#snapshot.credentials.find(candidate => candidate.id === credentialId);
-		if (!entry || entry.credential.type !== "oauth" || entry.rotatesInMs === null) return false;
+		if (entry?.credential.type !== "oauth" || entry.rotatesInMs === null) return false;
 		const remainingMs = this.#snapshotReceivedAt + entry.rotatesInMs - Date.now();
 		if (remainingMs > WAIT_THRESHOLD_MS) return false;
 		return this.waitForFreshSnapshot(MAX_WAIT_MS, opts);

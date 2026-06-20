@@ -13,21 +13,22 @@
  */
 import { describe, expect, it } from "bun:test";
 import { type SkillPromptDetails, stripInternalDetailsFields } from "@oh-my-pi/pi-coding-agent/session/messages";
-import { type CustomMessageEntry, SessionManager } from "@oh-my-pi/pi-coding-agent/session/session-manager";
+import type { CustomMessageEntry } from "@oh-my-pi/pi-coding-agent/session/session-entries";
+import { SessionManager } from "@oh-my-pi/pi-coding-agent/session/session-manager";
 
 const SKILL_TYPE = "skill-prompt";
 
 function readPersistedCustomMessageEntry<T>(session: SessionManager, id: string): CustomMessageEntry<T> {
 	const branch = session.getBranch();
 	const entry = branch.find(e => e.id === id);
-	if (!entry || entry.type !== "custom_message") {
+	if (entry?.type !== "custom_message") {
 		throw new Error(`Expected custom_message entry with id ${id}, got ${entry?.type ?? "none"}`);
 	}
 	return entry as CustomMessageEntry<T>;
 }
 
 describe("SessionManager.appendCustomMessageEntry (allowlist strip + persistence contract)", () => {
-	it("F1: strips __pendingDisplayTag from persisted details while preserving all other SkillPromptDetails fields", () => {
+	it("F1: strips __queueChipText from persisted details while preserving all other SkillPromptDetails fields", () => {
 		const session = SessionManager.inMemory();
 		const id = session.appendCustomMessageEntry<SkillPromptDetails>(
 			SKILL_TYPE,
@@ -38,7 +39,7 @@ describe("SessionManager.appendCustomMessageEntry (allowlist strip + persistence
 				path: "/s.md",
 				args: "bar",
 				lineCount: 10,
-				__pendingDisplayTag: "omp-cmd-1-0",
+				__queueChipText: "omp-cmd-1-0",
 			},
 			"user",
 		);
@@ -52,7 +53,7 @@ describe("SessionManager.appendCustomMessageEntry (allowlist strip + persistence
 		});
 		// Explicit absence assertion — defends against `toEqual` semantics drift
 		// where an `undefined`-valued key would still satisfy deep equality.
-		expect(Object.hasOwn(entry.details!, "__pendingDisplayTag")).toBe(false);
+		expect(Object.hasOwn(entry.details!, "__queueChipText")).toBe(false);
 	});
 
 	it("F2: persists details deep-equal to the input when no allowlisted field is present", () => {
