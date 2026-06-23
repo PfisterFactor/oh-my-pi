@@ -32,7 +32,7 @@ const THINKING_LEVEL_METADATA: Record<ThinkingLevel, ThinkingLevelMetadata> = {
 	[ThinkingLevel.High]: { value: ThinkingLevel.High, label: "high", description: "Deep reasoning (~16k tokens)" },
 	[ThinkingLevel.XHigh]: {
 		value: ThinkingLevel.XHigh,
-		label: "max",
+		label: "xhigh",
 		description: "Maximum reasoning (~32k tokens)",
 	},
 };
@@ -151,6 +151,26 @@ export function parseConfiguredThinkingLevel(value: string | null | undefined): 
 /** Returns display metadata for a configured selector, including `auto`. */
 export function getConfiguredThinkingLevelMetadata(level: ConfiguredThinkingLevel): ConfiguredThinkingLevelMetadata {
 	return level === AUTO_THINKING ? AUTO_THINKING_METADATA : getThinkingLevelMetadata(level);
+}
+
+/**
+ * Thinking selectors accepted by the `--thinking` CLI flag, in display order:
+ * `off`, every concrete effort (`minimal`..`xhigh`), then `auto`. Single source
+ * for the flag's `options` list, shell completions, and the "invalid level"
+ * warning so all three stay in sync.
+ */
+export const CLI_THINKING_LEVELS: readonly string[] = [ThinkingLevel.Off, ...THINKING_EFFORTS, AUTO_THINKING];
+
+/**
+ * Parses a `--thinking` CLI value. Accepts every {@link parseConfiguredThinkingLevel}
+ * selector (`off`, `auto`, `minimal`..`xhigh`, plus the `max` alias) but rejects
+ * `inherit`: an explicit `inherit` on the command line would suppress the
+ * settings/scoped-model fallback during startup resolution only to resolve back
+ * to the provider default, which is never what the user means.
+ */
+export function parseCliThinkingLevel(value: string | null | undefined): ConfiguredThinkingLevel | undefined {
+	const level = parseConfiguredThinkingLevel(value);
+	return level === ThinkingLevel.Inherit ? undefined : level;
 }
 
 /**
