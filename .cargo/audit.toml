@@ -1,0 +1,21 @@
+# cargo-audit configuration for the CI "blocking Rust advisory audit" step.
+#
+# Vulnerability advisories are fatal by default. Entries below are transitive
+# advisories with no available upstream fix that are unreachable in this
+# workspace's usage; each is justified. Revisit whenever the dependency tree
+# changes (e.g. an arboard / wayland-scanner release that bumps quick-xml).
+
+[advisories]
+ignore = [
+	# quick-xml 0.39.4 — pulled ONLY by wayland-scanner 0.31.10 (Linux clipboard
+	# via arboard -> wl-clipboard-rs). wayland-scanner uses quick-xml at BUILD
+	# time to parse the trusted, bundled Wayland protocol XML files that ship
+	# with the crate; it never parses attacker-controlled input at runtime. Both
+	# advisories are DoS via untrusted XML (quadratic duplicate-attribute scan /
+	# unbounded namespace allocation), so neither is reachable here. The fix
+	# requires quick-xml >=0.41.0, but arboard 3.6.1 and wl-clipboard-rs 0.9.3
+	# (both already the latest releases) still pin the 0.31 wayland stack on
+	# quick-xml 0.39 — there is no upstream release to upgrade to yet.
+	"RUSTSEC-2026-0194", # quick-xml: quadratic run time on duplicate attribute names
+	"RUSTSEC-2026-0195", # quick-xml: unbounded namespace-declaration allocation (NsReader)
+]
