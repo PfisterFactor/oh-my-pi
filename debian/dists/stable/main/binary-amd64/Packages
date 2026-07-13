@@ -151,3 +151,20 @@ Description: AI coding agent for the terminal
  Coding agent CLI with read, bash, edit, write tools and session
  management. Fork of badlogic/pi-mono.
 
+Package: omp
+Architecture: amd64
+Version: 16.3.11-0.1783923646.git75450cb
+Priority: optional
+Section: utils
+Maintainer: PfisterFactor <noreply@github.com>
+Filename: pool/main/o/omp/omp_16.3.11-0.1783923646.git75450cb_amd64.deb
+Size: 56349988
+MD5sum: 56e204d6ad36e9e744da73042a859e93
+SHA1: e2128ae2070c597c63de9c18c314380074f60d20
+SHA256: 2ffa0370aff3e703e2058f6c33accd40f1d21126f131d39db2ea14c20591ad46
+SHA512: b812ef059bd209d4ce817844d892a1bb3d1d689d45806640420f5806384c41af8bf861834ed04a3a0379514e764dd59837b6ec9411990467281d05f00c355a19
+Homepage: https://github.com/PfisterFactor/oh-my-pi
+Description: AI coding agent for the terminal
+ Coding agent CLI with read, bash, edit, write tools and session
+ management. Fork of badlogic/pi-mono.
+
